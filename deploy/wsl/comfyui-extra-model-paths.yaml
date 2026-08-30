@@ -1,0 +1,16 @@
+# Existing model library. ComfyUI must never download or install models on
+# behalf of the governor; additions are made by the operator outside ComfyUI.
+wsl_existing_models:
+  base_path: /srv/vram-governor/comfyui
+  is_default: true
+  checkpoints: models/checkpoints
+  diffusion_models: models/diffusion_models
+  unet: models/unet
+  text_encoders: models/text_encoders
+  clip: models/clip
+  clip_vision: models/clip_vision
+  vae: models/vae
+  loras: models/loras
+  controlnet: models/controlnet
+  embeddings: models/embeddings
+  upscale_models: models/upscale_models

@@ -1,0 +1,61 @@
+{
+  "generated_at": "2026-08-24T03:44:47.049874+00:00",
+  "runtime": "llama.cpp/llama-server",
+  "model": "/srv/vram-governor/models/Qwen3.8-9B-Q5_K_M.gguf",
+  "ctx": 8192,
+  "ngl": 999,
+  "results": [
+    {
+      "target_tokens": 1000,
+      "context_tokens": 1000,
+      "T_reprefill_recompute_s": 0.333932,
+      "T_slot_save_s": 0.07376615800000152,
+      "T_slot_restore_s": 0.02560527700000037,
+      "T_resume_prefill_s": 0.138539,
+      "resume_prefill_tokens": 12,
+      "T_kv_path_total_s": 0.16414427700000037,
+      "kv_file_mb": 81.523681640625,
+      "n_saved_tokens": 1000,
+      "kv_reused": true
+    },
+    {
+      "target_tokens": 2000,
+      "context_tokens": 2000,
+      "T_reprefill_recompute_s": 0.635174,
+      "T_slot_save_s": 0.13840725200000037,
+      "T_slot_restore_s": 0.04217954499999976,
+      "T_resume_prefill_s": 0.12534900000000002,
+      "resume_prefill_tokens": 12,
+      "T_kv_path_total_s": 0.16752854499999978,
+      "kv_file_mb": 112.79656982421875,
+      "n_saved_tokens": 2000,
+      "kv_reused": true
+    },
+    {
+      "target_tokens": 4000,
+      "context_tokens": 4000,
+      "T_reprefill_recompute_s": 1.208199,
+      "T_slot_save_s": 0.1173180039999977,
+      "T_slot_restore_s": 0.039136527000003696,
+      "T_resume_prefill_s": 0.131273,
+      "resume_prefill_tokens": 12,
+      "T_kv_path_total_s": 0.1704095270000037,
+      "kv_file_mb": 175.34234619140625,
+      "n_saved_tokens": 4000,
+      "kv_reused": true
+    },
+    {
+      "target_tokens": 7000,
+      "context_tokens": 7000,
+      "T_reprefill_recompute_s": 2.107982,
+      "T_slot_save_s": 0.19855686800000427,
+      "T_slot_restore_s": 0.05046718300000208,
+      "T_resume_prefill_s": 0.093348,
+      "resume_prefill_tokens": 12,
+      "T_kv_path_total_s": 0.14381518300000207,
+      "kv_file_mb": 269.1610107421875,
+      "n_saved_tokens": 7000,
+      "kv_reused": true
+    }
+  ]
+}

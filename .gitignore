@@ -1,0 +1,17 @@
+/bin/
+*.exe
+*.test
+*.out
+.vscode/
+.idea/
+.cache/
+data/
+web/ui/node_modules/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+configs/*.local.yaml

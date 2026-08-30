@@ -1,0 +1,30 @@
+[Unit]
+Description=VRAM Governor node control agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vram-governor
+Group=vram-governor
+WorkingDirectory=/var/lib/vram-governor
+Environment=PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+EnvironmentFile=-/etc/vram-governor/node-agent.env
+ExecStart=/usr/local/bin/vram-governor-node-agent -config /etc/vram-governor/node-agent.yaml
+Restart=always
+RestartSec=2
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/vram-governor
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+# VRAM Governor — Phase 2 ServingProfile config (architecture.md §32).
+#
+# This gives the Phase 2 measured-footprint probe something real to run.
+# expected_vram_mb is only used as the probe's pre-flight "don't attempt an
+# OOM" gate (docs/measurement.md) — it is NEVER fed to the scheduler as a
+# measured number; only the PerformanceProfile rows the probe produces are.
+profiles:
+  - id: "qwen9b-q5-llamacpp-ctx8192"
+    runtime: "llamacpp"
+    context_limit: 8192
+    max_sequences: 4
+    expected_vram_mb: 6400 # weights ~5.96 GiB (SPIKE_RESULTS.md) + KV/headroom
+    runtime_args:
+      model_path: "/srv/vram-governor/models/Qwen3.8-9B-Q5_K_M.gguf"
+      ngl: 999
+    model_artifact:
+      id: "qwen3.8-9b-q5_k_m"
+      name: "Qwen3.8-9B"
+      revision: "unknown"
+      quantization: "Q5_K_M"
+      format: "gguf"
+      tokenizer: "qwen3"
+      source: "local:/srv/vram-governor/models/Qwen3.8-9B-Q5_K_M.gguf"

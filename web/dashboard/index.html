@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VRAM Governor</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0b0d12;
+    --panel: #12151c;
+    --border: #232733;
+    --text: #e6e8ee;
+    --dim: #8a8f9c;
+    --green: #3ddc84;
+    --yellow: #e8b93f;
+    --red: #e8543f;
+    --accent: #5b8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 13px;
+  }
+  header {
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: 0.02em; }
+  header .sub { color: var(--dim); font-size: 12px; }
+  main { padding: 20px; display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    margin-bottom: 8px;
+  }
+  .card-head .name { font-weight: 600; font-size: 14px; }
+  .tag {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #1c2130;
+    color: var(--dim);
+  }
+  .row { display: flex; justify-content: space-between; padding: 3px 0; color: var(--dim); }
+  .row b { color: var(--text); font-weight: 500; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .dot.connected { background: var(--green); }
+  .dot.suspect { background: var(--yellow); }
+  .dot.lost, .dot.offline { background: var(--red); }
+  .gpu { border-top: 1px solid var(--border); margin-top: 8px; padding-top: 8px; }
+  .gpu .bar-bg { background: #1c2130; border-radius: 4px; height: 6px; overflow: hidden; margin-top: 4px; }
+  .gpu .bar-fg { background: var(--accent); height: 100%; }
+  .empty { color: var(--dim); padding: 40px; text-align: center; grid-column: 1 / -1; }
+  .err { color: var(--red); font-size: 12px; padding: 0 20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>VRAM GOVERNOR</h1>
+  <div class="sub" id="meta">polling /nodes …</div>
+</header>
+<div class="err" id="err"></div>
+<main id="nodes"><div class="empty">loading…</div></main>
+
+<script>
+const POLL_MS = 2000;
+
+function fmtAge(iso) {
+  if (!iso) return "never";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 0) return "0s ago";
+  if (s < 60) return s.toFixed(0) + "s ago";
+  return (s / 60).toFixed(1) + "m ago";
+}
+
+function renderNode(n) {
+  const conn = (n.observed && n.observed.connectivity) || "offline";
+  const gpus = (n.accelerators || []).map(a => {
+    const pct = a.vram_total_mb ? Math.round(100 * a.vram_used_mb / a.vram_total_mb) : 0;
+    return `
+      <div class="gpu">
+        <div class="row"><span>${a.model || "GPU"}</span><b>${a.utilization_pct}% util · ${a.temperature_c}&deg;C</b></div>
+        <div class="row"><span>VRAM</span><b>${a.vram_used_mb} / ${a.vram_total_mb} MB</b></div>
+        <div class="bar-bg"><div class="bar-fg" style="width:${pct}%"></div></div>
+      </div>`;
+  }).join("");
+
+  return `
+    <div class="card">
+      <div class="card-head">
+        <span class="name"><span class="dot ${conn}"></span>${n.name || n.id}</span>
+        <span class="tag">${n.location_class || "?"}</span>
+      </div>
+      <div class="row"><span>desired power / scheduling</span><b>${n.desired?.power || "-"} / ${n.desired?.scheduling_enabled ? "enabled" : "disabled"}</b></div>
+      <div class="row"><span>observed lifecycle</span><b>${n.observed?.lifecycle || "-"}</b></div>
+      <div class="row"><span>ready</span><b>${n.observed?.ready ? "yes" : "no"}</b></div>
+      <div class="row"><span>last heartbeat</span><b>${fmtAge(n.observed?.last_heartbeat)}</b></div>
+      ${gpus}
+    </div>`;
+}
+
+async function poll() {
+  const metaEl = document.getElementById("meta");
+  const errEl = document.getElementById("err");
+  try {
+    const res = await fetch("/nodes");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const nodes = await res.json();
+    errEl.textContent = "";
+    metaEl.textContent = nodes.length + " node(s) · updated " + new Date().toLocaleTimeString();
+    const el = document.getElementById("nodes");
+    el.innerHTML = nodes.length
+      ? nodes.map(renderNode).join("")
+      : '<div class="empty">No nodes registered yet. Start a node agent to see it here.</div>';
+  } catch (e) {
+    errEl.textContent = "Failed to reach controller API: " + e.message;
+  } finally {
+    setTimeout(poll, POLL_MS);
+  }
+}
+poll();
+</script>
+</body>
+</html>

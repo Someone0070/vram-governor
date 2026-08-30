@@ -1,0 +1,162 @@
+# VRAM Governor controller config. Development defaults are explicit.
+listen_addr: ":8080"
+log_level: "info"
+production: false
+tls_cert_file: ""
+tls_key_file: ""
+# Set after applying migrations/0001..0014. Empty uses the in-memory dev store.
+database_url: ""
+
+auth:
+  # Legacy compatibility only. Keep empty when scoped credentials are used.
+  shared_token: ""
+  # Development only: silently creates scoped browser sessions for clients in
+  # admin_private_cidrs. Production mode rejects this setting when enabled.
+  development_bypass: false
+  command_signing_secret: ""
+  command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
+  admin_private_cidrs:
+    - "127.0.0.0/8"
+    - "::1/128"
+    - "10.0.0.0/8"
+    - "172.16.0.0/12"
+    - "192.168.0.0/16"
+  credentials:
+    - id: "node-gpu-01"
+      token: "dev-node-token"
+      plane: "node"
+      owner_id: "system"
+      node_id: "gpu-node-01"
+      scopes: ["node:connect", "node:report"]
+      adapters: ["llamacpp", "comfy"]
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "studio-user"
+      token: "dev-studio-token"
+      plane: "ui"
+      owner_id: "home"
+      scopes: ["workloads:submit", "workloads:read", "workloads:cancel", "workloads:approve", "workloads:reprioritize", "events:read", "inference:submit", "comfy:submit", "comfy:read", "comfy:cancel", "artifacts:write", "artifacts:read"]
+      adapters: ["mock", "llamacpp", "comfy", "openrouter"]
+      max_priority: 50
+      concurrency_limit: 4
+      preemption_budget: 1
+      egress_policy: "local_only"
+    - id: "monitor-agent"
+      token: "dev-monitor-token"
+      plane: "agent"
+      owner_id: "home"
+      scopes: ["incidents:create", "incidents:read", "incidents:propose", "incidents:escalate", "agent:events", "workloads:read", "artifacts:read"]
+      adapters: ["mock"]
+      max_priority: 40
+      concurrency_limit: 1
+      preemption_budget: 0
+      max_incident_severity: "S1"
+      egress_policy: "local_only"
+    - id: "operator"
+      token: "dev-admin-token"
+      plane: "admin"
+      owner_id: "home"
+      scopes: ["*"]
+      adapters: ["*"]
+      max_priority: 100
+      preemption_budget: 10
+      max_incident_severity: "S4"
+      egress_policy: "cloud_allowed"
+
+notifications:
+  enabled: false
+  # Development-only literal. Production requires signing_secret_env.
+  signing_secret: ""
+  signing_secret_env: "VRAM_WEBHOOK_SIGNING_SECRET"
+  allowed_hosts: []
+  allowed_private_cidrs: []
+  allow_http: false
+  max_attempts: 8
+  base_retry_seconds: 1
+  request_timeout_seconds: 10
+  dispatch_interval_seconds: 1
+
+workloads:
+  lease_ttl_seconds: 30
+  artifact_root: "data/artifacts"
+  artifact_store:
+    type: "filesystem"
+    # Production example:
+    endpoint: ""
+    bucket: ""
+    region: "us-east-1"
+    prefix: "vram-governor"
+    access_key_env: ""
+    secret_key_env: ""
+    session_token_env: ""
+  residency:
+    enabled: true
+    reconcile_seconds: 10
+    idle_unload_seconds: 900
+    min_residency_seconds: 300
+    transition_timeout_seconds: 120
+    # Empty disables quiet-hour unloading. Example overnight window:
+    quiet_hours_start: ""
+    quiet_hours_end: ""
+  targets:
+    - id: "dev-mock"
+      adapter: "mock"
+      endpoint: "in-process"
+      models: ["verifier-9b"]
+      slots: 4
+      enabled: true
+    # Two instances may advertise the same model with different context/slot
+    # tradeoffs. Best-fit placement preserves the long-context instance.
+    - id: "local-llama-short"
+      adapter: "llamacpp"
+      endpoint: "http://127.0.0.1:8081"
+      accelerator_id: "gpu-node-01-gpu0"
+      models: ["local-model"]
+      # Enable lifecycle only for llama-server router mode. No model files are
+      # downloaded by the governor.
+      resident_models: ["local-model"]
+      supports_model_lifecycle: false
+      max_resident_models: 1
+      residency_policy: "auto"
+      idle_unload_seconds: 900
+      min_residency_seconds: 300
+      context_limit: 8192
+      slots: 4
+      enabled: false
+    - id: "local-llama-long"
+      adapter: "llamacpp"
+      endpoint: "http://127.0.0.1:8082"
+      accelerator_id: "gpu-node-02-gpu0"
+      models: ["local-model"]
+      context_limit: 32768
+      slots: 1
+      enabled: false
+    - id: "local-comfy"
+      adapter: "comfy"
+      endpoint: "http://127.0.0.1:8188"
+      accelerator_id: "gpu-node-01-gpu0"
+      slots: 1
+      enabled: false
+    - id: "openrouter"
+      adapter: "openrouter"
+      endpoint: "https://openrouter.ai/api"
+      cloud: true
+      models: ["example/model"]
+      provider: "example-provider"
+      quarantined: true
+      input_cents_per_million_tokens: 100
+      output_cents_per_million_tokens: 300
+      authorization_env: "OPENROUTER_AUTHORIZATION"
+      enabled: false
+
+agents:
+  allowed_cloud_providers: []
+  allowed_cloud_models: []
+  quarantined_models: []
+  local_verifier_models: ["verifier-9b"]
+  paid_emergency_fallback: false
+
+liveness:
+  heartbeat_interval_seconds: 2
+  suspect_after_seconds: 6
+  lost_after_seconds: 15

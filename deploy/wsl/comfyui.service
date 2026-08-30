@@ -1,0 +1,24 @@
+[Unit]
+Description=External ComfyUI runtime for VRAM Governor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vram-governor
+Group=vram-governor
+WorkingDirectory=/opt/comfyui
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HUB_OFFLINE=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=CUDA_VISIBLE_DEVICES=0
+ExecStart=/opt/comfyui/.venv/bin/python /opt/comfyui/main.py --listen 127.0.0.1 --port 8188 --disable-api-nodes --output-directory /srv/vram-governor/comfyui/output --input-directory /srv/vram-governor/comfyui/input --temp-directory /srv/vram-governor/comfyui/temp --user-directory /srv/vram-governor/comfyui/user
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGINT
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

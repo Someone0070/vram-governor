@@ -1,0 +1,60 @@
+name: Release node agent
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Build release archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          for architecture in amd64 arm64; do
+            package="vram-governor-node-agent-${version}-linux-${architecture}"
+            stage="$(mktemp -d)"
+            mkdir -p "${stage}/${package}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="${architecture}" go build \
+              -buildvcs=false -trimpath -ldflags "-s -w" \
+              -o "${stage}/${package}/vram-governor-node-agent" ./cmd/node-agent
+            install -m 0755 packaging/node-agent/install.sh "${stage}/${package}/install.sh"
+            install -m 0755 packaging/node-agent/uninstall.sh "${stage}/${package}/uninstall.sh"
+            install -m 0644 packaging/node-agent/README.txt "${stage}/${package}/README.txt"
+            install -m 0644 deploy/vram-governor-node-agent.service "${stage}/${package}/vram-governor-node-agent.service"
+            tar -C "${stage}" -czf "dist/${package}.tar.gz" "${package}"
+            (cd dist && sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256")
+            rm -rf -- "${stage}"
+          done
+
+      - name: Verify amd64 package
+        run: ./scripts/verify-node-agent-package.sh "dist/vram-governor-node-agent-${GITHUB_REF_NAME#v}-linux-amd64.tar.gz"
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1 || \
+            gh release create "${GITHUB_REF_NAME}" --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+          gh release upload "${GITHUB_REF_NAME}" dist/* --clobber

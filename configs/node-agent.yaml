@@ -1,0 +1,42 @@
+# VRAM Governor node agent config.
+# This node is co-located with the RTX 3080.
+controller_url: "ws://127.0.0.1:8080/ws/node"
+token: "dev-node-token"
+# Production wss connections require token_env and an empty literal token.
+token_env: ""
+command_signing_secret: ""
+command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
+command_state_path: "data/node-command-state.json"
+
+node_id: "gpu-node-01"
+node_name: "rtx3080-workstation"
+log_level: "info"
+
+# Capability flags, not an architectural split (architecture.md §45 #33/#34).
+location_class: "local"       # local | remote
+power_control_mode: "manual"  # auto | manual | off | dont_touch | external
+
+heartbeat_interval_seconds: 2
+capability_refresh_seconds: 30
+reconnect_min_seconds: 1
+reconnect_max_seconds: 15
+
+llamacpp:
+  servers:
+    # Add one entry per already-running llama-server. /v1/models and /slots
+    # are inspected at registration; context_limit/slots are fallbacks only.
+    - id: "local-llama-short"
+      endpoint: "http://127.0.0.1:8081"
+      public_endpoint: "http://127.0.0.1:8081"
+      accelerator_index: 0
+      router_managed: false
+      max_resident_models: 1
+      context_limit: 8192
+      slots: 4
+      runtime_args: ["--ctx-size", "8192", "--parallel", "4"]
+
+comfyui:
+  # Set endpoint to enable discovery; no installation or upgrade is performed.
+  endpoint: ""
+  public_endpoint: ""
+  accelerator_index: 0
