@@ -149,9 +149,10 @@ func main() {
 		_ = httpSrv.Shutdown(shutdownCtx)
 	}()
 
-	log.Info("controller listening", "addr", cfg.ListenAddr, "tls", cfg.Production)
+	tlsEnabled := cfg.TLSCertFile != "" && cfg.TLSKeyFile != ""
+	log.Info("controller listening", "addr", cfg.ListenAddr, "tls", tlsEnabled)
 	serve := httpSrv.ListenAndServe
-	if cfg.Production {
+	if tlsEnabled {
 		serve = func() error { return httpSrv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile) }
 	}
 	if err := serve(); err != nil && err != http.ErrServerClosed {

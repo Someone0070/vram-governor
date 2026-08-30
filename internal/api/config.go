@@ -210,6 +210,9 @@ func LoadConfig(path string) (*Config, error) {
 	if c.Notifications.MaxAttempts < 0 || c.Notifications.BaseRetrySeconds < 0 || c.Notifications.RequestTimeoutSeconds < 0 || c.Notifications.DispatchIntervalSeconds < 0 {
 		return nil, fmt.Errorf("notification retry settings may not be negative")
 	}
+	if (c.TLSCertFile == "") != (c.TLSKeyFile == "") {
+		return nil, fmt.Errorf("tls_cert_file and tls_key_file must be configured together")
+	}
 	if c.Production {
 		if c.Auth.DevelopmentBypass {
 			return nil, fmt.Errorf("production mode forbids auth.development_bypass")

@@ -20,6 +20,26 @@ func TestSampleControllerConfigParsesResidencyPolicy(t *testing.T) {
 	}
 }
 
+func TestDevelopmentTLSRequiresCertificateAndKeyTogether(t *testing.T) {
+	valid := `listen_addr: ":8443"
+tls_cert_file: "controller.crt"
+tls_key_file: "controller.key"
+auth:
+  credentials: []
+workloads:
+  artifact_store:
+    type: "filesystem"
+`
+	if _, err := LoadConfig(writeConfig(t, valid)); err != nil {
+		t.Fatalf("development TLS configuration was rejected: %v", err)
+	}
+
+	missingKey := strings.Replace(valid, "tls_key_file: \"controller.key\"\n", "", 1)
+	if _, err := LoadConfig(writeConfig(t, missingKey)); err == nil || !strings.Contains(err.Error(), "configured together") {
+		t.Fatalf("unpaired development TLS certificate was accepted: %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "controller.yaml")

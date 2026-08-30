@@ -144,6 +144,12 @@ Production mode additionally requires:
 - an HTTPS S3-compatible artifact endpoint and credentials supplied through
   the configured environment variable names.
 
+For encrypted private-LAN development, setting both `tls_cert_file` and
+`tls_key_file` also enables HTTPS/WSS while `production` is false. This keeps
+development storage and session behavior available without sending node
+credentials over plaintext WebSockets. Configuring only one TLS file is
+rejected.
+
 Generate a credential digest, for example:
 
 ```powershell
