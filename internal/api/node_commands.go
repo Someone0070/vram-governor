@@ -256,7 +256,16 @@ func (s *Server) handleNodeCommandResult(ctx context.Context, result wsproto.Com
 	}
 	command.CompletedAt = &now
 	command.UpdatedAt = now
-	_, _ = s.workloadStore.UpdateNodeCommand(ctx, command)
+	_, updateErr := s.workloadStore.UpdateNodeCommand(ctx, command)
+	if updateErr == nil && command.Status == domain.NodeCommandSucceeded && command.Command == "refresh_capabilities" {
+		body, marshalErr := json.Marshal(result.Result)
+		if marshalErr == nil {
+			var capabilities wsproto.CapabilitiesPayload
+			if json.Unmarshal(body, &capabilities) == nil {
+				s.registerAdapterAdvertisements(command.NodeID, capabilities.Adapters)
+			}
+		}
+	}
 	severity := "info"
 	if command.Status != domain.NodeCommandSucceeded {
 		severity = "error"

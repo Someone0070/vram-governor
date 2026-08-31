@@ -238,10 +238,24 @@ func TestAdminNodeCommandIsSignedDurableAndIdempotent(t *testing.T) {
 	if !wsproto.VerifyCommand(wire, srv.commandSecret) {
 		t.Fatal("stored node command signature is invalid")
 	}
-	srv.handleNodeCommandResult(context.Background(), wsproto.CommandResultPayload{ID: firstCommand.ID, NodeID: "node-1", OK: true, Result: map[string]any{"refreshed": true}, CompletedAt: time.Now().UTC()})
+	srv.handleNodeCommandResult(context.Background(), wsproto.CommandResultPayload{ID: firstCommand.ID, NodeID: "node-1", OK: true, Result: map[string]any{"adapters": []wsproto.AdapterAdvertisement{{
+		ID: "comfy", Adapter: "comfy", Endpoint: "http://node-1:8188", AcceleratorIndex: 0,
+		Models: []string{"video.safetensors"}, Version: "0.34.0", SupportsAcceleratorReclaim: true,
+	}}}, CompletedAt: time.Now().UTC()})
 	completed, _ := srv.workloadStore.GetNodeCommand(context.Background(), firstCommand.ID)
 	if completed.Status != domain.NodeCommandSucceeded {
 		t.Fatalf("command result was not persisted: %+v", completed)
+	}
+	var refreshed *workloads.Target
+	for _, target := range srv.workloads.Targets() {
+		if target.ID == "node-1-comfy" {
+			candidate := target
+			refreshed = &candidate
+			break
+		}
+	}
+	if refreshed == nil || refreshed.CapabilityVersion != "0.34.0" || len(refreshed.Models) != 1 || len(refreshed.ResidentModels) != 0 {
+		t.Fatalf("successful refresh did not immediately apply adapter inventory: %+v", refreshed)
 	}
 }
 

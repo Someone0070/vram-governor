@@ -19,6 +19,18 @@ import (
 
 func quietLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
+func TestComfyCatalogIsNotClaimedAsResidentVRAM(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterTarget(Target{
+		ID: "comfy", Adapter: "comfy", Models: []string{"video.safetensors", "vae.safetensors"},
+		SupportsAcceleratorReclaim: true, Enabled: true,
+	})
+	targets := mgr.Targets()
+	if len(targets) != 1 || len(targets[0].ResidentModels) != 0 {
+		t.Fatalf("Comfy model catalog was incorrectly marked resident: %+v", targets)
+	}
+}
+
 func TestLLMAndComfyShareOnePhysicalLease(t *testing.T) {
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {

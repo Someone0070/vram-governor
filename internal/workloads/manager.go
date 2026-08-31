@@ -124,7 +124,10 @@ func (m *Manager) RegisterTarget(target Target) {
 		m.log.Warn("invalid target residency policy; protecting target as manual", "target", target.ID, "policy", target.ResidencyPolicy)
 		target.ResidencyPolicy = domain.ResidencyManual
 	}
-	if len(target.ResidentModels) == 0 && !target.SupportsModelLifecycle {
+	// External ComfyUI advertises the model files it can load, not the models
+	// currently occupying VRAM. Treating that catalog as resident makes an
+	// idle accelerator look full and defeats honest unload/offload telemetry.
+	if len(target.ResidentModels) == 0 && !target.SupportsModelLifecycle && !strings.EqualFold(target.Adapter, "comfy") {
 		target.ResidentModels = append([]string(nil), target.Models...)
 	}
 	m.mu.Lock()
