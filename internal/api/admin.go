@@ -84,7 +84,7 @@ func (s *Server) handleAdminNodeTelemetry(w http.ResponseWriter, r *http.Request
 // readiness reports observable deployment facts, not roadmap claims. It is
 // intentionally conservative: configuration and simulator tests do not count
 // as a live integration.
-func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, profiles []*domain.InterferenceProfile) deploymentReadiness {
+func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, profiles []*domain.InterferenceProfile, samples []*domain.SchedulerLearningSample) deploymentReadiness {
 	mode := "development"
 	if s.cfg.Production {
 		mode = "production"
@@ -130,6 +130,23 @@ func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, pro
 			trustedProfiles++
 		}
 	}
+	guardedSharingSuccesses, guardedSharingRollbacks := 0, 0
+	for _, sample := range samples {
+		var predicted struct {
+			GuardedExploration bool `json:"guarded_exploration"`
+		}
+		var observed struct {
+			VRAMMB int64 `json:"vram_mb"`
+		}
+		if json.Unmarshal(sample.Predicted, &predicted) != nil || !predicted.GuardedExploration || json.Unmarshal(sample.Observed, &observed) != nil || observed.VRAMMB <= 0 {
+			continue
+		}
+		if sample.Outcome == "succeeded" {
+			guardedSharingSuccesses++
+		} else {
+			guardedSharingRollbacks++
+		}
+	}
 
 	checks := []readinessCheck{
 		{ID: "durable_state", Label: "Durable controller state", Status: persistenceStatus, Detail: persistenceDetail},
@@ -151,9 +168,12 @@ func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, pro
 		checks[5].Status = "ready"
 		checks[5].Detail = "S3-compatible artifact storage opened successfully at startup"
 	}
-	if sharingTargets > 0 && trustedProfiles > 0 {
+	if guardedSharingSuccesses > 0 {
+		checks[8].Status = "ready"
+		checks[8].Detail = fmt.Sprintf("%d measured guarded co-scheduling success(es), %d rollback sample(s), and %d trusted profile(s) are persisted", guardedSharingSuccesses, guardedSharingRollbacks, trustedProfiles)
+	} else if sharingTargets > 0 && trustedProfiles > 0 {
 		checks[8].Status = "partial"
-		checks[8].Detail = fmt.Sprintf("%d sharing target(s) and %d trusted profile(s) are configured; hardware rollback behavior still requires live acceptance", sharingTargets, trustedProfiles)
+		checks[8].Detail = fmt.Sprintf("%d sharing target(s) and %d trusted profile(s) are configured; no guarded physical co-scheduling success is recorded", sharingTargets, trustedProfiles)
 	}
 	releaseGate := "not ready"
 	if persistenceStatus == "ready" && connected > 0 && llmTargets > 0 && comfyTargets > 0 && unverifiedCapacity == 0 {
@@ -293,7 +313,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	performanceProfiles = jsonSlice(performanceProfiles)
 	nodeCommands = jsonSlice(nodeCommands)
 	targets := s.workloads.Targets()
-	writeJSON(w, http.StatusOK, map[string]any{"principal": p.ID, "readiness": s.readiness(nodes, targets, profiles), "nodes": nodes, "targets": targets, "workloads": workloads, "events": events, "model_residencies": residencies, "residency_transitions": transitions, "notifications": notifications, "budget_reservations": budgets, "scheduler_learning_samples": learning, "interference_profiles": profiles, "performance_profiles": performanceProfiles, "transition_plans": transitionPlans, "node_commands": nodeCommands, "incidents": incidents})
+	writeJSON(w, http.StatusOK, map[string]any{"principal": p.ID, "readiness": s.readiness(nodes, targets, profiles, learning), "nodes": nodes, "targets": targets, "workloads": workloads, "events": events, "model_residencies": residencies, "residency_transitions": transitions, "notifications": notifications, "budget_reservations": budgets, "scheduler_learning_samples": learning, "interference_profiles": profiles, "performance_profiles": performanceProfiles, "transition_plans": transitionPlans, "node_commands": nodeCommands, "incidents": incidents})
 }
 
 func (s *Server) handleAdminIntegrations(w http.ResponseWriter, r *http.Request) {
@@ -318,7 +338,7 @@ func (s *Server) handleAdminIntegrations(w http.ResponseWriter, r *http.Request)
 		{ID: "state", Label: "PostgreSQL authority", Enabled: s.cfg.DatabaseURL != "", Ready: s.cfg.DatabaseURL != "", Detail: map[bool]string{true: "Durable controller state is active", false: "Using restart-ephemeral in-memory state"}[s.cfg.DatabaseURL != ""]},
 		{ID: "artifacts", Label: "Artifact storage", Enabled: true, Ready: artifactReady, Detail: fmt.Sprintf("%s backend%s", artifact.Type, map[bool]string{true: " is initialized", false: " is missing required bindings"}[artifactReady]), SecretBindings: map[string]bool{"access_key": artifact.AccessKeyEnv != "" && os.Getenv(artifact.AccessKeyEnv) != "", "secret_key": artifact.SecretKeyEnv != "" && os.Getenv(artifact.SecretKeyEnv) != ""}},
 		{ID: "openrouter", Label: "OpenRouter fallback", Enabled: cloudTargets > 0, Ready: cloudTargets > 0 && cloudReady == cloudTargets, Detail: fmt.Sprintf("%d of %d cloud routes have endpoint and authorization bindings", cloudReady, cloudTargets), Allowed: append([]string(nil), s.cfg.Agents.AllowedCloudModels...)},
-		{ID: "webhooks", Label: "Signed webhook outbox", Enabled: s.cfg.Notifications.Enabled, Ready: s.cfg.Notifications.Enabled && notificationSecretReady && len(s.cfg.Notifications.AllowedHosts) > 0, Detail: fmt.Sprintf("%d allowlisted destinations; %d delivery attempts", len(s.cfg.Notifications.AllowedHosts), s.cfg.Notifications.MaxAttempts), SecretBindings: map[string]bool{"signing_secret": notificationSecretReady}, Allowed: append([]string(nil), s.cfg.Notifications.AllowedHosts...)},
+		{ID: "webhooks", Label: "Signed webhook outbox", Enabled: s.cfg.Notifications.Enabled, Ready: s.cfg.Notifications.Enabled && notificationSecretReady && len(s.cfg.Notifications.AllowedHosts) > 0, Detail: fmt.Sprintf("%d allowlisted destinations; at most %d attempts per delivery", len(s.cfg.Notifications.AllowedHosts), s.cfg.Notifications.MaxAttempts), SecretBindings: map[string]bool{"signing_secret": notificationSecretReady}, Allowed: append([]string(nil), s.cfg.Notifications.AllowedHosts...)},
 		{ID: "system_agent", Label: "System-agent escalation", Enabled: true, Ready: len(s.cfg.Agents.LocalVerifierModels) > 0, Detail: fmt.Sprintf("%d local verifiers; %d allowed cloud models; paid emergency %t", len(s.cfg.Agents.LocalVerifierModels), len(s.cfg.Agents.AllowedCloudModels), s.cfg.Agents.PaidEmergencyFallback), Allowed: append([]string(nil), s.cfg.Agents.AllowedCloudProviders...)},
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"integrations": statuses, "residency": map[string]any{"enabled": s.cfg.Workloads.Residency.Enabled == nil || *s.cfg.Workloads.Residency.Enabled, "idle_unload_seconds": s.cfg.Workloads.Residency.IdleUnloadSeconds, "min_residency_seconds": s.cfg.Workloads.Residency.MinResidencySeconds, "quiet_hours_start": s.cfg.Workloads.Residency.QuietHoursStart, "quiet_hours_end": s.cfg.Workloads.Residency.QuietHoursEnd}, "restart_required_fields": []string{"target endpoints", "credentials", "database URL", "artifact backend", "provider allowlists", "webhook allowlists"}})

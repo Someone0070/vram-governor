@@ -65,3 +65,27 @@ func TestLivenessObserverCreatesOneNodeLossIncidentAndVerifiesRecovery(t *testin
 		t.Fatalf("node lifecycle audit events missing: %+v", seen)
 	}
 }
+
+func TestLivenessDoesNotFenceOpenTransportDuringTransientHandlerStall(t *testing.T) {
+	srv, _, cancel := testServer(t)
+	defer cancel()
+	backing := srv.nodes.(*store.MemoryStore)
+	ctx := context.Background()
+	_, err := backing.UpsertNode(ctx, &domain.Node{
+		ID: "busy-node", SchedulingState: domain.SchedulingEnabled,
+		Desired:  domain.Desired{SchedulingEnabled: true},
+		Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true, LastHeartbeat: time.Now().Add(-10 * time.Second)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.nodeConnMu.Lock()
+	srv.nodeConnections["busy-node"] = &nodeConnection{}
+	srv.nodeConnMu.Unlock()
+
+	srv.sweepLiveness(ctx, 2*time.Second, 5*time.Second)
+	node, err := backing.GetNode(ctx, "busy-node")
+	if err != nil || node.Observed.Connectivity != domain.ConnectivitySuspect || !node.Observed.Ready {
+		t.Fatalf("an open transport was falsely fenced during a transient stall: %+v err=%v", node, err)
+	}
+}

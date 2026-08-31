@@ -11,12 +11,14 @@ VRAM Governor is open source under the [MIT License](LICENSE).
 
 The repository is an active prototype, not a complete A-Z production release.
 It has a broad production-shaped implementation and deterministic tests. The
-current RTX 3080 WSL deployment now runs PostgreSQL, Ollama, and an external
-ComfyUI instance against one accelerator inventory. A real Z-Image workflow,
-central artifact collection, and PostgreSQL prompt-route recovery have passed
-live acceptance. S3, OpenRouter, runtime checkpointing, and real hardware
-co-scheduling still require live acceptance, so the full production release
-gate remains open.
+current RTX 3080 WSL deployment now runs PostgreSQL, two context/slot profiles
+of the same Ollama model, and external ComfyUI routes against one accelerator
+inventory. Real Comfy workflows, central artifact collection, PostgreSQL
+prompt-route recovery, context-aware routing, demand loading, runtime drain,
+and guarded two-profile GPU sharing have passed live acceptance. S3,
+OpenRouter, runtime checkpointing, and several external failure boundaries
+still require live acceptance, so the full production release gate remains
+open.
 
 See [Implementation status](docs/implementation-status.md) for the audited
 live-proven, simulated, partial, and missing feature matrix. The Operator
@@ -49,8 +51,11 @@ results; external-boundary status is tracked in the audit linked above.
   durably backs nodes, runtime/profile records, compatibility jobs, unified
   workloads, prompt mappings, leases, approvals, notifications, incidents,
   learning profiles, transition plans, and operator target-policy overrides.
-- Restart recovery: recoverable running work is re-admitted; non-recoverable
-  interrupted work is failed rather than duplicated.
+- Restart recovery reconciles a recoverable external execution with its
+  original backend. A completed execution is collected in place; a running or
+  unknown execution is only re-admitted after backend cancellation is
+  confirmed. Otherwise it fails indeterminate rather than risking duplicate
+  execution. Non-recoverable interrupted work is never replayed.
 - Filesystem artifact storage for development and AWS-SigV4 S3-compatible
   storage for production, with owner checks, hashes, bounded uploads, and
   traversal-safe IDs.
@@ -73,9 +78,11 @@ results; external-boundary status is tracked in the audit linked above.
 - OpenRouter fallback with model/provider allowlists, route quarantine,
   per-principal budgets, actual usage settlement, bounded retries, and
   rate-limit/provider circuit breakers.
-- QoS/deadline ordering, checkpoint/yield/cancel preemption under explicit
-  victim consent and credential budgets, durable transition plans, exact-hash
-  transformation approval, and safe Comfy step/resolution transforms.
+- QoS/deadline ordering, capability-gated disruption under explicit victim
+  consent and credential budgets, durable transition plans, exact-hash
+  transformation approval, and bounded Comfy step/resolution transforms.
+  Active HTTP runtimes currently prove cancellation but not checkpoint/resume,
+  so resumable disruption is not advertised for those routes.
 - Conservative p95 VRAM composition, exclusive-run envelope bootstrapping,
   class/runtime and exact-fingerprint interference profiles, guarded
   exploration, thermal/VRAM/slowdown rollback, production sample learning,

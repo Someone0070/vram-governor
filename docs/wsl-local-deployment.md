@@ -49,9 +49,10 @@ wsl.exe -d Ubuntu -- nvidia-smi
 
 ComfyUI's `/free` endpoint was verified to release idle model allocations after
 a completed workflow (about 6.4 GiB in the acceptance run). Automatic
-cross-adapter idle reclamation is not yet represented as a durable governor
-residency transition; it remains a documented gap rather than a claimed
-feature.
+cross-adapter reclamation is now represented as a fenced, durable
+`cross_adapter_reclaim` residency transition. The same transition machinery
+unloads Ollama before Comfy work and reclaims Comfy before an Ollama demand
+load; both directions were exercised on the 3080.
 
 ## Live acceptance evidence
 
@@ -70,5 +71,9 @@ After restart, PostgreSQL restored:
 - history and `/view` retrieval for the 270,460-byte PNG.
 
 A subsequent 3B Ollama request also completed through the same accelerator
-inventory. This proves sequential dual-adapter use and exclusive leasing; it
-does not prove safe concurrent co-scheduling.
+inventory. Later acceptance added two Ollama profiles for the same artifact:
+2,048 context with two slots and 8,192 context with one slot. A bounded short
+request selected the narrow profile while a long request selected the only
+sufficient profile, and both ran concurrently under the guarded sharing
+policy. The physical 10 GiB envelope peaked at 8,412 MiB with a 1,024 MiB
+reserve and persisted a successful real-run learning sample.

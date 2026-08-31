@@ -106,19 +106,23 @@ func runOnce(ctx context.Context, cfg *Config, log *slog.Logger, sampler *System
 		log.Info("registered with controller")
 	}
 	establishedAt := time.Now()
+	sessionCtx, cancelSession := context.WithCancel(ctx)
+	defer cancelSession()
 
 	errCh := make(chan error, 2)
 	capabilitiesCh := make(chan []wsproto.AdapterAdvertisement, 1)
 	commandResultsCh := make(chan wsproto.CommandResultPayload, 8)
+	telemetryCh := make(chan wsproto.TelemetryPayload, 1)
 	commands := newCommandProcessor(cfg, log)
-	go capabilityDiscoveryLoop(ctx, cfg, log, capabilitiesCh)
+	go capabilityDiscoveryLoop(sessionCtx, cfg, log, capabilitiesCh)
+	go telemetrySamplingLoop(sessionCtx, cfg, log, sampler, logs, QueryGPUTelemetry, telemetryCh)
 
 	// Reader goroutine verifies and executes only the node agent's fixed
 	// command allowlist. Results go through the single writer goroutine.
 	go func() {
 		for {
 			var env wsproto.Envelope
-			if err := wsjson.Read(ctx, conn, &env); err != nil {
+			if err := wsjson.Read(sessionCtx, conn, &env); err != nil {
 				errCh <- err
 				return
 			}
@@ -128,21 +132,20 @@ func runOnce(ctx context.Context, cfg *Config, log *slog.Logger, sampler *System
 					log.Warn("invalid command payload", "err", err)
 					continue
 				}
-				result := commands.Handle(ctx, command)
+				result := commands.Handle(sessionCtx, command)
 				select {
 				case commandResultsCh <- result:
-				case <-ctx.Done():
+				case <-sessionCtx.Done():
 					return
 				}
 			}
 		}
 	}()
 
-	// Send one immediately so the dashboard doesn't wait a full interval.
-	// This happens on the main goroutine, strictly before the writer
-	// goroutine below starts, so there is never more than one writer at a
-	// time on the connection (coder/websocket requires a single writer).
-	if err := sendHeartbeatAndTelemetry(ctx, conn, cfg, log, sampler, logs); err != nil {
+	// Liveness is deliberately independent from GPU/system sampling. Driver
+	// tools can stall while a model is loading; that must not make a healthy
+	// node look disconnected or invalidate a running workload's lease.
+	if err := sendHeartbeat(sessionCtx, conn, cfg.NodeID); err != nil {
 		return time.Since(establishedAt), err
 	}
 
@@ -153,22 +156,27 @@ func runOnce(ctx context.Context, cfg *Config, log *slog.Logger, sampler *System
 		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
-				errCh <- ctx.Err()
+			case <-sessionCtx.Done():
+				errCh <- sessionCtx.Err()
 				return
 			case <-ticker.C:
-				if err := sendHeartbeatAndTelemetry(ctx, conn, cfg, log, sampler, logs); err != nil {
+				if err := sendHeartbeat(sessionCtx, conn, cfg.NodeID); err != nil {
+					errCh <- err
+					return
+				}
+			case telemetry := <-telemetryCh:
+				if err := sendEnvelope(sessionCtx, conn, wsproto.MsgTelemetry, telemetry); err != nil {
 					errCh <- err
 					return
 				}
 			case advertisements := <-capabilitiesCh:
 				payload := wsproto.CapabilitiesPayload{NodeID: cfg.NodeID, Adapters: advertisements}
-				if err := sendEnvelope(ctx, conn, wsproto.MsgCapabilities, payload); err != nil {
+				if err := sendEnvelope(sessionCtx, conn, wsproto.MsgCapabilities, payload); err != nil {
 					errCh <- err
 					return
 				}
 			case result := <-commandResultsCh:
-				if err := sendEnvelope(ctx, conn, wsproto.MsgCommandResult, result); err != nil {
+				if err := sendEnvelope(sessionCtx, conn, wsproto.MsgCommandResult, result); err != nil {
 					errCh <- err
 					return
 				}
@@ -233,31 +241,57 @@ func capabilityDiscoveryLoop(ctx context.Context, cfg *Config, log *slog.Logger,
 	}
 }
 
-func sendHeartbeatAndTelemetry(ctx context.Context, conn *websocket.Conn, cfg *Config, log *slog.Logger, sampler *SystemSampler, logs func() []logging.Entry) error {
-	// Liveness must never wait behind a slow driver query. Large model loads can
-	// temporarily stall nvidia-smi; send the heartbeat first so the controller
-	// does not fence a healthy node while telemetry catches up.
-	hb := wsproto.HeartbeatPayload{NodeID: cfg.NodeID, Ready: true}
-	if err := sendEnvelope(ctx, conn, wsproto.MsgHeartbeat, hb); err != nil {
-		return err
-	}
+func sendHeartbeat(ctx context.Context, conn *websocket.Conn, nodeID string) error {
+	return sendEnvelope(ctx, conn, wsproto.MsgHeartbeat, wsproto.HeartbeatPayload{NodeID: nodeID, Ready: true})
+}
 
-	accels, err := QueryGPUTelemetry(ctx)
-	if err != nil {
-		log.Warn("gpu telemetry query failed (preserving last inventory)", "err", err)
+func telemetrySamplingLoop(ctx context.Context, cfg *Config, log *slog.Logger, sampler *SystemSampler, logs func() []logging.Entry, query func(context.Context) ([]wsproto.AcceleratorTelemetry, error), out chan wsproto.TelemetryPayload) {
+	interval := time.Duration(cfg.HeartbeatIntervalSeconds) * time.Second
+	if interval <= 0 {
+		interval = 2 * time.Second
 	}
-	if err == nil {
-		tel := wsproto.TelemetryPayload{NodeID: cfg.NodeID, Accelerators: accels, System: sampler.Sample()}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var lastAccelerators []wsproto.AcceleratorTelemetry
+	for {
+		queryTimeout := 5 * time.Second
+		if interval > queryTimeout {
+			queryTimeout = interval
+		}
+		queryCtx, cancel := context.WithTimeout(ctx, queryTimeout)
+		accelerators, err := query(queryCtx)
+		cancel()
+		if err != nil {
+			log.Warn("gpu telemetry query failed (preserving last inventory)", "err", err)
+			accelerators = append([]wsproto.AcceleratorTelemetry(nil), lastAccelerators...)
+		} else {
+			lastAccelerators = append(lastAccelerators[:0], accelerators...)
+		}
+		telemetry := wsproto.TelemetryPayload{NodeID: cfg.NodeID, Accelerators: accelerators, System: sampler.Sample()}
 		if logs != nil {
 			for _, entry := range logs() {
-				tel.AgentLogs = append(tel.AgentLogs, wsproto.LogEntry{Timestamp: entry.Timestamp, Level: entry.Level, Message: entry.Message, Attributes: entry.Attributes})
+				telemetry.AgentLogs = append(telemetry.AgentLogs, wsproto.LogEntry{Timestamp: entry.Timestamp, Level: entry.Level, Message: entry.Message, Attributes: entry.Attributes})
 			}
 		}
-		if err := sendEnvelope(ctx, conn, wsproto.MsgTelemetry, tel); err != nil {
-			return err
+		select {
+		case out <- telemetry:
+		default:
+			// Keep the freshest sample without ever blocking liveness.
+			select {
+			case <-out:
+			default:
+			}
+			select {
+			case out <- telemetry:
+			default:
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
-	return nil
 }
 
 func sendEnvelope(ctx context.Context, conn *websocket.Conn, t wsproto.MsgType, payload any) error {

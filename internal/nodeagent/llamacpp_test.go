@@ -75,7 +75,7 @@ func TestDiscoverLlamaCPPUsesOllamaRunningModelsForResidency(t *testing.T) {
 		case "/v1/models":
 			_ = json.NewEncoder(w).Encode(map[string]any{"data": []any{map[string]any{"id": "small"}, map[string]any{"id": "large"}}})
 		case "/api/ps":
-			_ = json.NewEncoder(w).Encode(map[string]any{"models": []any{map[string]any{"name": "small", "model": "small"}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"models": []any{map[string]any{"name": "small", "model": "small", "size_vram": 2 * 1024 * 1024 * 1024}}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -88,5 +88,8 @@ func TestDiscoverLlamaCPPUsesOllamaRunningModelsForResidency(t *testing.T) {
 	}
 	if !advertisement.SupportsModelLifecycle || len(advertisement.Models) != 2 || len(advertisement.ResidentModels) != 1 || advertisement.ResidentModels[0] != "small" {
 		t.Fatalf("Ollama catalog/residency discovery is incorrect: %+v", advertisement)
+	}
+	if advertisement.StandaloneVRAMMB != 2048 || !advertisement.StandaloneVRAMVerified || advertisement.StandaloneVRAMSource != "runtime:/api/ps:size_vram" {
+		t.Fatalf("Ollama runtime VRAM envelope is incomplete: %+v", advertisement)
 	}
 }

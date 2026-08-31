@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,6 +29,85 @@ func TestComfyCatalogIsNotClaimedAsResidentVRAM(t *testing.T) {
 	targets := mgr.Targets()
 	if len(targets) != 1 || len(targets[0].ResidentModels) != 0 {
 		t.Fatalf("Comfy model catalog was incorrectly marked resident: %+v", targets)
+	}
+}
+
+func TestRuntimeRefreshPreservesMeasuredCapacityAndLearnedEnvelope(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterTarget(Target{
+		ID: "node-short", Adapter: "llamacpp", AcceleratorID: "node-gpu0",
+		CapabilityVersion: "ollama-v1", AcceleratorVRAMMB: 10240,
+		StandaloneVRAMMB: 3072, WorkloadClass: "llm", PredictedSlowdown: 1.1,
+		ContextLimit: 2048, Slots: 2, Enabled: true,
+	})
+	// A periodic runtime advertisement does not carry scheduler learning or
+	// physical telemetry. Those values must not disappear.
+	mgr.RegisterTarget(Target{
+		ID: "node-short", Adapter: "llamacpp", AcceleratorID: "node-gpu0",
+		CapabilityVersion: "ollama-v1", ContextLimit: 2048, Slots: 2, Enabled: true,
+	})
+	target := mgr.Targets()[0]
+	if target.AcceleratorVRAMMB != 10240 || target.StandaloneVRAMMB != 3072 || target.WorkloadClass != "llm" || target.PredictedSlowdown != 1.1 {
+		t.Fatalf("runtime refresh erased scheduler evidence: %+v", target)
+	}
+
+	mgr.UpdateAcceleratorCapacity("node-gpu0", 12288)
+	target = mgr.Targets()[0]
+	if target.AcceleratorVRAMMB != 12288 {
+		t.Fatalf("live accelerator capacity was not applied: %+v", target)
+	}
+}
+
+func TestCapacityArrivalReappliesPersistedSharingPolicy(t *testing.T) {
+	backing := store.NewMemoryStore()
+	_, err := backing.UpsertTargetPolicyOverride(context.Background(), &domain.TargetPolicyOverride{
+		TargetID: "node-short", Enabled: true, SharingEnabled: true, GuardedExploration: true,
+		VRAMReserveMB: 1024, MaxSlowdown: 1.5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(quietLogger(), backing, time.Second)
+	manager.RegisterTarget(Target{ID: "node-short", Adapter: "llamacpp", AcceleratorID: "node-gpu0", Enabled: true})
+	if manager.Targets()[0].SharingEnabled {
+		t.Fatal("sharing policy should wait for a physical capacity envelope")
+	}
+	manager.UpdateAcceleratorCapacity("node-gpu0", 10240)
+	target := manager.Targets()[0]
+	if !target.SharingEnabled || !target.GuardedExploration || target.VRAMReserveMB != 1024 || target.MaxSlowdown != 1.5 {
+		t.Fatalf("persisted policy was not restored after telemetry arrived: %+v", target)
+	}
+}
+
+func TestCapabilityChangeInvalidatesOldRuntimeEnvelope(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterTarget(Target{
+		ID: "route", Adapter: "llamacpp", AcceleratorID: "gpu0", CapabilityVersion: "v1",
+		StandaloneVRAMMB: 5000, StandaloneVRAMSource: "learned-total", Enabled: true,
+	})
+	mgr.RegisterTarget(Target{
+		ID: "route", Adapter: "llamacpp", AcceleratorID: "gpu0", CapabilityVersion: "v2", Enabled: true,
+	})
+	target := mgr.Targets()[0]
+	if target.StandaloneVRAMMB != 0 || target.StandaloneVRAMSource != "" || target.StandaloneVRAMVerified {
+		t.Fatalf("new runtime capability inherited a stale envelope: %+v", target)
+	}
+}
+
+func TestNodeTargetReconciliationRemovesOnlyInactiveStaleRoutes(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterTarget(Target{ID: "node-a-old", Adapter: "llamacpp", Enabled: true})
+	mgr.RegisterTarget(Target{ID: "node-a-current", Adapter: "llamacpp", Enabled: true})
+	mgr.RegisterTarget(Target{ID: "node-b-route", Adapter: "llamacpp", Enabled: true})
+	mgr.RegisterTarget(Target{ID: "static-route", Adapter: "llamacpp", Enabled: true})
+
+	mgr.ReconcileNodeTargets("node-a", map[string]struct{}{"node-a-current": {}})
+	ids := map[string]bool{}
+	for _, target := range mgr.Targets() {
+		ids[target.ID] = true
+	}
+	if ids["node-a-old"] || !ids["node-a-current"] || !ids["node-b-route"] || !ids["static-route"] {
+		t.Fatalf("unexpected reconciled targets: %+v", ids)
 	}
 }
 
@@ -230,6 +310,164 @@ func TestLLMAdapterUsesBoundedContextAndStripsGovernorMetadata(t *testing.T) {
 	}
 }
 
+func TestLocalLLMAsyncExecutionIsObservableAndCancellable(t *testing.T) {
+	request := domain.WorkloadRequest{Payload: json.RawMessage(`{"model":"same-model","messages":[{"role":"user","content":"hello"}]}`)}
+
+	cancelStarted := make(chan struct{})
+	backendCancelled := make(chan struct{})
+	cancelBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(cancelStarted)
+		flusher, _ := w.(http.Flusher)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-r.Context().Done():
+				close(backendCancelled)
+				return
+			case <-ticker.C:
+				_, _ = w.Write([]byte(" "))
+				if flusher != nil {
+					flusher.Flush()
+				}
+			}
+		}
+	}))
+	defer cancelBackend.Close()
+	cancelAdapter := NewHTTPAdapter("llamacpp", "llama", cancelBackend.Client())
+	handle, err := cancelAdapter.StartAsync(context.Background(), request, nil, Target{ID: "llm", Endpoint: cancelBackend.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cancelStarted:
+	case <-time.After(time.Second):
+		t.Fatal("async backend did not start")
+	}
+	observation, err := cancelAdapter.Observe(context.Background(), request, nil, handle, Target{})
+	if err != nil || observation.Status != domain.WorkloadRunning {
+		t.Fatalf("in-flight LLM was not observable: %+v err=%v", observation, err)
+	}
+	cancelCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cancelAdapter.Cancel(cancelCtx, handle, Target{}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-backendCancelled:
+	case <-time.After(time.Second):
+		t.Fatal("async cancellation did not reach the backend")
+	}
+
+	// A separate run proves completion output and performance survive polling.
+	completeStarted := make(chan struct{})
+	released := make(chan struct{})
+	completeBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(completeStarted)
+		<-released
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": "chat-async", "usage": map[string]int{"prompt_tokens": 2, "completion_tokens": 1}})
+	}))
+	defer completeBackend.Close()
+	completeAdapter := NewHTTPAdapter("llamacpp", "llama", completeBackend.Client())
+	handle, err = completeAdapter.StartAsync(context.Background(), request, nil, Target{ID: "llm", Endpoint: completeBackend.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-completeStarted
+	close(released)
+	deadline := time.Now().Add(time.Second)
+	for {
+		observation, err = completeAdapter.Observe(context.Background(), request, nil, handle, Target{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if observation.Status == domain.WorkloadSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("async completion was not observed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	output, _, err := completeAdapter.CollectOutputs(context.Background(), request, nil, handle, Target{})
+	if err != nil || !strings.Contains(string(output), "chat-async") || handle.Performance == nil {
+		t.Fatalf("async output/performance was lost: output=%s handle=%+v err=%v", output, handle, err)
+	}
+}
+
+func TestBuiltInAdaptersRejectUnimplementedDisruptionPromises(t *testing.T) {
+	manager := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	manager.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", nil))
+	manager.RegisterAdapter(NewHTTPAdapter("openrouter", "openrouter", nil))
+	base := domain.WorkloadRequest{OwnerID: "owner", Payload: json.RawMessage(`{"model":"m","messages":[{"role":"user","content":"hello"}]}`)}
+
+	checkpoint := base
+	checkpoint.Adapter = "llamacpp"
+	checkpoint.Disruption = domain.DisruptionCheckpointable
+	if _, _, err := manager.Submit(context.Background(), checkpoint); err == nil || !strings.Contains(err.Error(), "checkpoint/resume") {
+		t.Fatalf("unsupported checkpoint promise was accepted: %v", err)
+	}
+
+	cloudCancel := base
+	cloudCancel.Adapter = "openrouter"
+	cloudCancel.Disruption = domain.DisruptionCancelable
+	if _, _, err := manager.Submit(context.Background(), cloudCancel); err == nil || !strings.Contains(err.Error(), "in-flight cancellation") {
+		t.Fatalf("unsupported cloud cancellation promise was accepted: %v", err)
+	}
+}
+
+func TestManagerPersistsFinalAsyncLLMPerformance(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":    "chat-durable-performance",
+			"usage": map[string]int{"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12},
+		})
+	}))
+	defer backend.Close()
+
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	mgr.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", backend.Client()))
+	mgr.RegisterTarget(Target{ID: "llm", Adapter: "llamacpp", Endpoint: backend.URL, Models: []string{"model"}, ResidentModels: []string{"model"}, ContextLimit: 4096, Slots: 1, CapacityVerified: true, Enabled: true})
+	mgr.Start(ctx)
+	row, _, err := mgr.Submit(ctx, domain.WorkloadRequest{OwnerID: "owner", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"model","messages":[{"role":"user","content":"hello"}]}`), Bounds: domain.WorkloadBounds{ContextTokens: 32, MaxOutput: 8}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer waitCancel()
+	finished, err := mgr.Wait(waitCtx, row.Request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Execution == nil || finished.Execution.Performance == nil {
+		t.Fatalf("final async performance was not persisted: %+v", finished.Execution)
+	}
+	performance := finished.Execution.Performance
+	if performance.PromptTokens != 8 || performance.CompletionTokens != 4 || performance.TotalTokens != 12 || performance.Source != "gateway_wall_clock_async" {
+		t.Fatalf("unexpected durable performance: %+v", performance)
+	}
+}
+
+func TestCompletedSlowdownUsesMeasuredStandaloneDuration(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	target := Target{ID: "llm", Adapter: "llamacpp", AcceleratorID: "gpu", CapabilityVersion: "runtime-v1", ModelFingerprint: "model-v1", WorkloadClass: "llm"}
+	request := domain.WorkloadRequest{Adapter: "llamacpp", WorkloadType: "llm.chat", Bounds: domain.WorkloadBounds{ContextTokens: 512, MaxOutput: 32}}
+	mgr.interferenceProfiles[standaloneRequestProfileKey(target, request)] = &domain.InterferenceProfile{Samples: 2, P95DurationMS: 1000}
+	workload := &domain.Workload{Request: request}
+
+	ratio := mgr.completedSlowdown(workload, target, &domain.ExecutionHandle{Performance: &domain.ExecutionPerformance{DurationMS: 1500}}, time.Now())
+	if math.Abs(ratio-1.5) > .001 {
+		t.Fatalf("expected 1.5x measured slowdown, got %f", ratio)
+	}
+	ratio = mgr.completedSlowdown(workload, target, &domain.ExecutionHandle{Performance: &domain.ExecutionPerformance{DurationMS: 750}}, time.Now())
+	if ratio != 1 {
+		t.Fatalf("faster shared execution must normalize to 1x, got %f", ratio)
+	}
+}
+
 func TestComfyRequirementsAreInferredFromWorkflowLoadersAndNodeClasses(t *testing.T) {
 	adapter := NewHTTPAdapter("comfy", "comfy", nil)
 	payload := json.RawMessage(`{"prompt":{"1":{"class_type":"UNETLoader","inputs":{"unet_name":"z_image.safetensors"}},"2":{"class_type":"VAELoader","inputs":{"vae_name":"ae.safetensors"}},"3":{"class_type":"PrivateSampler","inputs":{"seed":1}}}}`)
@@ -316,6 +554,47 @@ func TestContextBestFitPreservesLargeContextTarget(t *testing.T) {
 	}
 	if long.Plan == nil || long.Plan.TargetID != "long-context" {
 		t.Fatalf("long request should only use the sufficient target: %+v", long)
+	}
+}
+
+type profileLifecycleMock struct{ *MockAdapter }
+
+func (a *profileLifecycleMock) Name() string { return "profile-mock" }
+func (a *profileLifecycleMock) Requirements(_ context.Context, req domain.WorkloadRequest) (Requirements, error) {
+	var body struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(req.Payload, &body)
+	return Requirements{Model: body.Model, ContextTokens: req.Bounds.ContextTokens + req.Bounds.MaxOutput, AcceleratorRequired: true}, nil
+}
+func (a *profileLifecycleMock) LoadModel(context.Context, Target, string) error   { return nil }
+func (a *profileLifecycleMock) UnloadModel(context.Context, Target, string) error { return nil }
+
+func TestContextBestFitBeatsResidentLongProfile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	adapter := &profileLifecycleMock{MockAdapter: NewMockAdapter()}
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterAdapter(adapter)
+	mgr.RegisterTarget(Target{
+		ID: "short-cold", Adapter: adapter.Name(), Endpoint: "in-process", AcceleratorID: "gpu-short",
+		Models: []string{"same-model"}, ContextLimit: 2048, Slots: 2, SupportsModelLifecycle: true, Enabled: true,
+	})
+	mgr.RegisterTarget(Target{
+		ID: "long-hot", Adapter: adapter.Name(), Endpoint: "in-process", AcceleratorID: "gpu-long",
+		Models: []string{"same-model"}, ResidentModels: []string{"same-model"}, ContextLimit: 8192, Slots: 1, SupportsModelLifecycle: true, Enabled: true,
+	})
+	mgr.Start(ctx)
+
+	row, _, err := mgr.Submit(ctx, domain.WorkloadRequest{
+		OwnerID: "owner", Adapter: adapter.Name(), Payload: json.RawMessage(`{"model":"same-model"}`),
+		Bounds: domain.WorkloadBounds{ContextTokens: 512, MaxOutput: 32},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Plan == nil || row.Plan.TargetID != "short-cold" {
+		t.Fatalf("resident long-context route stole a short request: %+v", row)
 	}
 }
 
@@ -1035,6 +1314,78 @@ func TestRestartDoesNotReplayInterruptedTransitionPlan(t *testing.T) {
 	}
 }
 
+type completedRestartAdapter struct {
+	*MockAdapter
+	starts int
+}
+
+func newCompletedRestartAdapter() *completedRestartAdapter {
+	return &completedRestartAdapter{MockAdapter: NewMockAdapter()}
+}
+
+func (a *completedRestartAdapter) Name() string { return "restart-complete" }
+func (a *completedRestartAdapter) Start(ctx context.Context, req domain.WorkloadRequest, plan *domain.ExecutionPlan, target Target) (*domain.ExecutionHandle, error) {
+	a.starts++
+	return a.MockAdapter.Start(ctx, req, plan, target)
+}
+func (a *completedRestartAdapter) Observe(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, *domain.ExecutionHandle, Target) (Observation, error) {
+	return Observation{Status: domain.WorkloadSucceeded, Progress: 1}, nil
+}
+func (a *completedRestartAdapter) CollectOutputs(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, *domain.ExecutionHandle, Target) (json.RawMessage, []string, error) {
+	return json.RawMessage(`{"recovered":true}`), nil, nil
+}
+
+func TestRestartReattachesCompletedExternalExecutionWithoutDuplicateStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backing := store.NewMemoryStore()
+	now := time.Now().UTC()
+	request := domain.WorkloadRequest{ID: "restart-work", OwnerID: "owner", Adapter: "restart-complete", Payload: json.RawMessage(`{}`), Recoverable: true}
+	_, created, err := backing.CreateWorkload(ctx, &domain.Workload{
+		Request: request, Status: domain.WorkloadRunning,
+		Plan:      &domain.ExecutionPlan{ID: "plan-before-restart", WorkloadID: request.ID, TargetID: "restart-target", AcceleratorID: "gpu-0"},
+		Execution: &domain.ExecutionHandle{ExternalID: "external-before-restart", StartedAt: now},
+		CreatedAt: now, UpdatedAt: now, StartedAt: &now, ExecutionAttempts: 1,
+	})
+	if err != nil || !created {
+		t.Fatalf("seed running workload: created=%t err=%v", created, err)
+	}
+	adapter := newCompletedRestartAdapter()
+	manager := NewManager(quietLogger(), backing, time.Second)
+	manager.RegisterAdapter(adapter)
+	manager.RegisterTarget(Target{ID: "restart-target", Adapter: adapter.Name(), AcceleratorID: "gpu-0", Enabled: true})
+	manager.Start(ctx)
+	recovered, err := manager.Get(ctx, request.ID)
+	if err != nil || recovered.Status != domain.WorkloadSucceeded || !strings.Contains(string(recovered.InlineOutput), "recovered") || recovered.ExecutionAttempts != 1 || adapter.starts != 0 {
+		t.Fatalf("persisted execution was duplicated instead of reattached: %+v starts=%d err=%v", recovered, adapter.starts, err)
+	}
+}
+
+func TestRestartDoesNotReplayExecutionWhoseBackendStateCannotBeConfirmed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backing := store.NewMemoryStore()
+	now := time.Now().UTC()
+	request := domain.WorkloadRequest{ID: "restart-stale", OwnerID: "owner", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"m","messages":[{"role":"user","content":"hello"}]}`), Recoverable: true}
+	_, _, err := backing.CreateWorkload(ctx, &domain.Workload{
+		Request: request, Status: domain.WorkloadRunning,
+		Plan:      &domain.ExecutionPlan{ID: "stale-plan", WorkloadID: request.ID, TargetID: "llm", AcceleratorID: "gpu-0"},
+		Execution: &domain.ExecutionHandle{ExternalID: "http-run-from-dead-controller", StartedAt: now},
+		CreatedAt: now, UpdatedAt: now, StartedAt: &now, ExecutionAttempts: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(quietLogger(), backing, time.Second)
+	manager.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", nil))
+	manager.RegisterTarget(Target{ID: "llm", Adapter: "llamacpp", Endpoint: "http://127.0.0.1:1", AcceleratorID: "gpu-0", Enabled: true})
+	manager.Start(ctx)
+	recovered, err := manager.Get(ctx, request.ID)
+	if err != nil || recovered.Status != domain.WorkloadFailed || recovered.ExecutionAttempts != 1 || !strings.Contains(recovered.Error, "not duplicated") {
+		t.Fatalf("unconfirmed restart execution was replayed: %+v err=%v", recovered, err)
+	}
+}
+
 type lateResultAdapter struct{ release chan struct{} }
 
 func (lateResultAdapter) Name() string                                           { return "late" }
@@ -1065,6 +1416,13 @@ func (lateResultAdapter) Resume(context.Context, domain.WorkloadRequest, *domain
 func (lateResultAdapter) Cancel(context.Context, *domain.ExecutionHandle, Target) error { return nil }
 func (lateResultAdapter) CollectOutputs(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, *domain.ExecutionHandle, Target) (json.RawMessage, []string, error) {
 	return json.RawMessage(`{"ok":true}`), nil, nil
+}
+
+type unconfirmedStopAdapter struct{ lateResultAdapter }
+
+func (unconfirmedStopAdapter) Name() string { return "unconfirmed-stop" }
+func (unconfirmedStopAdapter) Cancel(context.Context, *domain.ExecutionHandle, Target) error {
+	return ErrUnsupported
 }
 
 func TestNodeLossRequeuesRecoverableWorkAndIgnoresLateFencedResult(t *testing.T) {
@@ -1127,6 +1485,51 @@ func TestNodeLossRequeuesRecoverableWorkAndIgnoresLateFencedResult(t *testing.T)
 	finished, err := mgr.Wait(waitCtx, row.Request.ID)
 	if err != nil || finished.Status != domain.WorkloadSucceeded || finished.ExecutionAttempts != 2 {
 		t.Fatalf("recoverable work did not reschedule exactly once: %+v err=%v", finished, err)
+	}
+}
+
+func TestNodeLossDoesNotDuplicateRecoverableWorkWhenBackendStopIsUnconfirmed(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	backing := store.NewMemoryStore()
+	now := time.Now().UTC()
+	node := &domain.Node{ID: "node", Name: "node", SchedulingState: domain.SchedulingEnabled, Desired: domain.Desired{SchedulingEnabled: true}, Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true, LastSeenAt: now}, Accelerators: []domain.Accelerator{{ID: "gpu-0", NodeID: "node", VRAMTotalMB: 24_000, VRAMFreeMB: 24_000}}}
+	if _, err := backing.UpsertNode(ctx, node); err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	adapter := unconfirmedStopAdapter{lateResultAdapter{release: release}}
+	manager := NewManager(quietLogger(), backing, 200*time.Millisecond)
+	manager.SetNodeStore(backing)
+	manager.RegisterAdapter(adapter)
+	manager.RegisterTarget(Target{ID: "unconfirmed-target", Adapter: adapter.Name(), AcceleratorID: "gpu-0", Enabled: true})
+	manager.Start(ctx)
+	row, _, err := manager.Submit(ctx, domain.WorkloadRequest{OwnerID: "owner", Adapter: adapter.Name(), Payload: json.RawMessage(`{}`), Recoverable: true, IdempotencyKey: "must-not-duplicate"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		row, _ = manager.Get(ctx, row.Request.ID)
+		if row.Execution != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if row.Execution == nil {
+		t.Fatal("execution did not start")
+	}
+	if err := backing.UpdateObserved(ctx, "node", func(observed *domain.Observed, _ *[]domain.Accelerator) {
+		observed.Connectivity = domain.ConnectivityLost
+		observed.Ready = false
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager.reconcile(ctx)
+	close(release)
+	finished, err := manager.Get(ctx, row.Request.ID)
+	if err != nil || finished.Status != domain.WorkloadFailed || finished.ExecutionAttempts != 1 || !strings.Contains(finished.Error, "not duplicated") {
+		t.Fatalf("unconfirmed backend execution was re-admitted: %+v err=%v", finished, err)
 	}
 }
 

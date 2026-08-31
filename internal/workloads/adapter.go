@@ -81,6 +81,8 @@ type Target struct {
 	CircuitFailures            int                        `json:"circuit_failures,omitempty" yaml:"-"`
 	WorkloadClass              string                     `json:"workload_class,omitempty" yaml:"workload_class"`
 	StandaloneVRAMMB           int64                      `json:"standalone_vram_mb,omitempty" yaml:"standalone_vram_mb"`
+	StandaloneVRAMSource       string                     `json:"standalone_vram_source,omitempty" yaml:"-"`
+	StandaloneVRAMVerified     bool                       `json:"standalone_vram_verified" yaml:"-"`
 	AcceleratorVRAMMB          int64                      `json:"accelerator_vram_mb,omitempty" yaml:"accelerator_vram_mb"`
 	VRAMReserveMB              int64                      `json:"vram_reserve_mb,omitempty" yaml:"vram_reserve_mb"`
 	SharingEnabled             bool                       `json:"sharing_enabled" yaml:"sharing_enabled"`
@@ -128,6 +130,27 @@ type Adapter interface {
 // the backend response body and must return promptly on client cancellation.
 type StreamingAdapter interface {
 	StartStream(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, Target, func([]byte) error) (*domain.ExecutionHandle, error)
+}
+
+// AsyncStartAdapter lets a polling runtime return control to the scheduler
+// while the backend request is still executing. This is required for live
+// guardrails and cancellation; a synchronous Start cannot be observed until
+// after the risky work has already finished.
+type AsyncStartAdapter interface {
+	StartAsync(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, Target) (*domain.ExecutionHandle, error)
+}
+
+// DisruptionCapabilities makes preemption promises explicit. Built-in
+// adapters implement this so a request cannot claim resumability that its
+// selected runtime does not actually provide.
+type DisruptionCapabilities struct {
+	Yield      bool `json:"yield"`
+	Checkpoint bool `json:"checkpoint"`
+	Cancel     bool `json:"cancel"`
+}
+
+type DisruptionCapabilityAdapter interface {
+	DisruptionCapabilities() DisruptionCapabilities
 }
 
 // ModelLifecycleAdapter controls models already known to an allowlisted

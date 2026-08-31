@@ -72,6 +72,9 @@ type AdapterAdvertisement struct {
 	WarmRAMSupported           bool     `json:"warm_ram_supported,omitempty"`
 	QueueRunning               int      `json:"queue_running,omitempty"`
 	QueuePending               int      `json:"queue_pending,omitempty"`
+	StandaloneVRAMMB           int64    `json:"standalone_vram_mb,omitempty"`
+	StandaloneVRAMSource       string   `json:"standalone_vram_source,omitempty"`
+	StandaloneVRAMVerified     bool     `json:"standalone_vram_verified,omitempty"`
 }
 
 // AcceleratorTelemetry mirrors the live fields of domain.Accelerator that

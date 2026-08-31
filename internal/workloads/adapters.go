@@ -31,6 +31,20 @@ type HTTPAdapter struct {
 	artifacts     artifacts.Store
 	progressMu    sync.RWMutex
 	comfyProgress map[string]Observation
+	runMu         sync.Mutex
+	runs          map[string]*httpRun
+}
+
+type httpRun struct {
+	done        bool
+	output      json.RawMessage
+	err         error
+	status      int
+	startedAt   time.Time
+	finishedAt  time.Time
+	backendID   string
+	performance *domain.ExecutionPerformance
+	cancel      context.CancelFunc
 }
 
 func (a *HTTPAdapter) SetArtifactStore(store artifacts.Store) { a.artifacts = store }
@@ -39,11 +53,14 @@ func NewHTTPAdapter(name, kind string, client *http.Client) *HTTPAdapter {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Minute}
 	}
-	return &HTTPAdapter{name: name, version: "v1", kind: kind, client: client, comfyProgress: make(map[string]Observation)}
+	return &HTTPAdapter{name: name, version: "v1", kind: kind, client: client, comfyProgress: make(map[string]Observation), runs: make(map[string]*httpRun)}
 }
 
 func (a *HTTPAdapter) Name() string    { return a.name }
 func (a *HTTPAdapter) Version() string { return a.version }
+func (a *HTTPAdapter) DisruptionCapabilities() DisruptionCapabilities {
+	return DisruptionCapabilities{Cancel: a.kind == "llama" || a.kind == "comfy"}
+}
 
 func (a *HTTPAdapter) Validate(ctx context.Context, req domain.WorkloadRequest) error {
 	if len(req.Payload) == 0 || !json.Valid(req.Payload) {
@@ -258,6 +275,62 @@ func (a *HTTPAdapter) Start(ctx context.Context, req domain.WorkloadRequest, pla
 		h.ExternalID = accepted.ID
 	}
 	return h, nil
+}
+
+// StartAsync is deliberately limited to local LLM HTTP routes. Cloud
+// providers retain their synchronous start path so provider errors can make
+// an immediate, bounded fallback decision. Streaming requests use
+// StartStream and preserve client backpressure directly.
+func (a *HTTPAdapter) StartAsync(ctx context.Context, req domain.WorkloadRequest, plan *domain.ExecutionPlan, target Target) (*domain.ExecutionHandle, error) {
+	if a.kind != "llama" {
+		return nil, ErrUnsupported
+	}
+	payload := req.Payload
+	if plan != nil && len(plan.Material) > 0 {
+		payload = plan.Material
+	}
+	var body map[string]any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return nil, err
+	}
+	body["stream"] = false
+	delete(body, "governor")
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return nil, err
+	}
+	startedAt := time.Now().UTC()
+	id := newID("http-run")
+	runCtx, cancel := context.WithCancel(ctx)
+	a.runMu.Lock()
+	a.runs[id] = &httpRun{startedAt: startedAt, cancel: cancel}
+	a.runMu.Unlock()
+	go func() {
+		result, status, _, requestErr := a.request(runCtx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/chat/completions", target.Authorization, payload)
+		finishedAt := time.Now().UTC()
+		backendID := ""
+		if requestErr == nil && status >= 200 && status < 300 {
+			var accepted struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(result, &accepted)
+			backendID = accepted.ID
+		} else if requestErr == nil {
+			requestErr = fmt.Errorf("llama backend returned %d: %s", status, truncate(result, 512))
+		}
+		a.runMu.Lock()
+		if run := a.runs[id]; run != nil {
+			run.done = true
+			run.output = append(json.RawMessage(nil), result...)
+			run.err = requestErr
+			run.status = status
+			run.finishedAt = finishedAt
+			run.backendID = backendID
+			run.performance = executionPerformance(startedAt, finishedAt, time.Time{}, result, "gateway_wall_clock_async")
+		}
+		a.runMu.Unlock()
+	}()
+	return &domain.ExecutionHandle{ExternalID: id, StartedAt: startedAt}, nil
 }
 
 func (a *HTTPAdapter) observeComfyWebSocket(ctx context.Context, target Target, clientID, promptID string) {
@@ -680,6 +753,30 @@ func routerModelLoaded(body []byte, wanted string) (loaded, known bool) {
 }
 
 func (a *HTTPAdapter) Observe(ctx context.Context, req domain.WorkloadRequest, plan *domain.ExecutionPlan, h *domain.ExecutionHandle, target Target) (Observation, error) {
+	if a.kind == "llama" && strings.HasPrefix(h.ExternalID, "http-run-") {
+		a.runMu.Lock()
+		run := a.runs[h.ExternalID]
+		if run == nil {
+			a.runMu.Unlock()
+			return Observation{}, fmt.Errorf("local LLM execution state %s is unavailable", h.ExternalID)
+		}
+		done, runErr := run.done, run.err
+		output := append(json.RawMessage(nil), run.output...)
+		performance := run.performance
+		a.runMu.Unlock()
+		if !done {
+			return Observation{Status: domain.WorkloadRunning}, nil
+		}
+		if runErr != nil {
+			return Observation{}, runErr
+		}
+		h.Opaque = output
+		if performance != nil {
+			copy := *performance
+			h.Performance = &copy
+		}
+		return Observation{Status: domain.WorkloadSucceeded, Progress: 1}, nil
+	}
 	if a.kind != "comfy" {
 		return Observation{Status: domain.WorkloadSucceeded, Progress: 1}, nil
 	}
@@ -735,6 +832,32 @@ func (a *HTTPAdapter) Resume(context.Context, domain.WorkloadRequest, *domain.Ex
 }
 
 func (a *HTTPAdapter) Cancel(ctx context.Context, h *domain.ExecutionHandle, target Target) error {
+	if a.kind == "llama" && h != nil && strings.HasPrefix(h.ExternalID, "http-run-") {
+		a.runMu.Lock()
+		run := a.runs[h.ExternalID]
+		if run == nil {
+			a.runMu.Unlock()
+			return fmt.Errorf("local LLM execution state %s is unavailable; backend stop cannot be confirmed", h.ExternalID)
+		}
+		cancel := run.cancel
+		done := run.done
+		a.runMu.Unlock()
+		if cancel != nil && !done {
+			cancel()
+		}
+		for !done {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(25 * time.Millisecond):
+				a.runMu.Lock()
+				run = a.runs[h.ExternalID]
+				done = run == nil || run.done
+				a.runMu.Unlock()
+			}
+		}
+		return nil
+	}
 	if a.kind != "comfy" || h.ExternalID == "" {
 		return ErrUnsupported
 	}
@@ -811,7 +934,13 @@ func (a *HTTPAdapter) CollectOutputs(ctx context.Context, req domain.WorkloadReq
 	if a.kind == "comfy" && a.artifacts != nil && len(h.Opaque) > 0 {
 		return a.collectComfyOutputs(ctx, req, h.Opaque, target)
 	}
-	return append(json.RawMessage(nil), h.Opaque...), nil, nil
+	output := append(json.RawMessage(nil), h.Opaque...)
+	if a.kind == "llama" && strings.HasPrefix(h.ExternalID, "http-run-") {
+		a.runMu.Lock()
+		delete(a.runs, h.ExternalID)
+		a.runMu.Unlock()
+	}
+	return output, nil, nil
 }
 
 func (a *HTTPAdapter) stageComfyInputs(ctx context.Context, req domain.WorkloadRequest, target Target) error {
@@ -998,6 +1127,9 @@ type MockAdapter struct {
 func NewMockAdapter() *MockAdapter     { return &MockAdapter{runs: make(map[string]json.RawMessage)} }
 func (a *MockAdapter) Name() string    { return "mock" }
 func (a *MockAdapter) Version() string { return "v1" }
+func (a *MockAdapter) DisruptionCapabilities() DisruptionCapabilities {
+	return DisruptionCapabilities{Cancel: true}
+}
 func (a *MockAdapter) Validate(ctx context.Context, req domain.WorkloadRequest) error {
 	if !json.Valid(req.Payload) {
 		return fmt.Errorf("invalid JSON payload")

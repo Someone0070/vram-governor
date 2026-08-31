@@ -63,6 +63,8 @@ type providerCircuit struct {
 	OpenUntil time.Time
 }
 
+const restartReconciliationBlocker = "controller restarted; reconciling prior backend execution"
+
 func NewManager(log *slog.Logger, backing store.WorkloadStore, leaseTTL time.Duration) *Manager {
 	if leaseTTL <= 0 {
 		leaseTTL = 30 * time.Second
@@ -130,9 +132,46 @@ func (m *Manager) RegisterTarget(target Target) {
 	if len(target.ResidentModels) == 0 && !target.SupportsModelLifecycle && !strings.EqualFold(target.Adapter, "comfy") {
 		target.ResidentModels = append([]string(nil), target.Models...)
 	}
+	// Capability advertisements intentionally contain runtime facts, not the
+	// controller's learned envelopes. Preserve the latter across the periodic
+	// node refresh or every refresh would erase the evidence required for safe
+	// sharing. Live accelerator capacity may also arrive slightly before or
+	// after runtime discovery, so retain the last measured value when the new
+	// advertisement has not populated it yet.
 	m.mu.Lock()
+	if existing, found := m.targets[target.ID]; found {
+		sameCapability := existing.CapabilityVersion == target.CapabilityVersion
+		if target.AcceleratorVRAMMB <= 0 {
+			target.AcceleratorVRAMMB = existing.AcceleratorVRAMMB
+		}
+		if target.StandaloneVRAMMB <= 0 && sameCapability {
+			target.StandaloneVRAMMB = existing.StandaloneVRAMMB
+			target.StandaloneVRAMSource = existing.StandaloneVRAMSource
+			target.StandaloneVRAMVerified = existing.StandaloneVRAMVerified
+		}
+		if target.WorkloadClass == "" {
+			target.WorkloadClass = existing.WorkloadClass
+		}
+		if target.PredictedSlowdown <= 0 && sameCapability {
+			target.PredictedSlowdown = existing.PredictedSlowdown
+		}
+	}
 	m.targets[target.ID] = target
 	m.mu.Unlock()
+	// A persisted learned envelope is authoritative over an empty or smaller
+	// advertisement even after a controller or node restart.
+	m.learningMu.RLock()
+	profile := m.interferenceProfiles[standaloneProfileKey(target)]
+	m.learningMu.RUnlock()
+	if !target.StandaloneVRAMVerified && profile != nil && profile.Confidence >= .5 && profile.P95VRAMMB > target.StandaloneVRAMMB {
+		m.mu.Lock()
+		current := m.targets[target.ID]
+		if current.CapabilityVersion == target.CapabilityVersion {
+			current.StandaloneVRAMMB = profile.P95VRAMMB
+			m.targets[target.ID] = current
+		}
+		m.mu.Unlock()
+	}
 	// Node-discovered targets arrive after Manager.Start, so apply their
 	// durable override at registration time as well as during startup recovery.
 	if policies, err := m.store.ListTargetPolicyOverrides(context.Background()); err == nil {
@@ -147,7 +186,65 @@ func (m *Manager) RegisterTarget(target Target) {
 	}
 	m.observeTargetResidency(context.Background(), target)
 	m.recoverResidencyTransitionsForTarget(context.Background(), target.ID)
+	m.reconcileRecoveredExecutionsForTarget(context.Background(), target.ID)
 	m.signal()
+}
+
+// UpdateAcceleratorCapacity binds live physical inventory to every runtime
+// route exposing that accelerator. Runtime discovery and telemetry are
+// asynchronous, so this operation is safe to repeat on every telemetry tick.
+func (m *Manager) UpdateAcceleratorCapacity(acceleratorID string, vramTotalMB int64) {
+	if acceleratorID == "" || vramTotalMB <= 0 {
+		return
+	}
+	m.mu.Lock()
+	changed := false
+	for id, target := range m.targets {
+		if target.AcceleratorID != acceleratorID || target.AcceleratorVRAMMB == vramTotalMB {
+			continue
+		}
+		target.AcceleratorVRAMMB = vramTotalMB
+		m.targets[id] = target
+		changed = true
+	}
+	m.mu.Unlock()
+	if changed {
+		// Node registration normally precedes the first telemetry frame. A
+		// persisted sharing policy may therefore fail its physical-capacity
+		// validation during registration; apply it again as soon as the live
+		// accelerator envelope arrives.
+		if err := m.ApplyStoredTargetPolicies(context.Background()); err != nil {
+			m.log.Warn("target policy reapply after capacity update failed", "accelerator", acceleratorID, "error", err)
+		}
+		m.signal()
+	}
+}
+
+// ReconcileNodeTargets removes inactive runtime routes that a node no longer
+// advertises. Target IDs from the node protocol are controller-namespaced, so
+// this cannot remove static or another node's targets. An active route is kept
+// until a later refresh to avoid invalidating an in-flight execution.
+func (m *Manager) ReconcileNodeTargets(nodeID string, advertised map[string]struct{}) {
+	prefix := nodeID + "-"
+	m.mu.Lock()
+	m.placementMu.Lock()
+	changed := false
+	for id := range m.targets {
+		if !strings.HasPrefix(id, prefix) {
+			continue
+		}
+		if _, present := advertised[id]; present || m.targetActive[id] > 0 {
+			continue
+		}
+		delete(m.targets, id)
+		delete(m.targetLeases, id)
+		changed = true
+	}
+	m.placementMu.Unlock()
+	m.mu.Unlock()
+	if changed {
+		m.signal()
+	}
 }
 
 func (m *Manager) Targets() []Target {
@@ -243,7 +340,7 @@ func (m *Manager) Start(ctx context.Context) {
 		m.mu.Lock()
 		for id, target := range m.targets {
 			profile := loadedProfiles[standaloneProfileKey(target)]
-			if profile != nil && profile.Confidence >= .5 && profile.P95VRAMMB > target.StandaloneVRAMMB {
+			if !target.StandaloneVRAMVerified && profile != nil && profile.Confidence >= .5 && profile.P95VRAMMB > target.StandaloneVRAMMB {
 				target.StandaloneVRAMMB = profile.P95VRAMMB
 				m.targets[id] = target
 			}
@@ -264,19 +361,24 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 	}
 	m.initializeResidencyRecovery(ctx)
-	// Recovered running work is never blindly duplicated. Recoverable work is
-	// re-admitted; non-recoverable work is failed for operator inspection.
+	// Recovered running work is never blindly duplicated. Work that had not
+	// reached a backend can be re-admitted immediately. A persisted external
+	// execution is reconciled against its original backend after that target is
+	// registered; only a confirmed completion or stop can leave this state.
 	if rows, err := m.store.ListWorkloads(ctx); err == nil {
 		for _, w := range rows {
 			if w.Status != domain.WorkloadRunning {
 				continue
 			}
-			if w.Request.Recoverable {
+			if w.Request.Recoverable && w.Execution == nil {
 				_ = m.store.ReleaseBudget(ctx, w.Request.ID)
 				w.Status = domain.WorkloadQueued
-				w.Execution = nil
 				w.StartedAt = nil
 				w.Error = "controller restarted; re-admitting recoverable workload"
+			} else if w.Request.Recoverable {
+				w.Status = domain.WorkloadWaiting
+				w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: restartReconciliationBlocker, Confidence: .95}
+				w.Error = restartReconciliationBlocker
 			} else {
 				w.Status = domain.WorkloadFailed
 				w.Error = "controller restarted during non-recoverable execution"
@@ -294,6 +396,9 @@ func (m *Manager) Start(ctx context.Context) {
 		}
 	}
 	m.recoverRegisteredResidencyTransitions(ctx)
+	for _, target := range m.Targets() {
+		m.reconcileRecoveredExecutionsForTarget(ctx, target.ID)
+	}
 	go m.loop(ctx)
 	go m.notificationLoop(ctx)
 }
@@ -386,6 +491,23 @@ func (m *Manager) Submit(ctx context.Context, req domain.WorkloadRequest) (*doma
 	m.mu.RUnlock()
 	if adapter == nil {
 		return nil, false, fmt.Errorf("unknown adapter %q", req.Adapter)
+	}
+	if capabilities, ok := adapter.(DisruptionCapabilityAdapter); ok {
+		supported := capabilities.DisruptionCapabilities()
+		switch req.Disruption {
+		case domain.DisruptionYieldable:
+			if !supported.Yield {
+				return nil, false, fmt.Errorf("adapter %s does not support yieldable execution", req.Adapter)
+			}
+		case domain.DisruptionCheckpointable:
+			if !supported.Checkpoint {
+				return nil, false, fmt.Errorf("adapter %s does not support checkpoint/resume execution", req.Adapter)
+			}
+		case domain.DisruptionCancelable:
+			if !supported.Cancel {
+				return nil, false, fmt.Errorf("adapter %s cannot guarantee in-flight cancellation", req.Adapter)
+			}
+		}
 	}
 	if err := adapter.Validate(ctx, req); err != nil {
 		return nil, false, err
@@ -559,8 +681,101 @@ func (m *Manager) reconcileLocked(ctx context.Context) {
 		if w.Status != domain.WorkloadQueued && w.Status != domain.WorkloadWaiting {
 			continue
 		}
+		if w.Status == domain.WorkloadWaiting && w.Decision.Blocker == restartReconciliationBlocker {
+			continue
+		}
 		m.tryAdmit(ctx, w)
 	}
+}
+
+func (m *Manager) reconcileRecoveredExecutionsForTarget(ctx context.Context, targetID string) {
+	if targetID == "" {
+		return
+	}
+	rows, err := m.store.ListWorkloads(ctx)
+	if err != nil {
+		return
+	}
+	target := m.targetByID(targetID)
+	if target.ID == "" {
+		return
+	}
+	m.mu.RLock()
+	adapter := m.adapters[target.Adapter]
+	m.mu.RUnlock()
+	if adapter == nil {
+		return
+	}
+	for _, workload := range rows {
+		if workload.Status != domain.WorkloadWaiting || workload.Decision.Blocker != restartReconciliationBlocker || workload.Plan == nil || workload.Plan.TargetID != targetID || workload.Execution == nil {
+			continue
+		}
+		reconcileCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		observation, observeErr := adapter.Observe(reconcileCtx, workload.Request, workload.Plan, workload.Execution, target)
+		if observeErr == nil && observation.Status == domain.WorkloadSucceeded {
+			output, refs, collectErr := adapter.CollectOutputs(reconcileCtx, workload.Request, workload.Plan, workload.Execution, target)
+			cancel()
+			if collectErr != nil {
+				m.failRecoveredExecution(workload, "recovered backend completed but output collection failed: "+collectErr.Error())
+				continue
+			}
+			now := time.Now().UTC()
+			workload.Status = domain.WorkloadSucceeded
+			workload.Progress = 1
+			workload.InlineOutput = output
+			workload.OutputRefs = refs
+			workload.Error = ""
+			workload.UpdatedAt = now
+			workload.FinishedAt = &now
+			_, _ = m.store.UpdateWorkload(context.Background(), workload)
+			m.syncPromptMapping(context.Background(), workload)
+			m.settleWorkloadBudget(context.Background(), workload)
+			m.audit(context.Background(), workload.Request.OwnerID, workload.Request.ID, "workload.restart_recovered_completed", "info", map[string]string{"target_id": targetID})
+			continue
+		}
+		if observeErr == nil && observation.Status == domain.WorkloadFailed {
+			cancel()
+			m.failRecoveredExecution(workload, "recovered backend reported failure: "+observation.Error)
+			continue
+		}
+		stopErr := adapter.Cancel(reconcileCtx, workload.Execution, target)
+		cancel()
+		if stopErr != nil {
+			reason := "prior backend execution could not be reconciled or stopped; execution was not duplicated"
+			if observeErr != nil {
+				reason += ": observe: " + observeErr.Error()
+			}
+			reason += "; cancel: " + stopErr.Error()
+			m.failRecoveredExecution(workload, reason)
+			continue
+		}
+		_ = m.store.ReleaseBudget(context.Background(), workload.Request.ID)
+		workload.Status = domain.WorkloadQueued
+		workload.Plan = nil
+		workload.Execution = nil
+		workload.StartedAt = nil
+		workload.FinishedAt = nil
+		workload.Decision = domain.AdmissionDecision{Admitted: false, Blocker: "prior backend execution stopped after controller restart; safely re-admitting", Confidence: .95}
+		workload.Error = "controller restart recovery stopped the prior backend attempt"
+		workload.UpdatedAt = time.Now().UTC()
+		_, _ = m.store.UpdateWorkload(context.Background(), workload)
+		m.audit(context.Background(), workload.Request.OwnerID, workload.Request.ID, "workload.restart_recovered_requeued", "warn", map[string]string{"target_id": targetID})
+		m.signal()
+	}
+}
+
+func (m *Manager) failRecoveredExecution(workload *domain.Workload, reason string) {
+	if workload == nil {
+		return
+	}
+	now := time.Now().UTC()
+	workload.Status = domain.WorkloadFailed
+	workload.Error = reason
+	workload.UpdatedAt = now
+	workload.FinishedAt = &now
+	_, _ = m.store.UpdateWorkload(context.Background(), workload)
+	m.settleWorkloadBudget(context.Background(), workload)
+	m.audit(context.Background(), workload.Request.OwnerID, workload.Request.ID, "workload.restart_recovery_failed", "error", map[string]string{"error": reason})
 }
 
 func (m *Manager) reconcileRunningNodeLoss(ctx context.Context, rows []*domain.Workload) {
@@ -577,9 +792,25 @@ func (m *Manager) reconcileRunningNodeLoss(ctx context.Context, rows []*domain.W
 		}
 		m.mu.RLock()
 		cancel := m.cancels[workload.Request.ID]
+		adapter := m.adapters[workload.Request.Adapter]
 		m.mu.RUnlock()
+		backendStopped := workload.Execution == nil
+		var stopErr error
+		if workload.Execution != nil {
+			m.mu.Lock()
+			m.cancelling[workload.Request.ID] = struct{}{}
+			m.mu.Unlock()
+			stopCtx, stopCancel := context.WithTimeout(ctx, 5*time.Second)
+			if adapter == nil {
+				stopErr = fmt.Errorf("adapter is unavailable")
+			} else {
+				stopErr = adapter.Cancel(stopCtx, workload.Execution, target)
+			}
+			stopCancel()
+			backendStopped = stopErr == nil
+		}
 		now := time.Now().UTC()
-		if workload.Request.Recoverable {
+		if workload.Request.Recoverable && backendStopped {
 			_ = m.store.ReleaseBudget(ctx, workload.Request.ID)
 			workload.Status = domain.WorkloadQueued
 			workload.Decision = domain.AdmissionDecision{Admitted: false, Blocker: "assigned node was lost; re-admitting recoverable workload", Confidence: .95}
@@ -594,16 +825,26 @@ func (m *Manager) reconcileRunningNodeLoss(ctx context.Context, rows []*domain.W
 			m.audit(ctx, workload.Request.OwnerID, workload.Request.ID, "workload.node_lost_requeued", "warn", map[string]string{"target_id": target.ID})
 		} else {
 			workload.Status = domain.WorkloadFailed
-			workload.Error = "assigned node lost during non-recoverable execution"
+			if workload.Request.Recoverable && !backendStopped {
+				workload.Error = "assigned node lost; backend cancellation unconfirmed, so execution was not duplicated"
+				if stopErr != nil {
+					workload.Error += ": " + stopErr.Error()
+				}
+			} else {
+				workload.Error = "assigned node lost during non-recoverable execution"
+			}
 			workload.FinishedAt = &now
 			m.settleWorkloadBudget(ctx, workload)
-			m.audit(ctx, workload.Request.OwnerID, workload.Request.ID, "workload.node_lost_failed", "error", map[string]string{"target_id": target.ID})
+			m.audit(ctx, workload.Request.OwnerID, workload.Request.ID, "workload.node_lost_failed", "error", map[string]string{"target_id": target.ID, "backend_stop_confirmed": fmt.Sprintf("%t", backendStopped)})
 		}
 		workload.UpdatedAt = now
 		_, _ = m.store.UpdateWorkload(ctx, workload)
 		if cancel != nil {
 			cancel()
 		}
+		m.mu.Lock()
+		delete(m.cancelling, workload.Request.ID)
+		m.mu.Unlock()
 	}
 }
 
@@ -663,6 +904,15 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	sort.SliceStable(targets, func(i, j int) bool {
 		if boundTarget != "" && (targets[i].ID == boundTarget) != (targets[j].ID == boundTarget) {
 			return targets[i].ID == boundTarget
+		}
+		// Multiple routes for the same model commonly exist specifically to
+		// reserve a scarce long-context profile while a narrower profile serves
+		// ordinary traffic with more slots. Treat the smallest sufficient
+		// context as the primary best-fit dimension; residency and transition
+		// cost remain tie-breakers. If that route is busy or otherwise
+		// incompatible, admission naturally spills to the next candidate.
+		if preference := contextProfilePreference(targets[i], targets[j], w.Request.Adapter, req); preference != 0 {
+			return preference < 0
 		}
 		if targetEstimates[targets[i].ID].score != targetEstimates[targets[j].ID].score {
 			return targetEstimates[targets[i].ID].score < targetEstimates[targets[j].ID].score
@@ -942,6 +1192,24 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			m.enqueueNotification(ctx, w, "workload.rejected")
 		}
 	}
+}
+
+func contextProfilePreference(left, right Target, adapter string, requirements Requirements) int {
+	if requirements.ContextTokens <= 0 || left.Adapter != adapter || right.Adapter != adapter || left.Cloud != right.Cloud {
+		return 0
+	}
+	if requirements.Model != "" && (!containsString(left.Models, requirements.Model) || !containsString(right.Models, requirements.Model)) {
+		return 0
+	}
+	leftFits := left.ContextLimit > 0 && left.ContextLimit >= requirements.ContextTokens
+	rightFits := right.ContextLimit > 0 && right.ContextLimit >= requirements.ContextTokens
+	if !leftFits || !rightFits || left.ContextLimit == right.ContextLimit {
+		return 0
+	}
+	if left.ContextLimit < right.ContextLimit {
+		return -1
+	}
+	return 1
 }
 
 type targetEstimate struct {
@@ -2011,7 +2279,14 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 	if w.CheckpointRef != "" {
 		handle, err = adapter.Resume(runCtx, w.Request, w.Plan, w.CheckpointRef, target)
 	} else {
-		handle, err = adapter.Start(runCtx, w.Request, w.Plan, target)
+		if async, ok := adapter.(AsyncStartAdapter); ok {
+			handle, err = async.StartAsync(runCtx, w.Request, w.Plan, target)
+			if errors.Is(err, ErrUnsupported) {
+				handle, err = adapter.Start(runCtx, w.Request, w.Plan, target)
+			}
+		} else {
+			handle, err = adapter.Start(runCtx, w.Request, w.Plan, target)
+		}
 	}
 	if err != nil {
 		if runCtx.Err() != nil {
@@ -2074,6 +2349,9 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 				continue
 			}
 		}
+		if reservation.shared {
+			obs = m.withAcceleratorTelemetry(context.Background(), target.AcceleratorID, obs)
+		}
 		if reason := sharingViolation(reservation, obs); reason != "" {
 			if yieldErr := adapter.Yield(context.Background(), handle, target); yieldErr != nil {
 				_ = adapter.Cancel(context.Background(), handle, target)
@@ -2118,8 +2396,15 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 				return
 			}
 			now := time.Now().UTC()
+			if reservation.shared && obs.Slowdown <= 0 {
+				obs.Slowdown = m.completedSlowdown(latest, target, handle, now)
+			}
 			latest.Status = domain.WorkloadSucceeded
 			latest.Progress = 1
+			// Observe may enrich the in-memory handle with backend timing and
+			// token counters. Persist that final handle so TPS/TTFT remain
+			// available to the dashboard after polling or a controller restart.
+			latest.Execution = handle
 			latest.InlineOutput = output
 			latest.OutputRefs = refs
 			latest.UpdatedAt = now
@@ -2146,6 +2431,75 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 		case <-ticker.C:
 		}
 	}
+}
+
+// completedSlowdown derives a real-run slowdown ratio when a backend cannot
+// expose live throughput while it is executing. It intentionally only uses a
+// previously measured standalone duration for the exact bounded request (or,
+// conservatively, the runtime class) and never invents a live measurement.
+func (m *Manager) completedSlowdown(workload *domain.Workload, target Target, handle *domain.ExecutionHandle, finishedAt time.Time) float64 {
+	if workload == nil {
+		return 0
+	}
+	m.learningMu.RLock()
+	profile := m.interferenceProfiles[standaloneRequestProfileKey(target, workload.Request)]
+	if profile == nil || profile.P95DurationMS <= 0 {
+		profile = m.interferenceProfiles[standaloneProfileKey(target)]
+	}
+	var baselineMS int64
+	if profile != nil && profile.Samples > 0 {
+		baselineMS = profile.P95DurationMS
+	}
+	m.learningMu.RUnlock()
+	if baselineMS <= 0 {
+		return 0
+	}
+
+	measuredMS := float64(0)
+	if handle != nil && handle.Performance != nil {
+		measuredMS = handle.Performance.DurationMS
+	}
+	if measuredMS <= 0 {
+		startedAt := time.Time{}
+		if handle != nil {
+			startedAt = handle.StartedAt
+		}
+		if startedAt.IsZero() && workload.StartedAt != nil {
+			startedAt = *workload.StartedAt
+		}
+		if !startedAt.IsZero() {
+			measuredMS = float64(finishedAt.Sub(startedAt).Milliseconds())
+		}
+	}
+	if measuredMS <= 0 {
+		return 0
+	}
+	ratio := measuredMS / float64(baselineMS)
+	if ratio < 1 {
+		return 1
+	}
+	return ratio
+}
+
+func (m *Manager) withAcceleratorTelemetry(ctx context.Context, acceleratorID string, observation Observation) Observation {
+	if m.nodes == nil || acceleratorID == "" {
+		return observation
+	}
+	nodes, err := m.nodes.ListNodes(ctx)
+	if err != nil {
+		return observation
+	}
+	for _, node := range nodes {
+		for _, accelerator := range node.Accelerators {
+			if accelerator.ID != acceleratorID {
+				continue
+			}
+			observation.VRAMUsedMB = accelerator.VRAMUsedMB
+			observation.TemperatureC = accelerator.TemperatureC
+			return observation
+		}
+	}
+	return observation
 }
 
 func (m *Manager) syncPromptMapping(ctx context.Context, workload *domain.Workload) {
@@ -2199,7 +2553,12 @@ func (m *Manager) recordStandaloneSample(ctx context.Context, workload *domain.W
 	if workload == nil || workload.Plan == nil || target.AcceleratorID == "" || target.Cloud {
 		return
 	}
-	observedVRAM := observation.VRAMUsedMB
+	observedVRAM := int64(0)
+	if target.StandaloneVRAMVerified && target.StandaloneVRAMMB > 0 {
+		observedVRAM = target.StandaloneVRAMMB
+	} else {
+		observedVRAM = observation.VRAMUsedMB
+	}
 	if observedVRAM <= 0 && m.nodes != nil {
 		if nodes, err := m.nodes.ListNodes(ctx); err == nil {
 			for _, node := range nodes {
@@ -2223,7 +2582,7 @@ func (m *Manager) recordStandaloneSample(ctx context.Context, workload *domain.W
 	classes := []string{targetWorkloadClass(target)}
 	profile := m.updateInterferenceProfile(ctx, standaloneProfileKey(target), target.AcceleratorID, target.CapabilityVersion, classes, observedVRAM, 1, duration, outcome)
 	m.updateInterferenceProfile(ctx, standaloneRequestProfileKey(target, workload.Request), target.AcceleratorID, target.CapabilityVersion, classes, observedVRAM, 1, duration, outcome)
-	if profile != nil && profile.Confidence >= .5 && profile.P95VRAMMB > 0 {
+	if !target.StandaloneVRAMVerified && profile != nil && profile.Confidence >= .5 && profile.P95VRAMMB > 0 {
 		m.mu.Lock()
 		current := m.targets[target.ID]
 		if current.CapabilityVersion == target.CapabilityVersion && current.StandaloneVRAMMB < profile.P95VRAMMB {

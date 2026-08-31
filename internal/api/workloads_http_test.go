@@ -691,3 +691,45 @@ func TestNodeCapabilityRefreshUpdatesNamespacedTarget(t *testing.T) {
 		t.Fatalf("node-scoped target identity collided: %+v", other)
 	}
 }
+
+func TestDiscoveredTargetReceivesLiveAcceleratorCapacity(t *testing.T) {
+	srv, manager, cancel := testServer(t)
+	defer cancel()
+	_, err := srv.nodes.UpsertNode(context.Background(), &domain.Node{
+		ID:           "node-capacity",
+		Accelerators: []domain.Accelerator{{ID: "node-capacity-gpu0", NodeID: "node-capacity", VRAMTotalMB: 24576}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv.registerAdapterAdvertisements("node-capacity", []wsproto.AdapterAdvertisement{{
+		ID: "short", Adapter: "llamacpp", Endpoint: "http://node-capacity:11435", AcceleratorIndex: 0,
+		Models: []string{"same-model"}, ContextLimit: 2048, Slots: 4,
+	}})
+	for _, target := range manager.Targets() {
+		if target.ID == "node-capacity-short" {
+			if target.AcceleratorVRAMMB != 24576 {
+				t.Fatalf("target did not inherit physical VRAM capacity: %+v", target)
+			}
+			return
+		}
+	}
+	t.Fatal("discovered target was not registered")
+}
+
+func TestCapabilityRefreshRetiresRemovedNodeRoute(t *testing.T) {
+	srv, manager, cancel := testServer(t)
+	defer cancel()
+	srv.registerAdapterAdvertisements("node-a", []wsproto.AdapterAdvertisement{
+		{ID: "old", Adapter: "llamacpp", Endpoint: "http://node-a:11434", AcceleratorIndex: 0},
+		{ID: "current", Adapter: "llamacpp", Endpoint: "http://node-a:11435", AcceleratorIndex: 0},
+	})
+	srv.registerAdapterAdvertisements("node-a", []wsproto.AdapterAdvertisement{
+		{ID: "current", Adapter: "llamacpp", Endpoint: "http://node-a:11435", AcceleratorIndex: 0},
+	})
+	for _, target := range manager.Targets() {
+		if target.ID == "node-a-old" {
+			t.Fatalf("removed node route survived capability reconciliation: %+v", target)
+		}
+	}
+}

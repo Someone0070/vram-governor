@@ -173,9 +173,16 @@ func (s *Server) sweepLiveness(ctx context.Context, suspectAfter, lostAfter time
 			continue
 		}
 		age := now.Sub(n.Observed.LastHeartbeat)
+		s.nodeConnMu.RLock()
+		_, transportConnected := s.nodeConnections[n.ID]
+		s.nodeConnMu.RUnlock()
+		hardLostAfter := 3 * lostAfter
+		if hardLostAfter < lostAfter+30*time.Second {
+			hardLostAfter = lostAfter + 30*time.Second
+		}
 		var want domain.ConnectivityState
 		switch {
-		case age >= lostAfter:
+		case age >= lostAfter && (!transportConnected || age >= hardLostAfter):
 			want = domain.ConnectivityLost
 		case age >= suspectAfter:
 			want = domain.ConnectivitySuspect

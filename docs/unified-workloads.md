@@ -27,9 +27,14 @@ outbox rows, incidents, learning profiles, transition plans, and leases. Lease
 acquisition runs at serializable isolation and increments a separate fence
 counter. A stale execution cannot renew or release a successor's lease.
 
-On restart, recoverable running work returns to admission. Non-recoverable work
-is failed with an explicit restart reason. A Comfy prompt mapping is a separate
-durable row, so public identity does not depend on a backend prompt ID.
+On restart, recoverable running work enters backend reconciliation instead of
+blindly returning to admission. If the original backend reports completion,
+the controller collects that execution in place. If it is still running or
+unknown, the controller only re-admits it after backend cancellation is
+confirmed; otherwise it fails indeterminate so a late result cannot race a
+duplicate attempt. Non-recoverable work is failed with an explicit restart
+reason. A Comfy prompt mapping is a separate durable row, so public identity
+does not depend on a backend prompt ID.
 
 ## Security boundary
 

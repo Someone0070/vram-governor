@@ -150,6 +150,7 @@ func (s *Server) registerAdapterAdvertisements(nodeID string, advertisements []w
 	if s.workloads == nil {
 		return
 	}
+	registered := make(map[string]struct{}, len(advertisements))
 	for _, advertised := range advertisements {
 		if advertised.ID == "" || advertised.Adapter == "" || advertised.Endpoint == "" {
 			continue
@@ -158,19 +159,32 @@ func (s *Server) registerAdapterAdvertisements(nodeID string, advertisements []w
 		if !strings.HasPrefix(targetID, nodeID+"-") {
 			targetID = nodeID + "-" + targetID
 		}
+		registered[targetID] = struct{}{}
+		acceleratorID := fmt.Sprintf("%s-gpu%d", nodeID, advertised.AcceleratorIndex)
+		var acceleratorVRAMMB int64
+		if node, err := s.nodes.GetNode(context.Background(), nodeID); err == nil {
+			for _, accelerator := range node.Accelerators {
+				if accelerator.ID == acceleratorID {
+					acceleratorVRAMMB = accelerator.VRAMTotalMB
+					break
+				}
+			}
+		}
 		s.workloads.RegisterTarget(workloads.Target{
 			ID: targetID, Adapter: advertised.Adapter, Endpoint: advertised.Endpoint,
-			AcceleratorID: fmt.Sprintf("%s-gpu%d", nodeID, advertised.AcceleratorIndex),
-			Models:        advertised.Models, ResidentModels: advertised.ResidentModels, CustomNodes: advertised.CustomNodes,
+			AcceleratorID: acceleratorID, AcceleratorVRAMMB: acceleratorVRAMMB,
+			Models: advertised.Models, ResidentModels: advertised.ResidentModels, CustomNodes: advertised.CustomNodes,
 			ContextLimit: advertised.ContextLimit, Slots: advertised.Slots,
 			CapabilityVersion: advertised.Version, ModelFingerprint: advertised.ModelFingerprint,
 			CapacitySource: advertised.CapacitySource, CapacityVerified: advertised.CapabilitiesVerified,
 			RuntimeArgs: advertised.RuntimeArgs, SupportsModelLifecycle: advertised.SupportsModelLifecycle, SupportsAcceleratorReclaim: advertised.SupportsAcceleratorReclaim,
 			MaxResidentModels: advertised.MaxResidentModels, WarmRAMSupported: advertised.WarmRAMSupported,
 			QueueRunning: advertised.QueueRunning, QueuePending: advertised.QueuePending,
+			StandaloneVRAMMB: advertised.StandaloneVRAMMB, StandaloneVRAMSource: advertised.StandaloneVRAMSource, StandaloneVRAMVerified: advertised.StandaloneVRAMVerified,
 			ResidencyPolicy: domain.ResidencyAuto, Enabled: true,
 		})
 	}
+	s.workloads.ReconcileNodeTargets(nodeID, registered)
 }
 
 func (s *Server) checkAuth(r *http.Request) bool {
@@ -286,6 +300,11 @@ func (s *Server) handleTelemetry(ctx context.Context, nodeID string, tel wsproto
 	if err != nil {
 		s.log.Warn("telemetry for unknown node", "node_id", nodeID, "err", err)
 		return
+	}
+	if s.workloads != nil {
+		for _, accelerator := range accels {
+			s.workloads.UpdateAcceleratorCapacity(accelerator.ID, accelerator.VRAMTotalMB)
+		}
 	}
 	now := time.Now().UTC()
 	s.telemetryMu.Lock()

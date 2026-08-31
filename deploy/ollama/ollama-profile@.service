@@ -1,0 +1,30 @@
+[Unit]
+Description=Ollama inference profile %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ollama
+Group=ollama
+Environment="PATH=/usr/lib/wsl/lib:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="OLLAMA_MODELS=/usr/share/ollama/.ollama/models"
+Environment="OLLAMA_MAX_LOADED_MODELS=1"
+Environment="OLLAMA_MAX_QUEUE=32"
+EnvironmentFile=/etc/vram-governor/ollama-profiles/%i.env
+ExecStart=/usr/local/bin/ollama serve
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

@@ -36,10 +36,22 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 		return wsproto.AdapterAdvertisement{}, fmt.Errorf("discover models: server reported no loaded model")
 	}
 	ollamaDetected := false
+	standaloneVRAMMB := int64(0)
+	standaloneVRAMSource := ""
+	standaloneVRAMVerified := false
 	if runningBody, runningErr := getJSON(ctx, endpoint+"/api/ps"); runningErr == nil {
-		if running, ok := ollamaRunningModels(runningBody); ok {
+		if running, vramByModel, ok := ollamaRunningModels(runningBody); ok {
 			residentModels = running
 			ollamaDetected = true
+			for _, vramMB := range vramByModel {
+				if vramMB > standaloneVRAMMB {
+					standaloneVRAMMB = vramMB
+				}
+			}
+			if standaloneVRAMMB > 0 {
+				standaloneVRAMSource = "runtime:/api/ps:size_vram"
+				standaloneVRAMVerified = true
+			}
 		}
 	}
 
@@ -90,12 +102,13 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	}
 	modelHash := sha256.Sum256(modelMaterial)
 	capabilityMaterial, _ := json.Marshal(struct {
-		Models       []string `json:"models"`
-		ModelHash    string   `json:"model_hash"`
-		ContextLimit int      `json:"context_limit"`
-		Slots        int      `json:"slots"`
-		RuntimeArgs  []string `json:"runtime_args"`
-	}{models, hex.EncodeToString(modelHash[:]), contextLimit, slots, cfg.RuntimeArgs})
+		Models            []string `json:"models"`
+		ModelHash         string   `json:"model_hash"`
+		ContextLimit      int      `json:"context_limit"`
+		Slots             int      `json:"slots"`
+		RuntimeArgs       []string `json:"runtime_args"`
+		MeasurementSchema string   `json:"measurement_schema"`
+	}{models, hex.EncodeToString(modelHash[:]), contextLimit, slots, cfg.RuntimeArgs, "runtime-envelope-v1"})
 	capabilityHash := sha256.Sum256(capabilityMaterial)
 	return wsproto.AdapterAdvertisement{
 		ID: id, Adapter: "llamacpp", Endpoint: publicEndpoint,
@@ -104,28 +117,30 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 		ModelFingerprint: hex.EncodeToString(modelHash[:]), ContextLimit: contextLimit, Slots: slots,
 		CapacitySource: capacitySource, CapabilitiesVerified: verified, RuntimeArgs: append([]string(nil), cfg.RuntimeArgs...),
 		SupportsModelLifecycle: cfg.RouterManaged || routerDetected || ollamaDetected, MaxResidentModels: cfg.MaxResidentModels,
-		QueueRunning: running,
+		QueueRunning: running, StandaloneVRAMMB: standaloneVRAMMB, StandaloneVRAMSource: standaloneVRAMSource, StandaloneVRAMVerified: standaloneVRAMVerified,
 	}, nil
 }
 
-func ollamaRunningModels(body json.RawMessage) ([]string, bool) {
+func ollamaRunningModels(body json.RawMessage) ([]string, map[string]int64, bool) {
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	raw, found := envelope["models"]
 	if !found {
-		return nil, false
+		return nil, nil, false
 	}
 	var rows []struct {
-		Name  string `json:"name"`
-		Model string `json:"model"`
+		Name     string `json:"name"`
+		Model    string `json:"model"`
+		SizeVRAM int64  `json:"size_vram"`
 	}
 	if err := json.Unmarshal(raw, &rows); err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	models := make([]string, 0, len(rows))
 	seen := make(map[string]struct{}, len(rows))
+	vramByModel := make(map[string]int64, len(rows))
 	for _, row := range rows {
 		name := row.Model
 		if name == "" {
@@ -139,9 +154,12 @@ func ollamaRunningModels(body json.RawMessage) ([]string, bool) {
 		}
 		seen[name] = struct{}{}
 		models = append(models, name)
+		if row.SizeVRAM > 0 {
+			vramByModel[name] = (row.SizeVRAM + (1 << 20) - 1) / (1 << 20)
+		}
 	}
 	sort.Strings(models)
-	return models, true
+	return models, vramByModel, true
 }
 
 func getJSON(ctx context.Context, url string) (json.RawMessage, error) {
