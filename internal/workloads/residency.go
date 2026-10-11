@@ -315,13 +315,39 @@ func (m *Manager) acceptSucceededResidencyTransition(ctx context.Context, transi
 		if err := normalizeResidencyTier(residency, transition.ObservedTier, transition.WarmModelBytes, transition.WarmModelBytesVerified); err != nil {
 			return err
 		}
-		if !m.targetFenceMatches(target, generation) {
+		if !m.refreshStableLifecycleTarget(&target, &generation) {
 			return fmt.Errorf("transition target changed before projection persistence")
 		}
 		if err := m.persistResidencyProjection(ctx, residency, expectedRevision); err != nil {
-			return err
+			// The node's post-operation advertisement may project the same
+			// residency first. Re-read once: an identical observed tier is
+			// already the accepted truth; otherwise apply this result to the
+			// fresh revision.
+			if !errors.Is(err, store.ErrModelResidencyConflict) {
+				return err
+			}
+			current, getErr := m.store.GetModelResidency(ctx, residency.TargetID, residency.Model)
+			if getErr != nil {
+				return err
+			}
+			if current.ObservedTier != transition.ObservedTier {
+				fresh := *current
+				bindResidencyTargetFacts(&fresh, target, generation)
+				fresh.ObservedTier, fresh.DesiredTier = transition.ObservedTier, transition.ToTier
+				fresh.WarmModelBytes, fresh.WarmModelBytesVerified = transition.WarmModelBytes, transition.WarmModelBytesVerified
+				fresh.LastError, fresh.UpdatedAt = "", time.Now().UTC()
+				if normErr := normalizeResidencyTier(&fresh, transition.ObservedTier, transition.WarmModelBytes, transition.WarmModelBytesVerified); normErr != nil {
+					return normErr
+				}
+				if retryErr := m.persistResidencyProjection(ctx, &fresh, current.Revision); retryErr != nil {
+					return retryErr
+				}
+				*residency = fresh
+			} else {
+				*residency = *current
+			}
 		}
-		if !m.targetFenceMatches(target, generation) {
+		if !m.refreshStableLifecycleTarget(&target, &generation) {
 			return fmt.Errorf("transition target changed during acceptance")
 		}
 	}
@@ -334,7 +360,7 @@ func (m *Manager) acceptSucceededResidencyTransition(ctx context.Context, transi
 	if !m.persistResidencyTransition(ctx, transition) {
 		return fmt.Errorf("persist succeeded residency transition")
 	}
-	if !m.targetFenceMatches(target, generation) {
+	if !m.refreshStableLifecycleTarget(&target, &generation) {
 		return fmt.Errorf("transition target changed after acceptance")
 	}
 	return nil
