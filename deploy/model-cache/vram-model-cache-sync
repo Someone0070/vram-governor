@@ -1,0 +1,22 @@
+#!/bin/bash
+# Copy llama.cpp router models from the NAS to local NVMe and re-point the
+# preset symlinks, so loads read local disk / page cache instead of CIFS.
+set -euo pipefail
+SRC_DIR=/etc/vram-governor/llama-models
+CACHE=/var/lib/vram-governor/model-cache
+install -d -m 0755 "$CACHE"
+for link in "$SRC_DIR"/*.gguf; do
+  name=$(basename "$link")
+  target=$(readlink "$link")
+  case "$target" in "$CACHE"/*) echo "already local: $name"; continue ;; esac
+  src=$(readlink -f "$link")
+  dst="$CACHE/$name"
+  if [ ! -f "$dst" ] || [ "$(stat -c %s "$dst")" != "$(stat -c %s "$src")" ]; then
+    cp --sparse=never "$src" "$dst.partial"
+    chmod 0644 "$dst.partial"; mv -f "$dst.partial" "$dst"
+  fi
+  [ "$(stat -c %s "$dst")" = "$(stat -c %s "$src")" ] || { echo "size mismatch $name"; exit 1; }
+  ln -sfn "$dst" "$link.new" && mv -Tf "$link.new" "$link"
+  echo "local: $name ($(stat -c %s "$dst") bytes)"
+done
+echo "MODEL_CACHE_SYNC_DONE"
