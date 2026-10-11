@@ -1045,6 +1045,9 @@ func TestFailedDemandLoadRestoresEvictedResident(t *testing.T) {
 	defer backend.Close()
 	backing := store.NewMemoryStore()
 	mgr := NewManager(quietLogger(), backing, time.Second)
+	// These residents are evictable by design; min_residency protection is
+	// covered by TestDemandEvictionHonorsMinResidencyUnlessUrgent.
+	mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 0})
 	mgr.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", backend.Client()))
 	mgr.RegisterTarget(Target{ID: "router", Adapter: "llamacpp", Endpoint: backend.URL, AcceleratorID: "gpu-0", Models: []string{"small", "large"}, ResidentModels: []string{"small"}, SupportsModelLifecycle: true, MaxResidentModels: 1, Enabled: true})
 	workload, _, err := mgr.Submit(context.Background(), domain.WorkloadRequest{OwnerID: "alice", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"large","messages":[{}]}`)})
@@ -1219,7 +1222,7 @@ func TestMeasuredCapacityAdmissionUsesAggregateBytesAndHardCap(t *testing.T) {
 		if err := mgr.checkResidentCapacity(ctx, boundary, "requested"); err == nil {
 			t.Fatalf("%d GiB one-byte-over boundary was admitted", budget)
 		}
-		candidates, err := mgr.evictionCandidates(ctx, boundary, "requested")
+		candidates, _, err := mgr.evictionCandidates(ctx, boundary, "requested", 0)
 		if err != nil || len(candidates) != 1 || candidates[0].Model != "resident" {
 			t.Fatalf("%d GiB over-boundary did not expose the eligible reclaim victim: candidates=%+v err=%v", budget, candidates, err)
 		}
@@ -1401,6 +1404,9 @@ func TestEnsureModelResidentReclaimsAndRechecksMeasuredCapacityBoundaries(t *tes
 			ctx := context.Background()
 			backing := store.NewMemoryStore()
 			mgr := NewManager(quietLogger(), backing, time.Second)
+			// These residents are evictable by design; min_residency protection is
+			// covered by TestDemandEvictionHonorsMinResidencyUnlessUrgent.
+			mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 0})
 			adapterName := fmt.Sprintf("admission-path-%d", gib)
 			adapter := newAdmissionLifecycleAdapter(adapterName)
 			mgr.RegisterAdapter(adapter)
@@ -1465,6 +1471,9 @@ func TestEnsureModelResidentReclaimsAndRechecksMeasuredCapacityBoundaries(t *tes
 		ctx := context.Background()
 		backing := store.NewMemoryStore()
 		mgr := NewManager(quietLogger(), backing, time.Second)
+		// These residents are evictable by design; min_residency protection is
+		// covered by TestDemandEvictionHonorsMinResidencyUnlessUrgent.
+		mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 0})
 		adapter := newAdmissionLifecycleAdapter("admission-path-unified")
 		mgr.RegisterAdapter(adapter)
 		const reserve = int64(512 << 20)
@@ -1760,7 +1769,7 @@ func TestEvictionCandidatesProtectActiveQueuedAndOperatorResidents(t *testing.T)
 	if _, _, err := backing.CreateWorkload(ctx, queued); err != nil {
 		t.Fatal(err)
 	}
-	candidates, err := mgr.evictionCandidates(ctx, target, "new")
+	candidates, _, err := mgr.evictionCandidates(ctx, target, "new", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1774,7 +1783,7 @@ func TestEvictionCandidatesProtectActiveQueuedAndOperatorResidents(t *testing.T)
 		} else {
 			target.QueuePending = 1
 		}
-		if got, err := mgr.evictionCandidates(ctx, target, "new"); err != nil || len(got) != 0 {
+		if got, _, err := mgr.evictionCandidates(ctx, target, "new", 0); err != nil || len(got) != 0 {
 			t.Fatalf("target %s queue counter did not protect all residents: candidates=%+v err=%v", field, got, err)
 		}
 	}

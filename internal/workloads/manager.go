@@ -4241,7 +4241,7 @@ func (m *Manager) Submit(ctx context.Context, req domain.WorkloadRequest) (*doma
 				end := start.Add(m.leaseTTL)
 				stored.Status = domain.WorkloadRejected
 				stored.Decision = domain.AdmissionDecision{
-					Admitted: false, Blocker: "no eligible capacity (fail_fast)",
+					Admitted: false, Blocker: "no eligible capacity (fail_fast)", BlockerCode: domain.BlockerTransitionBusy,
 					EstimatedStart: &start, EstimatedEnd: &end, Confidence: .3,
 					Alternatives: []string{"scheduler busy with a model or residency transition"},
 				}
@@ -4306,6 +4306,7 @@ func (m *Manager) mutateWorkloadCAS(ctx context.Context, id string, allowed map[
 		if isTerminalWorkloadStatus(expectedStatus) && current.Status != expectedStatus {
 			return nil, store.ErrWorkloadConflict
 		}
+		completeAdmissionDecision(current)
 		updated, err := m.store.CompareAndSwapWorkload(ctx, current, expectedRevision, expectedStatus, expectedCancellationOwner)
 		if err == nil {
 			return updated, nil
@@ -4356,6 +4357,7 @@ func (m *Manager) replaceWorkloadCAS(ctx context.Context, desired *domain.Worklo
 			return nil, err
 		}
 	}
+	completeAdmissionDecision(&snapshot)
 	return m.store.CompareAndSwapWorkload(ctx, &snapshot, current.Revision, current.Status, expectedCancellationOwner)
 }
 
@@ -4885,6 +4887,14 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	})
 
 	var blockers []string
+	// Codes are recorded where the cause is known; blockers without an entry
+	// fall back to ClassifyBlocker when the decision is built.
+	blockerCodes := map[string]domain.AdmissionBlocker{}
+	coded := func(code domain.AdmissionBlocker, text string) string {
+		blockerCodes[text] = code
+		return text
+	}
+	var protectedUntil *time.Time
 	var waitingEstimate *targetEstimate
 	stickyTargetRegistered := boundTarget == ""
 	creatorProfileMatched := false
@@ -4897,7 +4907,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			continue
 		}
 		if !targetSupportsDisruption(adapter, target, w.Request.Disruption) {
-			blockers = append(blockers, target.ID+": disruption policy unsupported by runtime protocol")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": disruption policy unsupported by runtime protocol"))
 			continue
 		}
 		selectedProfile := domain.RuntimeProfile{}
@@ -4910,19 +4920,19 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			creatorProfileMatched = true
 		}
 		if target.Quarantined {
-			blockers = append(blockers, target.ID+": provider/model route is quarantined")
+			blockers = append(blockers, coded(domain.BlockerNodeOffline, target.ID+": provider/model route is quarantined"))
 			continue
 		}
 		if retryAt := w.TargetRetryAfter[target.ID]; retryAt.After(time.Now()) {
-			blockers = append(blockers, target.ID+": provider retry cooldown until "+retryAt.UTC().Format(time.RFC3339))
+			blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": provider retry cooldown until "+retryAt.UTC().Format(time.RFC3339)))
 			continue
 		}
 		if retryAt, open := m.providerCircuitOpen(target.ID); open {
-			blockers = append(blockers, target.ID+": provider circuit open until "+retryAt.UTC().Format(time.RFC3339))
+			blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": provider circuit open until "+retryAt.UTC().Format(time.RFC3339)))
 			continue
 		}
 		if concurrencyBlocked {
-			blockers = append(blockers, fmt.Sprintf("principal concurrency limit %d reached", w.Request.ConcurrencyLimit))
+			blockers = append(blockers, coded(domain.BlockerCapacity, fmt.Sprintf("principal concurrency limit %d reached", w.Request.ConcurrencyLimit)))
 			break
 		}
 		if !target.Enabled {
@@ -4932,11 +4942,11 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			continue
 		}
 		if req.RuntimeProtocol != "" && target.RuntimeProtocol != req.RuntimeProtocol {
-			blockers = append(blockers, target.ID+": required runtime protocol unavailable")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": required runtime protocol unavailable"))
 			continue
 		}
 		if target.Cloud && w.Request.Egress == domain.EgressLocalOnly {
-			blockers = append(blockers, target.ID+": egress denied")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": egress denied"))
 			continue
 		}
 		if w.Request.PlacementPolicy == domain.PlacementSticky && boundTarget != "" && target.ID != boundTarget {
@@ -4944,11 +4954,15 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		}
 		if blocker := m.inventoryBlocker(ctx, target, req); blocker != "" {
 			waitingEstimate = preferEstimate(waitingEstimate, targetEstimates[target.ID])
-			blockers = append(blockers, target.ID+": "+blocker)
+			code := domain.BlockerNodeOffline
+			if blocker == inventoryInsufficientVRAM {
+				code = domain.BlockerCapacity
+			}
+			blockers = append(blockers, coded(code, target.ID+": "+blocker))
 			continue
 		}
 		if req.Model != "" && !containsString(target.Models, req.Model) {
-			blockers = append(blockers, target.ID+": model unavailable")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": model unavailable"))
 			continue
 		}
 		missingRequiredModel := ""
@@ -4959,11 +4973,11 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			}
 		}
 		if missingRequiredModel != "" {
-			blockers = append(blockers, target.ID+": workflow model unavailable: "+missingRequiredModel)
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": workflow model unavailable: "+missingRequiredModel))
 			continue
 		}
 		if allowed, limit := m.modelAcceleratorAllowed(target, req.Model); !allowed {
-			blockers = append(blockers, fmt.Sprintf("%s: model accelerator limit %d reached", target.ID, limit))
+			blockers = append(blockers, coded(domain.BlockerCapacity, fmt.Sprintf("%s: model accelerator limit %d reached", target.ID, limit)))
 			continue
 		}
 		if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) {
@@ -4971,7 +4985,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			var schemaErr error
 			comfyProof, schemaErr = m.ComfySchema(ctx, target, comfySchemaGeneration, w.Request)
 			if schemaErr != nil {
-				blockers = append(blockers, target.ID+": workflow schema unavailable or incompatible")
+				blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": workflow schema unavailable or incompatible"))
 				continue
 			}
 		}
@@ -4983,7 +4997,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			}
 			if switchReason != "" {
 				waitingEstimate = preferEstimate(waitingEstimate, targetEstimates[target.ID])
-				blockers = append(blockers, target.ID+": "+switchReason)
+				blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": "+switchReason))
 				continue
 			}
 			target = updated
@@ -5036,13 +5050,13 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			if reason == "" {
 				reason = "runtime profile observation_unavailable; pending transition has no verified admission capacity"
 			}
-			blockers = append(blockers, target.ID+": "+reason)
+			blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": "+reason))
 			continue
 		}
 		if m.residencyTransitionInFlight(target.AcceleratorID) {
 			unlockAdmission()
 			waitingEstimate = preferEstimate(waitingEstimate, targetEstimates[target.ID])
-			blockers = append(blockers, target.ID+": accelerator residency transition in progress")
+			blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": accelerator residency transition in progress"))
 			continue
 		}
 		needsModelLoad := req.Model != "" && !containsString(target.ResidentModels, req.Model)
@@ -5089,20 +5103,20 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		}
 		if needsModelLoad && !target.SupportsModelLifecycle {
 			unlockAdmission()
-			blockers = append(blockers, target.ID+": model is not resident and target cannot load it")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": model is not resident and target cannot load it"))
 			continue
 		}
 		if needsModelLoad {
 			residency, residencyErr := observedResidency, observedResidencyErr
 			if residencyErr == nil && (residency.Policy == domain.ResidencyManual || residency.Policy == domain.ResidencyOff) {
 				unlockAdmission()
-				blockers = append(blockers, target.ID+": model loading requires an operator transition")
+				blockers = append(blockers, coded(domain.BlockerPinnedResident, target.ID+": model loading requires an operator transition"))
 				continue
 			}
 		}
 		if req.ContextTokens > 0 && target.ContextLimit > 0 && req.ContextTokens > target.ContextLimit {
 			unlockAdmission()
-			blockers = append(blockers, fmt.Sprintf("%s: context limit %d is below required %d", target.ID, target.ContextLimit, req.ContextTokens))
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, fmt.Sprintf("%s: context limit %d is below required %d", target.ID, target.ContextLimit, req.ContextTokens)))
 			continue
 		}
 		missingNode := false
@@ -5117,7 +5131,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		}
 		if missingNode {
 			unlockAdmission()
-			blockers = append(blockers, target.ID+": custom node unavailable")
+			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": custom node unavailable"))
 			continue
 		}
 		if len(w.Request.Transformations) > 0 {
@@ -5243,7 +5257,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			// and cannot reserve the same envelope while this optimistic phase waits.
 			if !m.beginResidencyTransition(target.AcceleratorID) {
 				unlockAdmission()
-				blockers = append(blockers, target.ID+": accelerator residency transition in progress")
+				blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": accelerator residency transition in progress"))
 				return admitCandidateNext
 			}
 			unlockAdmission()
@@ -5257,10 +5271,19 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 				m.endResidencyTransition(target.AcceleratorID)
 				waitingEstimate = preferEstimate(waitingEstimate, targetEstimates[target.ID])
 				if m.tryPreempt(ctx, w, target) {
-					blockers = append(blockers, target.ID+": victim transition in progress")
+					blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": victim transition in progress"))
 					return admitCandidateNext
 				}
-				blockers = append(blockers, target.ID+": "+reason)
+				// Lease refusals carry a free-text reason (capacity, profile
+				// transition, observation); the classifier picks the code unless
+				// the holder is a locked workload preemption could not displace.
+				text := target.ID + ": " + reason
+				if holderID, held := strings.CutPrefix(reason, acceleratorReservedBy); held {
+					if holder, holderErr := m.store.GetWorkload(ctx, holderID); holderErr == nil && holder.Request.Disruption != domain.DisruptionCheckpointable {
+						text = coded(domain.BlockerLockedWorkload, text)
+					}
+				}
+				blockers = append(blockers, text)
 				return admitCandidateNext
 			}
 			m.mu.Lock()
@@ -5356,7 +5379,12 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 					if cleanupResult := m.releaseAdmissionReservation(context.Background(), reservation, target.ID, &blockers); cleanupResult != admitCandidateNext {
 						return cleanupResult
 					}
-					blockers = append(blockers, target.ID+": model load failed: "+loadErr.Error())
+					text := target.ID + ": model load failed: " + loadErr.Error()
+					if code, until := blockerFromError(loadErr); code != "" {
+						text = coded(code, text)
+						protectedUntil = earlierTime(protectedUntil, until)
+					}
+					blockers = append(blockers, text)
 					return admitCandidateNext
 				}
 				residencyTransitionIDs = append(residencyTransitionIDs, transitionIDs...)
@@ -5610,10 +5638,10 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		return
 	}
 	if !stickyTargetRegistered {
-		blockers = append(blockers, boundTarget+": sticky target is no longer registered")
+		blockers = append(blockers, coded(domain.BlockerNodeOffline, boundTarget+": sticky target is no longer registered"))
 	}
 	if w.Request.Plane == domain.PlaneCreatorStudio && !creatorProfileMatched {
-		blockers = append([]string{"CAPABILITY_UNAVAILABLE"}, blockers...)
+		blockers = append([]string{coded(domain.BlockerRuntimeUnsupported, "CAPABILITY_UNAVAILABLE")}, blockers...)
 	}
 
 	wasWaiting := w.Status == domain.WorkloadWaiting
@@ -5630,9 +5658,26 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	if len(blockers) > 0 {
 		primaryBlocker = blockers[0]
 	}
-	w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: primaryBlocker, EstimatedStart: &estimatedStart, EstimatedEnd: &estimatedEnd, Confidence: estimateConfidence, Alternatives: blockers}
+	codes := make([]domain.AdmissionBlocker, 0, len(blockers))
+	for _, blocker := range blockers {
+		code, ok := blockerCodes[blocker]
+		if !ok {
+			code = ClassifyBlocker(blocker)
+		}
+		codes = append(codes, code)
+	}
+	w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: primaryBlocker, BlockerCode: dominantBlockerCode(codes), EstimatedStart: &estimatedStart, EstimatedEnd: &estimatedEnd, Confidence: estimateConfidence, Alternatives: blockers}
+	if protectedUntil != nil {
+		// A min_residency window is a known instant, not a statistical guess:
+		// publish it even when the queue estimate is only a placeholder.
+		w.Decision.ETA = earlierTime(realEstimate(w.Decision), protectedUntil)
+		retry := *w.Decision.ETA
+		w.Decision.RetryAfter = &retry
+	}
 	w.UpdatedAt = time.Now().UTC()
 	if w.Request.QueuePolicy == domain.QueueFailFast {
+		// Keep the generic first line for older clients; the real per-target
+		// causes stay in Alternatives and drive BlockerCode.
 		w.Decision.Blocker = "no eligible capacity (fail_fast)"
 		w.Status = domain.WorkloadRejected
 		now := time.Now().UTC()
@@ -6278,6 +6323,11 @@ func effectiveWorkloadPriority(workload *domain.Workload) int {
 	return effectivePriority(request)
 }
 
+const (
+	inventoryInsufficientVRAM = "insufficient measured VRAM"
+	acceleratorReservedBy     = "accelerator is reserved by "
+)
+
 func (m *Manager) inventoryBlocker(ctx context.Context, target Target, requirements Requirements) string {
 	if m.nodes == nil || target.Cloud || target.AcceleratorID == "" {
 		return ""
@@ -6298,7 +6348,7 @@ func (m *Manager) inventoryBlocker(ctx context.Context, target Target, requireme
 				return "node scheduling disabled"
 			}
 			if requirements.EstimatedVRAMMB > 0 && accelerator.VRAMFreeMB < requirements.EstimatedVRAMMB {
-				return "insufficient measured VRAM"
+				return inventoryInsufficientVRAM
 			}
 			return ""
 		}
@@ -7078,7 +7128,7 @@ func (m *Manager) reserveTarget(ctx context.Context, target Target, workload *do
 			return nil, false, "", err
 		}
 		if !acquired {
-			return nil, false, "accelerator is reserved by " + lease.WorkloadID, nil
+			return nil, false, acceleratorReservedBy + lease.WorkloadID, nil
 		}
 
 		// Recheck after the store round trip. A concurrent admission may have

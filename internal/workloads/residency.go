@@ -759,15 +759,16 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 	if !capacityScheduling && maxResident <= 0 {
 		maxResident = 1
 	}
+	priority := requestedPriority(workload)
 	if maxResident > 0 {
 		needed := len(target.ResidentModels) - maxResident + 1
 		if needed > 0 {
-			candidates, err := m.evictionCandidates(ctx, target, model)
+			candidates, protection, err := m.evictionCandidates(ctx, target, model, priority)
 			if err != nil {
 				return nil, err
 			}
 			if len(candidates) < needed {
-				return nil, fmt.Errorf("resident capacity is protected by policy or queued demand")
+				return nil, protection.blockError(fmt.Errorf("resident capacity is protected by policy or queued demand"))
 			}
 			for i := 0; i < needed; i++ {
 				victim := candidates[i]
@@ -790,7 +791,7 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 			if capacityErr == nil {
 				break
 			}
-			candidates, candidateErr := m.evictionCandidates(ctx, target, model)
+			candidates, protection, candidateErr := m.evictionCandidates(ctx, target, model, priority)
 			if candidateErr != nil {
 				return transitionIDs, candidateErr
 			}
@@ -806,7 +807,7 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 				}
 			}
 			if victim == nil {
-				return transitionIDs, capacityErr
+				return transitionIDs, protection.blockError(capacityErr)
 			}
 			transition, transitionErr := m.transitionModel(ctx, lifecycle, target, victim.Model, domain.ResidencyColdDisk, "capacity_for_demand", workload.Request.OwnerID, workload.Request.ID, "demand-evict:"+workload.Request.ID+":"+target.ID+":"+victim.Model, lease)
 			if transition != nil {
@@ -865,20 +866,60 @@ type ModelCapacityObserver interface {
 	ObserveModelCapacity(context.Context, Target, string) (store.ModelCapacity, error)
 }
 
-func (m *Manager) evictionCandidates(ctx context.Context, target Target, requested string) ([]*domain.ModelResidency, error) {
+// evictionProtection records why residents were withheld from demand
+// eviction so the admission decision can report a stable code and, for a
+// min_residency window, the instant the resident becomes evictable.
+type evictionProtection struct {
+	minResidentUntil *time.Time
+	pinned           bool
+}
+
+func (p evictionProtection) blockError(err error) error {
+	switch {
+	case p.minResidentUntil != nil:
+		return &admissionBlockError{code: domain.BlockerTransitionBusy, until: p.minResidentUntil, msg: err.Error() + "; resident within min_residency until " + p.minResidentUntil.UTC().Format(time.RFC3339)}
+	case p.pinned:
+		return &admissionBlockError{code: domain.BlockerPinnedResident, msg: err.Error()}
+	}
+	return err
+}
+
+// requestedPriority is the caller-requested priority without QoS boosts, so
+// "urgent" means the same thing for every plane.
+func requestedPriority(workload *domain.Workload) int {
+	if workload == nil {
+		return 0
+	}
+	if workload.RuntimePriority != nil {
+		return *workload.RuntimePriority
+	}
+	return workload.Request.Priority
+}
+
+// evictionCandidates lists residents demand may evict. A resident inside its
+// min_residency window is protected from ordinary demand (that window exists
+// to stop load/unload thrash) and only an urgent request may override it.
+func (m *Manager) evictionCandidates(ctx context.Context, target Target, requested string, priority int) ([]*domain.ModelResidency, evictionProtection, error) {
+	var protection evictionProtection
 	if target.QueueRunning > 0 || target.QueuePending > 0 {
-		return nil, nil
+		return nil, protection, nil
 	}
 	rows, err := m.store.ListModelResidencies(ctx)
 	if err != nil {
-		return nil, err
+		return nil, protection, err
 	}
+	now := time.Now()
 	var candidates []*domain.ModelResidency
 	for _, row := range rows {
 		if row.TargetID != target.ID || row.Model == requested || row.ObservedTier != domain.ResidencyHotVRAM {
 			continue
 		}
 		if row.Policy == domain.ResidencyPinned || row.Policy == domain.ResidencyManual || row.Policy == domain.ResidencyOff {
+			protection.pinned = true
+			continue
+		}
+		if row.MinResidentUntil != nil && now.Before(*row.MinResidentUntil) && priority < UrgentPriority {
+			protection.minResidentUntil = earlierTime(protection.minResidentUntil, row.MinResidentUntil)
 			continue
 		}
 		if m.modelHasActiveDemand(row.Model) {
@@ -895,7 +936,7 @@ func (m *Manager) evictionCandidates(ctx context.Context, target Target, request
 		}
 		return residencyTime(candidates[i]).Before(residencyTime(candidates[j]))
 	})
-	return candidates, nil
+	return candidates, protection, nil
 }
 
 // SetModelCapacity records a measured model/profile envelope. It is intended
