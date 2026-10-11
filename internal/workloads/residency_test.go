@@ -2077,3 +2077,27 @@ func TestReclaimForeignTargetsProtectsActiveQueuedPinnedManualAndOffResidents(t 
 		})
 	}
 }
+
+func TestStaleRuntimeQueueCountersDoNotBlockDemandEviction(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	defer mgr.Close()
+	target := Target{ID: "router", Adapter: "mock", AcceleratorID: "node-gpu0", Slots: 4, Enabled: true, QueueRunning: 1}
+	mgr.RegisterAdapter(NewMockAdapter())
+	mgr.RegisterTarget(target)
+	resident := &domain.ModelResidency{TargetID: target.ID, Model: "old", AcceleratorID: target.AcceleratorID, Policy: domain.ResidencyAuto, DesiredTier: domain.ResidencyHotVRAM, ObservedTier: domain.ResidencyHotVRAM}
+	if _, err := backing.UpsertModelResidency(ctx, resident); err != nil {
+		t.Fatal(err)
+	}
+	registered := mgr.targetByID(target.ID)
+	if candidates, _, err := mgr.evictionCandidates(ctx, registered, "new", 1); err != nil || len(candidates) != 0 {
+		t.Fatalf("fresh busy counters must protect residents: candidates=%d err=%v", len(candidates), err)
+	}
+	mgr.placementMu.Lock()
+	mgr.targetReleasedAt[target.ID] = time.Now().Add(time.Second)
+	mgr.placementMu.Unlock()
+	if candidates, _, err := mgr.evictionCandidates(ctx, registered, "new", 1); err != nil || len(candidates) != 1 {
+		t.Fatalf("counters advertised before the last release still blocked eviction: candidates=%d err=%v", len(candidates), err)
+	}
+}

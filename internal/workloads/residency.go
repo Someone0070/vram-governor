@@ -901,7 +901,7 @@ func requestedPriority(workload *domain.Workload) int {
 // to stop load/unload thrash) and only an urgent request may override it.
 func (m *Manager) evictionCandidates(ctx context.Context, target Target, requested string, priority int) ([]*domain.ModelResidency, evictionProtection, error) {
 	var protection evictionProtection
-	if target.QueueRunning > 0 || target.QueuePending > 0 {
+	if (target.QueueRunning > 0 || target.QueuePending > 0) && !m.runtimeQueueCountersStale(target) {
 		return nil, protection, nil
 	}
 	rows, err := m.store.ListModelResidencies(ctx)
@@ -2975,4 +2975,20 @@ func (m *Manager) DrainNode(ctx context.Context, nodeID, actor, idempotencyKey s
 	}
 	m.auditActor(ctx, actor, "", "", "node.runtime.drained", "info", result)
 	return result, nil
+}
+
+// runtimeQueueCountersStale reports whether the node's busy counters predate
+// the controller's last release on this target while nothing of ours still
+// runs there. Counters arrive with the periodic advertisement (~30 s), so a
+// request that just finished otherwise blocks demand eviction until the next
+// refresh; counters for work outside the LB still protect residents.
+func (m *Manager) runtimeQueueCountersStale(target Target) bool {
+	m.placementMu.Lock()
+	active := m.targetActive[target.ID]
+	released := m.targetReleasedAt[target.ID]
+	m.placementMu.Unlock()
+	m.mu.RLock()
+	advertised := m.targetAdvertisedAt[target.ID]
+	m.mu.RUnlock()
+	return active == 0 && !released.IsZero() && !advertised.IsZero() && advertised.Before(released)
 }

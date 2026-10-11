@@ -54,6 +54,8 @@ type Manager struct {
 	targetActive                   map[string]int
 	targetLeases                   map[string]*domain.AcceleratorLease
 	activePlacements               map[string]activePlacement
+	targetReleasedAt               map[string]time.Time
+	targetAdvertisedAt             map[string]time.Time
 	reservations                   map[string]*targetReservation
 	powerProfileLocksMu            sync.Mutex
 	powerProfileInFlight           map[string]chan struct{}
@@ -232,7 +234,7 @@ func NewManager(log *slog.Logger, backing store.WorkloadStore, leaseTTL time.Dur
 		log: log, store: backing, leaseTTL: leaseTTL,
 		adapters: make(map[string]Adapter), targets: make(map[string]Target), retiredTargets: make(map[string]Target), targetGenerations: make(map[string]uint64),
 		cancels: make(map[string]context.CancelFunc), cancelling: make(map[string]struct{}), pendingStreams: make(map[string]*pendingStream), streamSessions: make(map[string]*streamSession), subscribers: make(map[chan domain.AuditEvent]struct{}),
-		kick: make(chan struct{}, 1), targetActive: make(map[string]int), targetLeases: make(map[string]*domain.AcceleratorLease), activePlacements: make(map[string]activePlacement), reservations: make(map[string]*targetReservation),
+		kick: make(chan struct{}, 1), targetActive: make(map[string]int), targetLeases: make(map[string]*domain.AcceleratorLease), activePlacements: make(map[string]activePlacement), targetReleasedAt: make(map[string]time.Time), targetAdvertisedAt: make(map[string]time.Time), reservations: make(map[string]*targetReservation),
 		powerProfileInFlight:     make(map[string]chan struct{}),
 		managedGPUPerformance:    make(map[string]struct{}),
 		pendingGPUIdleReconcile:  make(map[string]bool),
@@ -1570,8 +1572,8 @@ func lifecycleRouteFingerprint(target Target) string {
 	sort.Strings(models)
 	material, _ := json.Marshal(struct {
 		ID, NodeID, Adapter, RuntimeProtocol, Endpoint, AcceleratorID, ModelFingerprint string
-		Cloud, Enabled                                                               bool
-		Models                                                                       []string
+		Cloud, Enabled                                                                  bool
+		Models                                                                          []string
 	}{target.ID, target.NodeID, target.Adapter, target.RuntimeProtocol, target.Endpoint, target.AcceleratorID, target.ModelFingerprint, target.Cloud, target.Enabled, models})
 	digest := sha256.Sum256(material)
 	return hex.EncodeToString(digest[:])
@@ -1951,6 +1953,7 @@ func (m *Manager) replaceTargetLocked(target Target) error {
 		m.targetGenerations[target.ID]++
 	}
 	m.targets[target.ID] = target
+	m.targetAdvertisedAt[target.ID] = time.Now()
 	return nil
 }
 
@@ -7690,6 +7693,7 @@ func (m *Manager) abandonRestoredCheckpointVictim(ctx context.Context, victim *d
 		m.placementMu.Lock()
 		if active, ok := m.activePlacements[victim.Request.ID]; ok && active.targetID == target.ID {
 			delete(m.activePlacements, victim.Request.ID)
+			m.targetReleasedAt[target.ID] = time.Now()
 			if count := m.targetActive[target.ID]; count <= 1 {
 				delete(m.targetActive, target.ID)
 			} else {
@@ -8196,6 +8200,7 @@ func (m *Manager) releaseTargetWithIntent(ctx context.Context, reservation *targ
 		// prevents two concurrent finalizers from both issuing Release.
 		reservation.released = true
 		delete(m.activePlacements, reservation.workloadID)
+		m.targetReleasedAt[reservation.targetID] = time.Now()
 		active := m.targetActive[reservation.targetID]
 		if active > 1 {
 			m.targetActive[reservation.targetID] = active - 1
@@ -8283,6 +8288,7 @@ func (m *Manager) finishReleasedReservationLocked(reservation *targetReservation
 	reservation.backendCleanupMessage = ""
 	reservation.backendCleanupTerminal = ""
 	delete(m.activePlacements, reservation.workloadID)
+	m.targetReleasedAt[reservation.targetID] = time.Now()
 	active := m.targetActive[reservation.targetID]
 	if active > 1 {
 		m.targetActive[reservation.targetID] = active - 1
