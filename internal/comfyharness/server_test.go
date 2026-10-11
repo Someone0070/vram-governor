@@ -1501,3 +1501,36 @@ func TestComfyDiscoveryLeavesSharedClientUnchanged(t *testing.T) {
 		t.Fatalf("discovery mutated the shared client: status=%d timeout=%s", response.Code, client.Timeout)
 	}
 }
+
+func TestManagedComfyUpgradesLegacyTerminalStateWithoutPayloadHash(t *testing.T) {
+	write := func(t *testing.T, state string) string {
+		t.Helper()
+		directory := privateStateDirectory(t)
+		legacy := fmt.Sprintf(`{"version":%q,"executions":[{"id":"legacy-1","workload_id":"w-1","idempotency_key":"k-1","plan_hash":"p-1","chunks":[{"id":"generation","prompt":{"1":{"class_type":"SaveImage","inputs":{}}}}],"next_chunk":1,"histories":{"prompt-1":{"outputs":{}}},"state":%q,"created_at":"2026-10-10T00:00:00Z","updated_at":"2026-10-10T00:00:00Z"}]}`, ProtocolVersion, state)
+		if err := os.WriteFile(filepath.Join(directory, "state.json"), []byte(legacy), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return directory
+	}
+	directory := write(t, "completed")
+	server, err := New(Options{ComfyURL: "http://127.0.0.1:1", Authorization: "Bearer harness-secret", StateDirectory: directory})
+	if err != nil {
+		t.Fatalf("legacy completed state was rejected: %v", err)
+	}
+	upgraded := server.executions["legacy-1"]
+	want, _ := hashChunks(upgraded.Chunks)
+	if upgraded.PayloadHash != want {
+		t.Fatalf("legacy payload hash not bound to its chunks: %q", upgraded.PayloadHash)
+	}
+	_ = server.Close()
+	persisted, err := os.ReadFile(filepath.Join(directory, "state.json"))
+	if err != nil || !strings.Contains(string(persisted), want) {
+		t.Fatalf("upgraded payload hash was not persisted: err=%v", err)
+	}
+
+	running := write(t, "running")
+	if server, err := New(Options{ComfyURL: "http://127.0.0.1:1", Authorization: "Bearer harness-secret", StateDirectory: running}); err == nil {
+		_ = server.Close()
+		t.Fatal("legacy nonterminal execution without payload identity was accepted")
+	}
+}

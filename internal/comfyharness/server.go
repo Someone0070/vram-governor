@@ -1204,6 +1204,10 @@ func hashChunks(chunks []chunk) (string, error) {
 	return hex.EncodeToString(digest[:]), nil
 }
 
+func legacyTerminalState(state string) bool {
+	return state == "completed" || state == "failed" || state == "cancelled"
+}
+
 func canonicalJSON(raw json.RawMessage) ([]byte, error) {
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, raw); err != nil {
@@ -1266,6 +1270,13 @@ func (s *Server) load() error {
 			}
 		}
 		hash, err := hashChunks(execution.Chunks)
+		if err == nil && execution.PayloadHash == "" && legacyTerminalState(execution.State) {
+			// Harness builds before payload hashing persisted no payload_hash.
+			// A terminal legacy execution can never be resubmitted, so binding
+			// it to its own validated chunks is a lossless format upgrade.
+			execution.PayloadHash = hash
+			recovered = true
+		}
 		if err != nil || hash != execution.PayloadHash {
 			return fmt.Errorf("durable payload identity mismatch")
 		}
