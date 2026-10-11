@@ -2100,6 +2100,13 @@ func reduceRuntimeProfileHistory(nodeID string, target Target, rows []*domain.No
 			continue
 		}
 		if row.Status == domain.NodeCommandSucceeded {
+			// A switch that finished long ago is settled history: the node's
+			// current /slots advertisement is authoritative for its profile.
+			// Only a recent unproven success can still disagree with it (e.g.
+			// rows written by older controllers without route/card proof).
+			if settled := runtimeProfileCommandSettledAt(row); !settled.IsZero() && time.Since(settled) > runtimeProfileSettledHistoryAge {
+				continue
+			}
 			return fmt.Sprintf("succeeded profile command %s lacks accepted route/card proof; node %s requires reconciliation", row.ID, nodeID)
 		}
 		if row.Attempts == 0 && (row.Status == domain.NodeCommandFailed || row.Status == domain.NodeCommandExpired) {
@@ -2222,6 +2229,15 @@ func runtimeProfileAcceptedResultMatchesTarget(row *domain.NodeCommand, target T
 		return profileMatches == 1
 	}
 	return false
+}
+
+const runtimeProfileSettledHistoryAge = time.Hour
+
+func runtimeProfileCommandSettledAt(row *domain.NodeCommand) time.Time {
+	if row.CompletedAt != nil && !row.CompletedAt.IsZero() {
+		return *row.CompletedAt
+	}
+	return row.UpdatedAt
 }
 
 func runtimeProfileCommandHasAcceptedResult(row *domain.NodeCommand) bool {

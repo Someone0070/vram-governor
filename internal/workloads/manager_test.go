@@ -2901,6 +2901,20 @@ func TestRuntimeProfileHistoryReducerIsOrderIndependent(t *testing.T) {
 	}
 }
 
+func TestRuntimeProfileHistoryLegacySucceededRowBlocksOnlyWhileRecent(t *testing.T) {
+	target := Target{ID: "node-runtime", NodeID: "node", Adapter: "mock", Endpoint: "http://runtime", AcceleratorID: "node-gpu0", ContextLimit: 8192, Slots: 4, ActiveRuntimeProfile: "ctx-8k"}
+	legacy := func(completed time.Time) []*domain.NodeCommand {
+		return []*domain.NodeCommand{{ID: "legacy-switch", NodeID: "node", Command: "switch_runtime_profile", Args: map[string]any{"target_id": "runtime", "profile_id": "ctx-8k"}, Attempts: 1, Status: domain.NodeCommandSucceeded, Result: json.RawMessage(`{"changed":true}`), CreatedAt: completed, UpdatedAt: completed, CompletedAt: &completed}}
+	}
+	known := map[string]Target{target.ID: target}
+	if blocker := reduceRuntimeProfileHistory("node", target, legacy(time.Now().UTC().Add(-time.Minute)), known); !strings.Contains(blocker, "lacks accepted route/card proof") {
+		t.Fatalf("recent unproven success did not block: %q", blocker)
+	}
+	if blocker := reduceRuntimeProfileHistory("node", target, legacy(time.Now().UTC().Add(-48*time.Hour)), known); blocker != "" {
+		t.Fatalf("settled legacy success still withholds capacity: %q", blocker)
+	}
+}
+
 type gatedRuntimeProfileHistoryStore struct {
 	store.WorkloadStore
 	mu      sync.Mutex
