@@ -96,6 +96,12 @@ type creatorWorkloadResponse struct {
 	Outputs             []creatorArtifactOutput `json:"outputs,omitempty"`
 	ContinuationRef     string                  `json:"continuation_ref,omitempty"`
 	InfrastructureError string                  `json:"infrastructure_error,omitempty"`
+	// Machine-readable admission detail for queued/blocked rows. Reason stays
+	// the Creator Studio enum; these mirror the scheduler decision.
+	BlockerCode       domain.AdmissionBlocker `json:"blocker_code,omitempty"`
+	EstimatedStart    *time.Time              `json:"estimated_start,omitempty"`
+	RetryAfterSeconds int                     `json:"retry_after_seconds,omitempty"`
+	Alternatives      []string                `json:"alternatives,omitempty"`
 }
 
 type creatorBlockedResponse struct {
@@ -389,6 +395,26 @@ func (s *Server) creatorResponse(ctx *http.Request, row *domain.Workload) creato
 		response.Status, response.InfrastructureError = "failed", row.Error
 	default:
 		response.Status = "queued"
+	}
+	if (row.Status == domain.WorkloadWaiting || row.Status == domain.WorkloadRejected) && !row.Decision.Admitted {
+		response.BlockerCode = row.Decision.BlockerCode
+		if response.BlockerCode == "" && row.Decision.Blocker != "" {
+			response.BlockerCode = workloads.ClassifyBlocker(row.Decision.Blocker)
+		}
+		response.Alternatives = row.Decision.Alternatives
+		// Only real estimates are published: ETA is set by the scheduler when the
+		// start time is history-backed (or a known min_residency expiry).
+		if row.Decision.ETA != nil {
+			eta := *row.Decision.ETA
+			response.EstimatedStart = &eta
+		}
+		if row.Decision.RetryAfter != nil {
+			if seconds := int(time.Until(*row.Decision.RetryAfter).Seconds()); seconds > 0 {
+				response.RetryAfterSeconds = seconds
+			} else {
+				response.RetryAfterSeconds = 1
+			}
+		}
 	}
 	if row.Plan != nil && row.Plan.ProfileID != "" {
 		response.Profile = &creatorProfileIdentity{ProfileID: row.Plan.ProfileID, Version: row.Plan.ProfileVersion, Digest: row.Plan.ProfileDigest, CapabilityRevision: row.Plan.CapabilityRevision, CapabilityDefinitionHash: row.Plan.CapabilityDefinitionHash}

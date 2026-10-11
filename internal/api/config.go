@@ -51,6 +51,11 @@ type Config struct {
 		Checkpoint                     CheckpointConfig             `yaml:"checkpoint"`
 		Residency                      ResidencyConfig              `yaml:"residency"`
 		Targets                        []WorkloadTargetConfig       `yaml:"targets"`
+		// OpenAI queueing fallbacks below body, X-VRAM-* headers and the
+		// credential. fail_fast stays the default so existing clients keep
+		// their immediate 429/503 behaviour.
+		OpenAIDefaultQueuePolicy    string `yaml:"openai_default_queue_policy"`
+		OpenAIDefaultMaxWaitSeconds int    `yaml:"openai_default_max_wait_seconds"`
 	} `yaml:"workloads"`
 	SmartPlugs []SmartPlugConfig `yaml:"smart_plugs"`
 
@@ -101,6 +106,27 @@ func (c CheckpointConfig) Validate() error {
 	}
 	if c.MaxMetadataBytes <= 0 || c.MaxOutputBytes <= 0 || c.ExpirySeconds <= 0 || c.LockStaleSeconds <= 0 || c.ProofJournalRetentionSeconds < 0 {
 		return fmt.Errorf("checkpoint bounds and lock expiry are required")
+	}
+	return nil
+}
+
+// validateOpenAIQueueDefaults normalizes workloads.openai_default_* and
+// rejects values the request path would otherwise silently reinterpret.
+func (c *Config) validateOpenAIQueueDefaults() error {
+	policy := strings.TrimSpace(c.Workloads.OpenAIDefaultQueuePolicy)
+	switch policy {
+	case "":
+		policy = string(domain.QueueFailFast)
+	case string(domain.QueueFailFast), string(domain.QueueWait):
+	default:
+		return fmt.Errorf("workloads.openai_default_queue_policy must be fail_fast or wait")
+	}
+	c.Workloads.OpenAIDefaultQueuePolicy = policy
+	if c.Workloads.OpenAIDefaultMaxWaitSeconds == 0 {
+		c.Workloads.OpenAIDefaultMaxWaitSeconds = 120
+	}
+	if c.Workloads.OpenAIDefaultMaxWaitSeconds < 1 || c.Workloads.OpenAIDefaultMaxWaitSeconds > 900 {
+		return fmt.Errorf("workloads.openai_default_max_wait_seconds must be between 1 and 900")
 	}
 	return nil
 }
@@ -181,6 +207,9 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if err := c.Workloads.Capacity.Validate(); err != nil {
 		return nil, fmt.Errorf("workloads.capacity: %w", err)
+	}
+	if err := c.validateOpenAIQueueDefaults(); err != nil {
+		return nil, err
 	}
 	if err := c.Workloads.Checkpoint.Validate(); err != nil {
 		return nil, fmt.Errorf("workloads.checkpoint: %w", err)

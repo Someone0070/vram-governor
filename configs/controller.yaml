@@ -82,6 +82,10 @@ smart_plugs: []
 
 workloads:
   lease_ttl_seconds: 30
+  # OpenAI-compatible requests that set no queue policy (body, X-VRAM-* header
+  # or credential default) use these. fail_fast answers busy immediately.
+  openai_default_queue_policy: "fail_fast"
+  openai_default_max_wait_seconds: 120
   # By default one model may actively occupy one physical accelerator. All
   # execution slots on that accelerator remain usable by the model.
   default_max_accelerators_per_model: 1

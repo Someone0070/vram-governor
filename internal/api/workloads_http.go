@@ -505,7 +505,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if disruption == domain.DisruptionCheckpointable {
 		queuePolicy = domain.QueueWait
 	}
-	priority, requestedQueue, maxWait := openAISchedulingControls(r, p, envelope.Governor.Priority, envelope.Governor.QueuePolicy, envelope.Governor.MaxWaitSeconds)
+	defaultQueue, defaultWait := s.openAIQueueDefaults()
+	priority, requestedQueue, maxWait := openAISchedulingControls(r, p, envelope.Governor.Priority, envelope.Governor.QueuePolicy, envelope.Governor.MaxWaitSeconds, defaultQueue, defaultWait)
 	if requestedQueue == domain.QueueWait {
 		queuePolicy = domain.QueueWait
 	}
@@ -527,29 +528,20 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			row = admitted
 		} else {
 			_ = s.workloads.Cancel(context.Background(), row.Request.ID, row.Request.OwnerID, false)
-			row.Status = domain.WorkloadWaiting
+			// The submit-time row is usually still queued with no blocker; the
+			// scheduler has since recorded why this request kept waiting.
+			if latest, getErr := s.workloads.Get(context.Background(), row.Request.ID); getErr == nil {
+				row = latest
+			}
+			if row.Decision.Admitted || row.Decision.Blocker == "" {
+				row.Decision = domain.AdmissionDecision{Blocker: waitErr.Error(), BlockerCode: domain.BlockerCapacity, EstimatedStart: row.Decision.EstimatedStart, Confidence: row.Decision.Confidence}
+			}
+			writeOpenAIBusy(w, row)
+			return
 		}
 	}
 	if row.Status == domain.WorkloadWaiting || row.Status == domain.WorkloadRejected {
-		retrySeconds := 1
-		if row.Decision.EstimatedStart != nil {
-			if seconds := int(time.Until(*row.Decision.EstimatedStart).Seconds()); seconds > retrySeconds {
-				retrySeconds = seconds
-			}
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(retrySeconds))
-		status := http.StatusServiceUnavailable
-		errorType := "service_unavailable"
-		blocker := strings.ToLower(strings.Join(append([]string{row.Decision.Blocker}, row.Decision.Alternatives...), " "))
-		if strings.Contains(blocker, "busy") || strings.Contains(blocker, "concurrency") || strings.Contains(blocker, "budget") || strings.Contains(blocker, "cooldown") || strings.Contains(blocker, "circuit open") || strings.Contains(blocker, "reserved") {
-			status = http.StatusTooManyRequests
-			errorType = "capacity_unavailable"
-		}
-		message := row.Decision.Blocker
-		if len(row.Decision.Alternatives) > 0 {
-			message += ": " + strings.Join(row.Decision.Alternatives, "; ")
-		}
-		writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": errorType, "workload_id": row.Request.ID}, "admission": row.Decision})
+		writeOpenAIBusy(w, row)
 		return
 	}
 	if envelope.Stream {
@@ -1401,10 +1393,60 @@ func decodeJSONLimit(r *http.Request, out any, limit int64) error {
 	return nil
 }
 
+// openAIBusyStatus maps a blocker code to the HTTP status. 429 tells clients
+// a retry can succeed once load or a transition clears; 503 means no route
+// can serve the request until an operator or node changes something.
+func openAIBusyStatus(code domain.AdmissionBlocker) (int, string) {
+	switch code {
+	case domain.BlockerNodeOffline, domain.BlockerRuntimeUnsupported:
+		return http.StatusServiceUnavailable, "service_unavailable"
+	}
+	return http.StatusTooManyRequests, "capacity_unavailable"
+}
+
+func writeOpenAIBusy(w http.ResponseWriter, row *domain.Workload) {
+	decision := row.Decision
+	code := decision.BlockerCode
+	if code == "" {
+		code = workloads.ClassifyBlocker(strings.Join(append([]string{decision.Blocker}, decision.Alternatives...), " "))
+	}
+	retryAt := decision.RetryAfter
+	if retryAt == nil {
+		retryAt = decision.EstimatedStart
+	}
+	retrySeconds := 1
+	if retryAt != nil {
+		if seconds := int(time.Until(*retryAt).Seconds()); seconds > retrySeconds {
+			retrySeconds = seconds
+		}
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySeconds))
+	status, errorType := openAIBusyStatus(code)
+	message := decision.Blocker
+	if len(decision.Alternatives) > 0 {
+		message += ": " + strings.Join(decision.Alternatives, "; ")
+	}
+	body := map[string]any{"error": map[string]any{"message": message, "type": errorType, "code": string(code), "workload_id": row.Request.ID}, "admission": decision, "retry_after_seconds": retrySeconds}
+	if decision.NotificationID != "" {
+		body["notification_id"] = decision.NotificationID
+	}
+	writeJSON(w, status, body)
+}
+
+// openAIQueueDefaults are the controller-wide fallbacks used when neither the
+// request nor the credential chooses a queue policy or wait bound.
+func (s *Server) openAIQueueDefaults() (string, int) {
+	if s.cfg == nil {
+		return "", 0
+	}
+	return s.cfg.Workloads.OpenAIDefaultQueuePolicy, s.cfg.Workloads.OpenAIDefaultMaxWaitSeconds
+}
+
 // openAISchedulingControls resolves priority, queue policy and wait bound for
 // an OpenAI-compatible request: governor body fields, then X-VRAM-* headers,
-// then the credential defaults. Priority is clamped later by prepareRequest.
-func openAISchedulingControls(r *http.Request, p Principal, bodyPriority *int, bodyQueue string, bodyWait int) (int, domain.QueuePolicy, time.Duration) {
+// then the credential defaults, then workloads.openai_default_*. Priority is
+// clamped later by prepareRequest.
+func openAISchedulingControls(r *http.Request, p Principal, bodyPriority *int, bodyQueue string, bodyWait int, defaultQueue string, defaultWait int) (int, domain.QueuePolicy, time.Duration) {
 	priority := p.DefaultPriority
 	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Priority")); header != "" {
 		if value, err := strconv.Atoi(header); err == nil {
@@ -1414,14 +1456,20 @@ func openAISchedulingControls(r *http.Request, p Principal, bodyPriority *int, b
 	if bodyPriority != nil {
 		priority = *bodyPriority
 	}
-	queue := strings.TrimSpace(p.DefaultQueuePolicy)
+	queue := strings.TrimSpace(defaultQueue)
+	if credential := strings.TrimSpace(p.DefaultQueuePolicy); credential != "" {
+		queue = credential
+	}
 	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Queue-Policy")); header != "" {
 		queue = header
 	}
 	if strings.TrimSpace(bodyQueue) != "" {
 		queue = strings.TrimSpace(bodyQueue)
 	}
-	waitSeconds := p.MaxQueueWaitSeconds
+	waitSeconds := defaultWait
+	if p.MaxQueueWaitSeconds > 0 {
+		waitSeconds = p.MaxQueueWaitSeconds
+	}
 	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Max-Wait-Seconds")); header != "" {
 		if value, err := strconv.Atoi(header); err == nil {
 			waitSeconds = value
