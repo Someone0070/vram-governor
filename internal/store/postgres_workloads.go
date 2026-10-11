@@ -1037,7 +1037,7 @@ func (p *PostgresWorkloadStore) AllocateResidencyTransition(ctx context.Context,
 		return nil, false, err
 	}
 	rollback := func(err error) (*domain.ResidencyTransition, bool, error) { _ = tx.Rollback(); return nil, false, err }
-	resourceKey := transition.TargetID + "\x00" + transition.Model
+	resourceKey := transition.TargetID + "\x1f" + transition.Model // NUL is invalid in a PostgreSQL text parameter
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, resourceKey); err != nil {
 		return rollback(err)
 	}
@@ -1098,7 +1098,7 @@ func (p *PostgresWorkloadStore) AllocateResidencyTransitionWithLease(ctx context
 	// fence-sentinel -> lease-row ordering. The expiry check follows the row
 	// lock, so time spent waiting cannot turn an expired tuple into authority.
 	if err := lockResidencyLeaseOrigin(ctx, tx, lease); err != nil { return rollback(err) }
-	resourceKey := transition.TargetID + "\x00" + transition.Model
+	resourceKey := transition.TargetID + "\x1f" + transition.Model // NUL is invalid in a PostgreSQL text parameter
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, resourceKey); err != nil { return rollback(err) }
 	if err := recheckLockedResidencyLeaseOrigin(ctx, tx, lease); err != nil { return rollback(err) }
 	var keyBody []byte
