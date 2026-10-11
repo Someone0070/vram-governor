@@ -195,8 +195,14 @@ func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, p
 		}
 	}
 	m.mu.Lock()
-	m.gpuCommandFences[acceleratorID]++
-	fence := m.gpuCommandFences[acceleratorID]
+	// The node keeps its fence high-water across controller restarts, so an
+	// in-memory counter starting at 1 was rejected as stale after every
+	// restart. Wall-clock milliseconds keep fences above any prior run.
+	fence := m.gpuCommandFences[acceleratorID] + 1
+	if now := uint64(time.Now().UnixMilli()); now > fence {
+		fence = now
+	}
+	m.gpuCommandFences[acceleratorID] = fence
 	m.mu.Unlock()
 	targetFences := m.snapshotAcceleratorTargetFences(acceleratorID)
 	if profile == "idle" {
