@@ -41,6 +41,8 @@ graphics/memory clocks, watts, VRAM residency, and first-token/render latency.
 If a card cannot support safe runtime clock changes, the LB should report it
 as unmanaged and let the driver scale automatically rather than claim P8.
 
+A ready-made root helper, unit and polkit rule for NVIDIA cards is in `deploy/gpu-performance/` (live on CT200 since 2026-10-11).
+
 This feature does not manage whole-node power, rentals, or RAM caching. Existing
 `power_control_mode` governs separate node/chassis power policy. The CMP/Comfy
 rig is not ready for live validation, so no fleet configuration is enabled yet.

@@ -1,0 +1,12 @@
+[Unit]
+Description=Apply VRAM Governor GPU performance profile %i
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/libexec/vram-governor/gpu-clock.sh %i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
