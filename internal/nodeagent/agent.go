@@ -216,11 +216,11 @@ func runOnce(ctx context.Context, cfg *Config, log *slog.Logger, sampler *System
 	defer cancelSession()
 	if commands.HasPending() {
 		if err := commands.ReconcilePending(sessionCtx); err != nil {
-			log.Warn("pending command reconciliation remains blocked", "error", "runtime reconciliation unavailable")
+			log.Warn("pending command reconciliation remains blocked", "error", boundedLogText(err.Error(), 240))
 		}
 	}
 	if err := commands.ReconcileWarmManifests(sessionCtx); err != nil {
-		log.Warn("restored warm manifest reconciliation remains blocked", "error", "runtime reconciliation unavailable")
+		log.Warn("restored warm manifest reconciliation remains blocked", "error", boundedLogText(err.Error(), 240))
 	}
 
 	errCh := make(chan error, 2)

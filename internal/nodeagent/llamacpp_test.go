@@ -416,3 +416,17 @@ func TestDiscoverLlamaCPPUsesOllamaRunningModelsForResidency(t *testing.T) {
 		t.Fatalf("Ollama runtime VRAM envelope is incomplete: %+v", advertisement)
 	}
 }
+
+func TestRouterModelLoadFailedReadsRouterFailureFlag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":[{"id":"broken","status":{"value":"unloaded","exit_code":1,"failed":true}},{"id":"fine","status":{"value":"unloaded"}}]}`))
+	}))
+	defer server.Close()
+	cfg := LlamaCPPServerConfig{Endpoint: server.URL}
+	if !routerModelLoadFailed(context.Background(), cfg, "broken") {
+		t.Fatal("router failure flag was not detected")
+	}
+	if routerModelLoadFailed(context.Background(), cfg, "fine") || routerModelLoadFailed(context.Background(), cfg, "absent") {
+		t.Fatal("unfailed or absent model reported as failed")
+	}
+}

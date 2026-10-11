@@ -4316,10 +4316,18 @@ func (p *commandProcessor) execute(ctx context.Context, command wsproto.CommandP
 			return nil, err.Error()
 		}
 		observedRuntimeIdentity := runtimeIdentity
+		mutatedAt, sawTransitional := time.Now(), false
 		for {
 			observedState, observeErr := discoverLlamaModelState(ctx, server, model)
 			if observeErr != nil {
 				return nil, "router model state discovery failed after mutation: " + observeErr.Error()
+			}
+			sawTransitional = sawTransitional || observedState == llamaStateTransitional
+			// A router load that crashed reports unloaded+failed. The model is
+			// confirmed absent, so this is a definite failure, not an uncertain
+			// state to wait out until the command expires.
+			if load && observedState == llamaStateUnloaded && (sawTransitional || time.Since(mutatedAt) > 3*time.Second) && routerModelLoadFailed(ctx, server, model) {
+				return nil, "model failed to load in the runtime"
 			}
 			if observedState != llamaStateTransitional && (observedState == llamaStateLoaded) == load {
 				if p.warmRAM != nil {

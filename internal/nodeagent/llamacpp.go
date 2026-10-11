@@ -354,6 +354,34 @@ func discoverLlamaModelState(ctx context.Context, cfg LlamaCPPServerConfig, want
 	return llamaModelStateFromBody(body, wanted)
 }
 
+// routerModelLoadFailed reports whether a llama.cpp router marks the model's
+// last load attempt as failed (status {"value":"unloaded","failed":true}).
+func routerModelLoadFailed(ctx context.Context, cfg LlamaCPPServerConfig, wanted string) bool {
+	body, err := getJSON(ctx, strings.TrimRight(cfg.Endpoint, "/")+"/v1/models")
+	if err != nil {
+		return false
+	}
+	var envelope struct {
+		Data []struct {
+			ID     string          `json:"id"`
+			Status json.RawMessage `json:"status"`
+		} `json:"data"`
+	}
+	if json.Unmarshal(body, &envelope) != nil {
+		return false
+	}
+	for _, entry := range envelope.Data {
+		if entry.ID != wanted {
+			continue
+		}
+		var status struct {
+			Failed bool `json:"failed"`
+		}
+		return json.Unmarshal(entry.Status, &status) == nil && status.Failed
+	}
+	return false
+}
+
 func discoverLlamaRouterModels(ctx context.Context, cfg LlamaCPPServerConfig) ([]wsproto.RouterModelRecord, error) {
 	body, err := getJSON(ctx, strings.TrimRight(cfg.Endpoint, "/")+"/v1/models")
 	if err != nil {
