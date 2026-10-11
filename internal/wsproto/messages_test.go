@@ -333,3 +333,23 @@ func cloneArgs(input map[string]any) map[string]any {
 	}
 	return output
 }
+
+func TestParseLlamaModelsPlainRouterAndMixed(t *testing.T) {
+	plain := []byte(`{"object":"list","data":[{"id":"/models/qwen.gguf","object":"model"}]}`)
+	records, isPlain, err := ParseLlamaModels(plain)
+	if err != nil || !isPlain || len(records) != 1 || records[0].State != RouterModelLoaded {
+		t.Fatalf("plain llama-server not parsed as one loaded model: %+v plain=%v err=%v", records, isPlain, err)
+	}
+	router := []byte(`{"data":[{"id":"a","status":{"value":"loaded","args":["-c","4096"]}},{"id":"b","status":"unloaded"}]}`)
+	records, isPlain, err = ParseLlamaModels(router)
+	if err != nil || isPlain || len(records) != 2 || records[0].State != RouterModelLoaded || records[1].State != RouterModelUnloaded {
+		t.Fatalf("router object/string status not parsed: %+v plain=%v err=%v", records, isPlain, err)
+	}
+	mixed := []byte(`{"data":[{"id":"a","status":"loaded"},{"id":"b"}]}`)
+	if _, _, err := ParseLlamaModels(mixed); err == nil {
+		t.Fatal("mixed router/plain response was accepted")
+	}
+	if _, err := ParseRouterModels(plain); err == nil {
+		t.Fatal("strict router parser accepted entries without status")
+	}
+}

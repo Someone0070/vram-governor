@@ -276,7 +276,7 @@ func getJSON(ctx context.Context, url string) (json.RawMessage, error) {
 }
 
 func llamaModels(body json.RawMessage) ([]string, []string, bool, []byte, error) {
-	entries, err := wsproto.ParseRouterModels(body)
+	entries, plain, err := wsproto.ParseLlamaModels(body)
 	if err != nil {
 		return nil, nil, false, nil, err
 	}
@@ -285,7 +285,7 @@ func llamaModels(body json.RawMessage) ([]string, []string, bool, []byte, error)
 	routerDetected := false
 	for _, model := range entries {
 		models = append(models, model.ID)
-		routerDetected = routerDetected || model.State != wsproto.RouterModelUnknown
+		routerDetected = routerDetected || (!plain && model.State != wsproto.RouterModelUnknown)
 		if model.State == wsproto.RouterModelLoaded {
 			resident = append(resident, model.ID)
 		}

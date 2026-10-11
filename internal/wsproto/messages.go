@@ -1098,8 +1098,8 @@ func ParseRouterModels(body []byte) ([]RouterModelRecord, error) {
 		if !ok {
 			return nil, fmt.Errorf("models entry %q is missing status", id)
 		}
-		var status string
-		if json.Unmarshal(statusRaw, &status) != nil || status == "" {
+		status, ok := routerModelStatusValue(statusRaw)
+		if !ok {
 			return nil, fmt.Errorf("models entry %q status is not an authoritative string", id)
 		}
 		var state RouterModelState
@@ -1116,6 +1116,57 @@ func ParseRouterModels(body []byte) ([]RouterModelRecord, error) {
 		result = append(result, RouterModelRecord{ID: id, State: state})
 	}
 	return result, nil
+}
+
+// routerModelStatusValue accepts llama.cpp's router status, which is either a
+// bare string or an object whose "value" field carries the state.
+func routerModelStatusValue(raw json.RawMessage) (string, bool) {
+	var status string
+	if json.Unmarshal(raw, &status) == nil {
+		return status, status != ""
+	}
+	var object struct {
+		Value *string `json:"value"`
+	}
+	if json.Unmarshal(raw, &object) == nil && object.Value != nil && *object.Value != "" {
+		return *object.Value, true
+	}
+	return "", false
+}
+
+// ParseLlamaModels parses /v1/models from either a llama.cpp router (every
+// entry carries a status) or a plain single-model llama-server (no entry
+// carries one). A plain server serves exactly what it lists, so its models
+// are reported loaded and plain=true. Mixed responses are rejected.
+func ParseLlamaModels(body []byte) (records []RouterModelRecord, plain bool, err error) {
+	var envelope struct {
+		Data []map[string]json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(body, &envelope) == nil && len(envelope.Data) > 0 {
+		withStatus := 0
+		for _, entry := range envelope.Data {
+			if _, ok := entry["status"]; ok {
+				withStatus++
+			}
+		}
+		if withStatus == 0 {
+			seen := make(map[string]struct{}, len(envelope.Data))
+			for _, entry := range envelope.Data {
+				var id string
+				if json.Unmarshal(entry["id"], &id) != nil || strings.TrimSpace(id) == "" {
+					return nil, false, fmt.Errorf("models entry id is not a nonempty string")
+				}
+				if _, duplicate := seen[id]; duplicate {
+					return nil, false, fmt.Errorf("models response contains duplicate id %q", id)
+				}
+				seen[id] = struct{}{}
+				records = append(records, RouterModelRecord{ID: id, State: RouterModelLoaded})
+			}
+			return records, true, nil
+		}
+	}
+	records, err = ParseRouterModels(body)
+	return records, false, err
 }
 
 func ParseRouterModelState(body []byte, wanted string) (RouterModelState, error) {

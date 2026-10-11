@@ -334,14 +334,14 @@ func discoverAdapters(ctx context.Context, cfg *Config, log *slog.Logger, comman
 
 func discoverAdaptersForSession(ctx context.Context, cfg *Config, log *slog.Logger, commandHandler CommandHandler, reconnect bool) []wsproto.AdapterAdvertisement {
 	advertisements := make([]wsproto.AdapterAdvertisement, 0, len(cfg.LlamaCPP.Servers)+1)
-	for _, server := range cfg.LlamaCPP.Servers {
+	for serverIndex, server := range cfg.LlamaCPP.Servers {
 		discoveryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		advertisement, err := DiscoverLlamaCPP(discoveryCtx, cfg.NodeID, server)
 		cancel()
 		if err != nil {
-			// Runtime IDs, endpoints, and upstream response bodies are external
-			// data.  Keep discovery diagnostics bounded and secret-free.
-			log.Warn("llama.cpp discovery failed")
+			// Upstream response bodies are external data and never logged; the
+			// error itself is bounded so a hostile runtime cannot flood logs.
+			log.Warn("llama.cpp discovery failed", "server_index", serverIndex, "err", boundedLogText(err.Error(), 240))
 			continue
 		}
 		if advertisement.CapabilityGeneration == 0 {
@@ -492,4 +492,11 @@ func sendEnvelope(ctx context.Context, conn *websocket.Conn, t wsproto.MsgType, 
 	}
 	env := wsproto.Envelope{Type: t, Time: time.Now().UTC(), Payload: b}
 	return wsjson.Write(ctx, conn, env)
+}
+
+func boundedLogText(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "…"
 }
