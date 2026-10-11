@@ -9809,6 +9809,12 @@ func (m *Manager) failAfterReservation(ctx context.Context, w *domain.Workload, 
 // reservation is released through the same confirmed-intent path as provider
 // fallback, and repeated drift is bounded by the execution attempt cap.
 func (m *Manager) requeueAfterPreDispatchDrift(ctx context.Context, w *domain.Workload, reservation *targetReservation, message string) {
+	if strings.TrimSpace(w.CheckpointRef) != "" || reservation.checkpointOperationID != "" {
+		// Checkpoint resumes own a durable restore protocol with its own
+		// recovery; keep their established fail-and-reconcile semantics.
+		m.failAfterReservation(ctx, w, reservation, message)
+		return
+	}
 	intent, prepareErr := m.prepareTerminalLeaseIntent(ctx, w, reservation, "failure", message)
 	if prepareErr != nil {
 		return
