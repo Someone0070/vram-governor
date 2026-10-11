@@ -1584,6 +1584,21 @@ func (m *Manager) lifecycleRouteStable(expected Target) bool {
 	return current.ID != "" && lifecycleRouteFingerprint(current) == lifecycleRouteFingerprint(expected)
 }
 
+// refreshStableLifecycleTarget keeps a completed lifecycle operation bound to
+// its route: when the advertisement changed only in facts the operation is
+// expected to change, the snapshot and generation are refreshed in place.
+func (m *Manager) refreshStableLifecycleTarget(target *Target, generation *uint64) bool {
+	if m.targetFenceMatches(*target, *generation) {
+		return true
+	}
+	if !m.lifecycleRouteStable(*target) {
+		return false
+	}
+	*target = m.targetByID(target.ID)
+	*generation = m.targetGeneration(target.ID)
+	return true
+}
+
 func targetExecutionFingerprint(target Target) string {
 	snapshot := target
 	snapshot.Active = 0

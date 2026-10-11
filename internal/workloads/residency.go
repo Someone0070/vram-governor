@@ -259,7 +259,7 @@ func (m *Manager) acceptSucceededResidencyTransition(ctx context.Context, transi
 		return fmt.Errorf("nil residency transition")
 	}
 	generation := expectedGeneration
-	if !m.targetFenceMatches(target, generation) {
+	if !m.refreshStableLifecycleTarget(&target, &generation) {
 		return fmt.Errorf("transition target changed before acceptance")
 	}
 	fingerprint := targetExecutionFingerprint(target)
@@ -1772,7 +1772,7 @@ func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleA
 			}
 		}
 	}
-	if err == nil && !m.targetFenceMatches(target, targetGeneration) && !m.lifecycleRouteStable(target) {
+	if err == nil && !m.refreshStableLifecycleTarget(&target, &targetGeneration) {
 		// The runtime result is now stale. Preserve only a durable reconciling
 		// transition; never apply its tier or bytes to a replacement target.
 		transition.Status = domain.ResidencyTransitionRunning
@@ -1796,7 +1796,7 @@ func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleA
 			err = fmt.Errorf("accelerator lease lost before transition completion: %w", renewErr)
 		}
 	}
-	if !m.targetFenceMatches(target, targetGeneration) {
+	if !m.refreshStableLifecycleTarget(&target, &targetGeneration) {
 		transition.Status = domain.ResidencyTransitionRunning
 		transition.Error = "reconciling: transition target changed before persistence"
 		m.persistResidencyTransition(context.Background(), transition)
@@ -2061,7 +2061,7 @@ func (m *Manager) transitionRuntimeCache(ctx context.Context, reclaimer Accelera
 			observation, err = observer.ReclaimAcceleratorObserved(transitionCtx, target, transition.FencingToken)
 		}
 	}
-	if err == nil && !m.targetFenceMatches(target, targetGeneration) && !m.lifecycleRouteStable(target) {
+	if err == nil && !m.refreshStableLifecycleTarget(&target, &targetGeneration) {
 		transition.Status = domain.ResidencyTransitionRunning
 		transition.Error = "reconciling: transition target changed during external operation"
 		m.persistResidencyTransition(context.Background(), transition)
