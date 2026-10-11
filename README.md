@@ -41,6 +41,76 @@ for the separate LB, always-on head GPU node, and slave GPU nodes. It still
 requires prepared controller infrastructure and a protected join bundle;
 do not mistake a Git clone alone for a fully configured mesh.
 
+## Use it: one endpoint for all inference
+
+Point every client at the controller. Nodes, GPUs and backends stay private.
+
+**LLM (OpenAI-compatible).** Base URL `https://<lb-host>:8443/v1`, API key =
+a controller credential token with the `inference:submit` scope.
+
+```bash
+curl https://<lb-host>:8443/v1/chat/completions   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json"   -d '{"model": "qwen3.8_4b",
+       "messages": [{"role": "user", "content": "hi"}],
+       "governor": {"priority": 7, "queue_policy": "wait", "max_wait_seconds": 120,
+                    "context_tokens": 8192}}'
+```
+
+- `GET /v1/models` lists every model on every node, with current/free slots,
+  context limits and whether the model is resident.
+- `priority` (0..credential `max_priority`, higher first) orders queued work.
+- `queue_policy: wait` holds the request until a slot frees (bounded by
+  `max_wait_seconds`, default 120, max 900); `fail_fast` (the default) returns
+  429/503 with `Retry-After` immediately.
+- Clients that cannot add body fields can send `X-VRAM-Priority`,
+  `X-VRAM-Queue-Policy` and `X-VRAM-Max-Wait-Seconds` headers instead.
+- Simplest: give each application its own credential and set its class there,
+  so unmodified OpenAI clients get the right priority from the key alone:
+
+```yaml
+auth:
+  credentials:
+    - id: background-agents
+      token_sha256: "<sha256 of the token>"
+      plane: api
+      scopes: [inference:submit]
+      adapters: [llamacpp]
+      max_priority: 3
+      default_priority: 1
+      default_queue_policy: wait
+      max_queue_wait_seconds: 600
+```
+
+**Images and video.** Creator Studio API: `GET /api/v1/capabilities` lists
+profiles (for example `image-sdxl-base@1`, `video-wan22-5b@1`) and their live
+availability; `POST /api/v1/workloads` submits, `GET /api/v1/workloads/{id}`
+polls, and outputs are fetched from `/api/v1/artifacts/{ref}/content`. See
+[Creator Studio integration](docs/creator-studio-integration.md).
+
+**What the balancer does with that traffic.**
+
+- Places each request on a node that has the model, preferring the smallest
+  sufficient context profile; same model on several nodes is load-balanced.
+- Loads models on demand (router-managed llama.cpp or Ollama), evicts the least
+  protected idle model when a card is full, and unloads models idle for
+  `idle_unload_seconds` (default 900). A model is never evicted within
+  `min_residency_seconds` of loading, so rapid model switching waits instead
+  of thrashing.
+- Models whose runtime cannot report per-model VRAM (plain llama.cpp) run with
+  exclusive use of their card rather than being packed by byte accounting.
+- Drops an idle GPU to its lowest memory clock (P8-class power) with models
+  still in VRAM and restores full clocks before work. See
+  [GPU performance control](docs/gpu-performance-control.md) and
+  `deploy/gpu-performance/`.
+
+**Swapping a GPU (for example RTX 3080 -> CMP 170HX).** Nothing in the
+scheduler is tied to a card model. Install the card, then on that node:
+re-run the node agent (it re-advertises the new card's VRAM and clocks),
+re-check `nvidia-smi --query-supported-clocks=mem` works for the idle profile,
+update any `accelerator_vram_mb` / `vram_reserve_mb` in controller target
+config to the new card, and re-measure model fit (a 10 GiB card and an 8 GiB
+card hold different models). Expect slower model loads on cards with narrow
+PCIe links; keeping models hot matters more there.
+
 ## Implemented code paths
 
 The list below describes code that exists. It is not a list of live acceptance
