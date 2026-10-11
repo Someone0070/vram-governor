@@ -355,6 +355,7 @@ func (s *Server) waitForNodeCommand(ctx context.Context, stored *domain.NodeComm
 	if err := s.sendNodeCommand(ctx, stored); err != nil {
 		// The durable row remains queued/sent and the caller receives the
 		// delivery error; reconnect recovery owns the eventual retry.
+		s.log.Warn("node command delivery failed", "command_id", stored.ID, "node_id", stored.NodeID, "command", stored.Command, "err", err)
 		return nil, err
 	}
 	ticker := time.NewTicker(100 * time.Millisecond)

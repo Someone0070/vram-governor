@@ -1614,9 +1614,10 @@ func (p *PostgresWorkloadStore) CompareAndSwapNodeCommandRevision(ctx context.Co
 	}
 	args := []any{updated.ID, updated.Status, body, updated.UpdatedAt, int64(expectedRevision), expectedAttempts, expectedUncertain}
 	placeholders := make([]string, 0, len(expected))
-	for i, status := range expected {
-		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)+i+1))
+	for _, status := range expected {
+		// Number from the current length: args grows inside this loop.
 		args = append(args, status)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
 	}
 	query := fmt.Sprintf(`UPDATE node_commands SET status=$2,body=$3,updated_at=$4 WHERE id=$1 AND COALESCE((body->>'revision')::bigint,1)=$5 AND COALESCE((body->>'attempts')::int,0)=$6 AND COALESCE((body->>'uncertain')::boolean,false)=$7 AND status IN (%s)`, strings.Join(placeholders, ","))
 	result, err := p.db.ExecContext(ctx, query, args...)
