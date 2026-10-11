@@ -20,7 +20,7 @@ export type Workload = {
 };
 
 export async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
-  const csrf = sessionStorage.getItem(path.startsWith("/admin/") ? "vg_csrf_admin" : "vg_csrf_ui");
+  const csrf = path.startsWith("/admin/") ? sessionStorage.getItem("vg_csrf_admin") : sessionStorage.getItem("vg_csrf_admin") || sessionStorage.getItem("vg_csrf_ui");
   const headers = new Headers(init.headers);
   if (csrf && init.method && init.method !== "GET") headers.set("X-CSRF-Token", csrf);
   const response = await fetch(path, {...init, credentials:"same-origin", headers});
@@ -32,7 +32,7 @@ export async function api<T>(path:string, init:RequestInit = {}):Promise<T> {
 export function Login({onReady,kind="ui"}:{onReady:()=>void;kind?:"ui"|"admin"}) {
   const [token,setToken]=useState(""); const [error,setError]=useState(""); const [checking,setChecking]=useState(true); const attempted=useRef(false);
   function acceptSession(result:{csrf_token:string}) { sessionStorage.setItem(kind==="admin"?"vg_csrf_admin":"vg_csrf_ui",result.csrf_token); setToken(""); onReady(); }
-  useEffect(()=>{ if(attempted.current)return; attempted.current=true; api<{csrf_token:string}>("/auth/session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:"",kind})}).then(acceptSession).catch(()=>setChecking(false)); },[kind]);
+  useEffect(()=>{ if(attempted.current)return; attempted.current=true; const existing=kind==="admin"?sessionStorage.getItem("vg_csrf_admin"):sessionStorage.getItem("vg_csrf_admin")||sessionStorage.getItem("vg_csrf_ui"); const probe=kind==="admin"?"/admin/api/overview":"/auth/whoami"; const tryEmpty=()=>api<{csrf_token:string}>("/auth/session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token:"",kind})}).then(acceptSession).catch(()=>setChecking(false)); if(existing){api<{plane?:string}>(probe).then(result=>{if(kind==="ui"&&result.plane&&result.plane!=="admin")sessionStorage.removeItem("vg_csrf_admin");onReady()}).catch(()=>{sessionStorage.removeItem(kind==="admin"?"vg_csrf_admin":"vg_csrf_ui");tryEmpty()});return} tryEmpty(); },[kind]);
   async function submit(event:FormEvent) { event.preventDefault(); setError(""); try { acceptSession(await api<{csrf_token:string}>("/auth/session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({token,kind})})); } catch(e) { setError((e as Error).message); } }
   if(checking)return <div className="login"><form><div className="eyebrow">Local control plane</div><h1>Opening cockpit…</h1><p>Establishing a protected browser session.</p></form></div>;
   return <div className="login"><form onSubmit={submit}><div className="eyebrow">{kind==="admin"?"Independent administrator session":"Secure control plane"}</div><h1>{kind==="admin"?"Unlock Fleet.":"Enter the cockpit."}</h1><p>{kind==="admin"?"Enter an administrator credential. Activity and Chat cookies are intentionally ignored here.":"Use a scoped UI credential. The token is exchanged for an HTTP-only browser session and is not retained."}</p><label>{kind==="admin"?"Administrator token":"Access token"}<input type="password" value={token} onChange={e=>setToken(e.target.value)} autoComplete="current-password" required/></label><button>{kind==="admin"?"Open Fleet":"Start session"}</button>{error&&<div className="error">{error}</div>}</form></div>;

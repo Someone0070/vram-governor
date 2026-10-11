@@ -1,0 +1,46 @@
+controller_url: "wss://governor.example.invalid:8443/ws/node"
+token: ""
+token_env: "VRAM_NODE_TOKEN_RTX3090"
+command_signing_secret: ""
+command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
+command_state_path: "/var/lib/vram-governor/node-command-state.json"
+
+node_id: "rtx3090-node"
+node_name: "rtx3090"
+log_level: "info"
+location_class: "local"
+power_control_mode: "manual"
+heartbeat_interval_seconds: 2
+capability_refresh_seconds: 30
+reconnect_min_seconds: 1
+reconnect_max_seconds: 15
+
+llamacpp:
+  servers:
+    - id: "rtx3090-llm"
+      endpoint: "http://127.0.0.1:11434"
+      public_endpoint: "http://rtx3090-node.internal:11434"
+      accelerator_index: 0
+      router_managed: true
+      max_resident_models: 1
+      context_limit: 16384
+      slots: 2
+      runtime_args: ["ollama", "balanced-context"]
+      # runtime_profiles: # Enable after /slots-backed live acceptance.
+      #   - id: "ctx-8k"
+      #     context_limit: 8192
+      #     slots: 4
+      #     switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-runtime-profile-switch@rtx3090-llm:ctx-8k.service"]
+      #   - id: "ctx-16k"
+      #     context_limit: 16384
+      #     slots: 2
+      #     switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-runtime-profile-switch@rtx3090-llm:ctx-16k.service"]
+      #   - id: "ctx-32k"
+      #     context_limit: 32768
+      #     slots: 1
+      #     switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-runtime-profile-switch@rtx3090-llm:ctx-32k.service"]
+
+comfyui:
+  endpoint: "http://127.0.0.1:8188"
+  public_endpoint: "http://rtx3090-node.internal:8188"
+  accelerator_index: 0

@@ -45,7 +45,10 @@ func DiscoverComfyUI(ctx context.Context, cfg *Config) (wsproto.AdapterAdvertise
 	if publicEndpoint == "" {
 		publicEndpoint = cfg.ComfyUI.Endpoint
 	}
-	return wsproto.AdapterAdvertisement{ID: cfg.NodeID + "-comfy", Adapter: "comfy", Endpoint: publicEndpoint, AcceleratorIndex: cfg.ComfyUI.AcceleratorIndex, Models: models, CustomNodes: customNodes, Version: version, SupportsAcceleratorReclaim: true, QueueRunning: running, QueuePending: pending}, nil
+	// Native ComfyUI's /free endpoint has no correlated, authoritative
+	// post-state protocol. Never advertise reclaim as a safe capability here;
+	// correlated reclaim belongs to the managed harness contract.
+	return wsproto.AdapterAdvertisement{ID: cfg.NodeID + "-comfy", Adapter: "comfy", Endpoint: publicEndpoint, AcceleratorIndex: cfg.ComfyUI.AcceleratorIndex, Models: models, CustomNodes: customNodes, Version: version, SupportsAcceleratorReclaim: false, QueueRunning: running, QueuePending: pending}, nil
 }
 
 func getJSONObject(ctx context.Context, url string) (map[string]any, error) {

@@ -4,7 +4,7 @@ log_level: "info"
 production: false
 tls_cert_file: ""
 tls_key_file: ""
-# Set after applying migrations/0001..0014. Empty uses the in-memory dev store.
+# Set after applying ordered migrations/0001..0021 (ending at 0021_llm_checkpoints.sql). Empty uses the in-memory dev store.
 database_url: ""
 
 auth:
@@ -76,9 +76,29 @@ notifications:
   request_timeout_seconds: 10
   dispatch_interval_seconds: 1
 
+# Map each Tasmota plug to its exact node_id after physically identifying the
+# outlet. Control remains off until explicitly enabled and tested on that rig.
+smart_plugs: []
+
 workloads:
   lease_ttl_seconds: 30
+  # By default one model may actively occupy one physical accelerator. All
+  # execution slots on that accelerator remain usable by the model.
+  default_max_accelerators_per_model: 1
+  model_capacity_policies: []
   artifact_root: "data/artifacts"
+  checkpoint:
+    enabled: false
+    root: ""
+    max_bytes: 0
+    max_files: 0
+    per_owner_max_bytes: 0
+    per_owner_max_files: 0
+    max_metadata_bytes: 1048576
+    max_output_bytes: 1048576
+    expiry_seconds: 86400
+    lock_stale_seconds: 900
+    proof_journal_retention_seconds: 172800
   artifact_store:
     type: "filesystem"
     # Production example:
@@ -103,6 +123,12 @@ workloads:
       adapter: "mock"
       endpoint: "in-process"
       models: ["verifier-9b"]
+      profiles:
+        - profile_id: "verifier_mock"
+          version: "1"
+          model: "verifier-9b"
+          modality: "LLM"
+          operations: ["llm.inference"]
       slots: 4
       enabled: true
     # Two instances may advertise the same model with different context/slot
@@ -112,6 +138,12 @@ workloads:
       endpoint: "http://127.0.0.1:8081"
       accelerator_id: "gpu-node-01-gpu0"
       models: ["local-model"]
+      profiles:
+        - profile_id: "local_model_short_8k"
+          version: "1"
+          model: "local-model"
+          modality: "LLM"
+          operations: ["llm.inference"]
       # Enable lifecycle only for llama-server router mode. No model files are
       # downloaded by the governor.
       resident_models: ["local-model"]
@@ -128,6 +160,12 @@ workloads:
       endpoint: "http://127.0.0.1:8082"
       accelerator_id: "gpu-node-02-gpu0"
       models: ["local-model"]
+      profiles:
+        - profile_id: "local_model_long_32k"
+          version: "1"
+          model: "local-model"
+          modality: "LLM"
+          operations: ["llm.inference"]
       context_limit: 32768
       slots: 1
       enabled: false
@@ -142,6 +180,12 @@ workloads:
       endpoint: "https://openrouter.ai/api"
       cloud: true
       models: ["example/model"]
+      profiles:
+        - profile_id: "openrouter_example_model"
+          version: "1"
+          model: "example/model"
+          modality: "LLM"
+          operations: ["llm.inference"]
       provider: "example-provider"
       quarantined: true
       input_cents_per_million_tokens: 100

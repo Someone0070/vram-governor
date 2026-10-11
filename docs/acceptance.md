@@ -4,7 +4,8 @@ The deterministic suite exercises the single-controller release without
 requiring a physical GPU, PostgreSQL service, ComfyUI, llama.cpp, S3, or cloud
 credentials. HTTP simulators implement the real protocol boundaries; the
 production PostgreSQL path is compiled against the aggregate `store.Store`
-interface and migrations `0001`–`0014`.
+interface and migrations `0001` through `0020`, ending at
+`0020_accelerator_lease_cleanup.sql`.
 
 | Roadmap scenario | Automated evidence |
 |---|---|
@@ -25,6 +26,14 @@ interface and migrations `0001`–`0014`.
 | Signed/idempotent commands and webhook SSRF/retry protection | `TestAdminNodeCommandIsSignedDurableAndIdempotent`, `TestSignedModelCommandIsAllowlistedAndDurablyIdempotent`, `TestSignedWebhookRetriesFromDurableOutbox`, `TestWebhookSSRFProtectionRejectsPrivateAddressBeforeDial` |
 | System-agent authority and egress separation | `TestMonitoringAgentSeverityIsClampedWithoutAdminAuthority` |
 | S3-compatible and filesystem artifact durability | `TestS3StoreRoundTripUsesSigV4AndDurableMetadata`, `TestFileStoreRoundTripAndTraversalRejection` |
+| Creator Studio immutable hardware-neutral capabilities | `TestCreatorStudioCapabilities` |
+| Creator Studio strict requirements, explicit fallback, idempotency, batches, ordered dependencies, late binding, and creative/infrastructure separation | `TestCreatorStudioWorkloads` |
+| Creator Studio advisory working-set create/list/release without hardware control | `TestCreatorStudioWorkingSet` |
+| Runnable workflow definitions, schema/Artifact contracts, and locality | `TestRuntimeProfileRegistrationRequiresCallableWorkflowContract` |
+| Generic Artifact upload, provenance, compatibility tokens, and incompatible-source rejection | `TestArtifactProvenanceRoundTrip`, `TestCreatorArtifactCompatibilityAndUpload` |
+| Artifact-backed local/hosted-style async LLM results and idempotent replay | `TestCreatorAsyncLLMOutputs` |
+| Stable capability/capacity/busy/deadline/route/approval reasons | `TestCreatorBlockingReasons` |
+| Explicit partial batch acceptance and replay safety | `TestCreatorBatchPartialAcceptance` |
 
 Local release verification:
 

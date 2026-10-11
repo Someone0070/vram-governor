@@ -1,8 +1,15 @@
 # WSL local deployment
 
-Last verified: 2026-08-25
+Last verified: 2026-08-31
 
-This development deployment uses one RTX 3080 as one physical accelerator,
+> **Historical development environment:** This document records the old
+> single-RTX-3080 WSL acceptance setup. It is not the current production/fleet
+> topology and WSL is not a controller requirement. The current topology uses a
+> dedicated controller/load-balancer machine and separate RTX 3080, RTX 3090,
+> and CMP170 node hosts. See
+> [Three-GPU fleet rollout and acceptance](fleet-rollout-and-acceptance.md).
+
+This historical development deployment used one RTX 3080 as one physical accelerator,
 even though both Ollama and ComfyUI expose it through separate adapters. The
 controller's PostgreSQL accelerator lease prevents concurrent exclusive jobs
 from double-booking the card.
@@ -13,9 +20,25 @@ from double-booking the card.
 |---|---|---|
 | Controller | `127.0.0.1:18082` | Runs in Ubuntu WSL and connects through the local PostgreSQL Unix socket. |
 | Node agent | Ubuntu WSL | Discovers Ollama, ComfyUI, and `nvidia-smi` telemetry. |
-| PostgreSQL 16 | `/var/run/postgresql` | Database `vram_governor`; migrations `0001` through `0014` are applied. |
+| PostgreSQL 16 | `/var/run/postgresql` | Database `vram_governor`; the historical live run applied `0001` through `0015` only. Current source requires ordered migrations through `0020_accelerator_lease_cleanup.sql`, including `0016_creator_contract_alignment.sql`, `0017_node_enrollments.sql`, `0018_workload_revision.sql`, and `0019_model_capacity.sql`. |
 | ComfyUI 0.34.0 | `/opt/comfyui`, `127.0.0.1:8188` | systemd service `comfyui.service`; official repository with no third-party custom nodes. |
 | Ollama | `127.0.0.1:11434` | Uses the existing local model catalog. |
+
+### Applying the current source migrations
+
+The table above describes the historical acceptance snapshot, not a migration
+target. For a fresh or upgraded WSL database, apply the complete ordered
+source set through `0020_accelerator_lease_cleanup.sql`; the runner skips nothing and
+is safe to rerun only when its normal migration bookkeeping permits it:
+
+```bash
+sudo -u vram-governor /usr/local/libexec/vram-governor/apply-migrations.sh
+```
+
+This applies `0001`–`0020`, including `0016_creator_contract_alignment.sql`,
+`0017_node_enrollments.sql`, `0018_workload_revision.sql`, and
+`0019_model_capacity.sql`, and `0020_accelerator_lease_cleanup.sql`. Do not infer
+that these later migrations were present in the dated live run above.
 
 ComfyUI is deliberately bound to WSL loopback. The node agent advertises it to
 the controller; clients use the governor's Comfy-compatible routes rather than

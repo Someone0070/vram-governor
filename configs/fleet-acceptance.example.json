@@ -1,0 +1,81 @@
+{
+  "version": "fleet-acceptance/v1",
+  "controller": {
+    "base_url": "https://governor.example.invalid:8443"
+  },
+  "credentials": {
+    "admin": "VRAM_ACCEPTANCE_ADMIN_TOKEN",
+    "workflow": "VRAM_ACCEPTANCE_WORKFLOW_TOKEN",
+    "agent": "VRAM_ACCEPTANCE_AGENT_TOKEN"
+  },
+  "expected_inventory": {
+    "node_ids": ["rtx3080-node", "rtx3090-node", "cmp170-node"],
+    "accelerator_ids": ["rtx3080-node-gpu0", "rtx3090-node-gpu0", "cmp170-node-gpu0"],
+    "target_ids": ["rtx3080-llm", "rtx3080-node-comfy", "rtx3090-llm", "rtx3090-node-comfy", "cmp170-llm", "cmp170-node-comfy", "cmp170-video-managed"]
+  },
+  "scenarios": [
+    {
+      "id": "urgent-small-on-busy-cmp",
+      "class": "urgent_small_on_busy_cmp",
+      "enabled": false,
+      "preconditions": ["CMP170 is rendering a checkpointable overnight video and the 3080 queue is saturated while the 3090 is offline."],
+      "steps": [{"action":"request","method":"POST","path":"/api/v1/workloads","credential":"workflow","save_as":"submitted","body":{"adapter":"llamacpp","workload_type":"llm.inference","priority":80,"queue_policy":"wait","disruption":"locked","bounds":{"context_tokens":1024,"max_output":256},"payload":{"model":"small-2.5b","messages":[{"role":"user","content":"acceptance probe"}]}}},{"action":"wait_workload","from":"submitted","credential":"workflow","timeout_seconds":300,"save_as":"finished"},{"action":"assert","from":"finished","path":"workload.plan.target_id","operator":"equals","value":"cmp170-llm"},{"action":"assert","from":"finished","path":"workload.status","operator":"one_of","value":["completed","succeeded"]}]
+    },
+    {
+      "id": "locked-video-refusal",
+      "class": "locked_video_refusal",
+      "enabled": false,
+      "preconditions": ["CMP170 is executing a locked video workload and every other compatible local target is unavailable."],
+      "steps": [{"action":"request","method":"POST","path":"/api/v1/workloads","credential":"workflow","save_as":"submitted","body":{"adapter":"llamacpp","workload_type":"llm.inference","priority":90,"queue_policy":"wait","disruption":"locked","payload":{"model":"small-2.5b","messages":[{"role":"user","content":"locked refusal probe"}]}}},{"action":"wait_workload","from":"submitted","credential":"workflow","timeout_seconds":30,"until":["waiting"],"save_as":"waiting"},{"action":"assert","from":"waiting","path":"workload.status","operator":"equals","value":"waiting"},{"action":"assert","from":"waiting","path":"workload.decision.blocker","operator":"includes","value":"capacity"}]
+    },
+    {
+      "id": "cmp-only-20b-wait",
+      "class": "cmp_only_20b_wait",
+      "enabled": false,
+      "preconditions": ["Only the CMP170 advertises the 20B model and it is occupied by a locked workflow."],
+      "steps": [{"action":"request","method":"POST","path":"/api/v1/workloads","credential":"workflow","save_as":"submitted","body":{"adapter":"llamacpp","workload_type":"llm.inference","priority":50,"queue_policy":"wait","notifications":{"in_app":true,"on_start":true,"on_finish":true},"payload":{"model":"local-20b","messages":[{"role":"user","content":"capacity probe"}]}}},{"action":"wait_workload","from":"submitted","credential":"workflow","timeout_seconds":30,"until":["waiting"],"save_as":"waiting"},{"action":"assert","from":"waiting","path":"workload.decision.estimated_start","operator":"exists"},{"action":"assert","from":"waiting","path":"workload.decision.estimated_end","operator":"exists"}]
+    },
+    {
+      "id": "sharing-guardrail-rollback",
+      "class": "sharing_guardrail_rollback",
+      "enabled": false,
+      "preconditions": ["CMP guarded sharing is enabled after standalone envelopes are measured; thresholds are deliberately tightened for this run."],
+      "steps": [{"action":"request","method":"GET","path":"/admin/api/overview","credential":"admin","save_as":"overview"},{"action":"assert","from":"overview","path":"transition_plans","operator":"exists"}]
+    },
+    {
+      "id": "node-reconnect-routing",
+      "class": "node_reconnect",
+      "enabled": false,
+      "preconditions": ["The 3090 node was stopped, a compatible workload was queued, and the node has now reconnected."],
+      "steps": [{"action":"request","method":"GET","path":"/admin/api/overview","credential":"admin","save_as":"overview"},{"action":"assert","from":"overview","path":"nodes","operator":"exists"}]
+    },
+    {
+      "id": "controller-restart-fencing",
+      "class": "controller_restart_fencing",
+      "enabled": false,
+      "preconditions": ["A managed video is running and the controller has been restarted once under the runbook procedure."],
+      "steps": [{"action":"request","method":"GET","path":"/admin/api/overview","credential":"admin","save_as":"overview"},{"action":"assert","from":"overview","path":"transition_plans","operator":"exists"}]
+    },
+    {
+      "id": "agent-model-escalation",
+      "class": "agent_escalation",
+      "enabled": false,
+      "preconditions": ["Local verifier routes and one sanitized cloud verifier route are enabled for the agent credential."],
+      "steps": [{"action":"request","method":"GET","path":"/api/agent/v1/incidents","credential":"agent","save_as":"incidents"},{"action":"assert","from":"incidents","path":"incidents","operator":"exists"}]
+    },
+    {
+      "id": "openrouter-bounded-fallback",
+      "class": "openrouter_fallback",
+      "enabled": false,
+      "preconditions": ["A real allowlisted OpenRouter route is enabled with a finite test budget and sanitized egress."],
+      "steps": [{"action":"request","method":"POST","path":"/api/v1/workloads","credential":"workflow","save_as":"submitted","body":{"adapter":"openrouter","workload_type":"llm.inference","queue_policy":"wait","egress":"sanitized_cloud","payload":{"model":"openrouter/free","messages":[{"role":"user","content":"provider probe"}]}}},{"action":"wait_workload","from":"submitted","credential":"workflow","timeout_seconds":300,"save_as":"finished"},{"action":"assert","from":"finished","path":"workload.status","operator":"one_of","value":["completed","succeeded"]}]
+    },
+    {
+      "id": "artifact-webhook-recovery",
+      "class": "artifact_webhook_recovery",
+      "enabled": false,
+      "preconditions": ["A real S3-compatible store and allowlisted signed webhook receiver are configured; the receiver records delivery IDs."],
+      "steps": [{"action":"request","method":"GET","path":"/admin/api/overview","credential":"admin","save_as":"overview"},{"action":"assert","from":"overview","path":"notifications","operator":"exists"}]
+    }
+  ]
+}

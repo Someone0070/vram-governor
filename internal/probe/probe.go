@@ -34,6 +34,35 @@ type Config struct {
 	MinFreeVRAMMarginMB int64 // safety margin above ExpectedVRAMMB before attempting a load
 }
 
+// ProductionCheckpointVerification is intentionally not inferred from a
+// Phase-2 probe. Callers must provide the complete live workflow evidence;
+// this helper is the single gate used before advertising session resumability.
+type ProductionCheckpointVerification struct {
+	SlotAssigned                                                            bool
+	PausedAtBoundary                                                        bool
+	SnapshotSaved                                                           bool
+	BackendStopConfirmed                                                    bool
+	SnapshotRestored                                                        bool
+	KVReused                                                                bool
+	NodeID, TargetID, ModelFingerprint, RuntimeIdentity, ProfileFingerprint string
+	ContextLimit, SlotID                                                    int
+	Generation, OldFence, NewFence                                          uint64
+	SavedTokens, ReusedTokens                                               int
+	EvidenceID, Signature, Digest                                           string
+	SnapshotDigest, Nonce, AcceleratorID                                    string
+	SnapshotBytes                                                           int64
+	ExpiresAt                                                               time.Time
+}
+
+func (v ProductionCheckpointVerification) Proof() runtime.CheckpointCapabilityProof {
+	p := runtime.CheckpointCapabilityProof{SlotAssignment: v.SlotAssigned, SafeBoundaryPause: v.PausedAtBoundary, SnapshotSave: v.SnapshotSaved, BackendStopConfirmed: v.BackendStopConfirmed, SnapshotRestore: v.SnapshotRestored, KVReused: v.KVReused, ProvenAt: time.Now().UTC(), ExpiresAt: v.ExpiresAt, NodeID: v.NodeID, TargetID: v.TargetID, ModelFingerprint: v.ModelFingerprint, RuntimeIdentity: v.RuntimeIdentity, ProfileFingerprint: v.ProfileFingerprint, ContextLimit: v.ContextLimit, SlotID: v.SlotID, Generation: v.Generation, OldFence: v.OldFence, NewFence: v.NewFence, SavedTokens: v.SavedTokens, ReusedTokens: v.ReusedTokens, EvidenceID: v.EvidenceID, Signature: v.Signature, Digest: v.Digest, SnapshotDigest: v.SnapshotDigest, SnapshotBytes: v.SnapshotBytes, AcceleratorID: v.AcceleratorID, Nonce: v.Nonce}
+	p.Verified = p.ComponentsComplete()
+	if !p.Verified {
+		p.Reason = "production checkpoint workflow evidence is incomplete"
+	}
+	return p
+}
+
 func (c *Config) withDefaults() Config {
 	out := *c
 	if out.EvictReloadCycles <= 0 {

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "target_id": "cmp170-video-managed",
+  "profiles": {
+    "image-sdxl-base@1": {
+      "production_graph": "image-sdxl-base.json",
+      "smoke_graph": "image-sdxl-smoke.json",
+      "accepted_payload_types": ["application/json"],
+      "produced_media_types": ["image/png"]
+    },
+    "video-wan22-5b@1": {
+      "production_graph": "video-wan22-5b.json",
+      "smoke_graph": "video-wan22-5b-smoke.json",
+      "accepted_payload_types": ["application/json"],
+      "produced_media_types": ["video/mp4"]
+    }
+  }
+}

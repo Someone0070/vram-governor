@@ -11,18 +11,35 @@ VRAM Governor is open source under the [MIT License](LICENSE).
 
 The repository is an active prototype, not a complete A-Z production release.
 It has a broad production-shaped implementation and deterministic tests. The
-current RTX 3080 WSL deployment now runs PostgreSQL, two context/slot profiles
-of the same Ollama model, and external ComfyUI routes against one accelerator
-inventory. Real Comfy workflows, central artifact collection, PostgreSQL
-prompt-route recovery, context-aware routing, demand loading, runtime drain,
-and guarded two-profile GPU sharing have passed live acceptance. S3,
-OpenRouter, runtime checkpointing, and several external failure boundaries
-still require live acceptance, so the full production release gate remains
-open.
+deployment topology uses a dedicated controller/load-balancer machine running
+the API, UI, scheduler, and PostgreSQL. Restricted node agents on the RTX 3080,
+RTX 3090, and CMP170 machines advertise their LLM, ComfyUI, managed-workflow,
+and accelerator capabilities back to that controller. Clients use the
+controller's single address; they do not connect to GPU backends directly.
+
+Earlier live acceptance used an RTX 3080 development stack in WSL. That
+historical environment proved real Comfy workflows, central artifact
+collection, PostgreSQL prompt-route recovery, context-aware routing, demand
+loading, runtime drain, and guarded two-profile GPU sharing. It is evidence for
+those paths, not the current deployment topology. S3, OpenRouter, managed
+runtime checkpointing on physical renderers, and several external failure
+boundaries still require live acceptance, so the full production release gate
+remains open.
 
 See [Implementation status](docs/implementation-status.md) for the audited
 live-proven, simulated, partial, and missing feature matrix. The Operator
 Console also shows the active deployment's release-readiness facts.
+
+For a new inference node, follow [Connect GPU nodes to the dedicated LB](docs/connect-gpu-nodes-to-lb.md),
+then [Add an existing llama.cpp server](docs/llamacpp-node-setup.md). The
+node-agent archive includes these setup guides. Enrolling a node and
+advertising a fixed runtime do not by themselves enable model loading or
+slot switching.
+
+The local [mesh quickstart](docs/mesh-quickstart.md) provides a role selector
+for the separate LB, always-on head GPU node, and slave GPU nodes. It still
+requires prepared controller infrastructure and a protected join bundle;
+do not mistake a Git clone alone for a fully configured mesh.
 
 ## Implemented code paths
 
@@ -31,6 +48,12 @@ results; external-boundary status is tracked in the audit linked above.
 
 - Node registry, heartbeat/liveness, nvidia-smi telemetry, and reconnecting
   outbound node WebSocket.
+- Configured per-rig Tasmota smart-plug telemetry in the Operator Console,
+  including relay state, wall watts, voltage/current, power factor, and energy
+  totals. Admin-only explicit ON/OFF control is opt-in and guards hard OFF with
+  scheduler-disabled/idle checks; direct physical relay OFF/ON was verified on
+  one unmapped test plug, but controller/LB control is not yet accepted live.
+  See [Smart plugs](docs/smart-plugs.md).
 - llama.cpp runtime driver, measurements, legacy job/work-item queue, leases,
   cross-worker retry, and operation-version-safe item identity.
 - Immutable `WorkloadRequest`, durable execution state, admission decisions,
@@ -42,12 +65,25 @@ results; external-boundary status is tracked in the audit linked above.
   declares its context limit and slot count, so short requests prefer the
   smallest sufficient context while long requests cannot land on an
   undersized instance. Optional per-client stickiness prevents spillover.
+- Allowlisted in-place runtime profile switching on an idle accelerator, so a
+  target can move between configurations such as 8K/four slots and 32K/one
+  slot. The node agent accepts only configured profile IDs, runs fixed argv
+  without a shell, and requires the runtime to report the selected capacity.
+- Per-model physical-accelerator ceilings default to one card while preserving
+  every slot on that card. `GET /v1/models` reports the ceiling, current and
+  currently free slots, maximum possible slots, context limits, and selectable
+  capacity profiles so clients can choose safe concurrency instead of blindly
+  requesting a maximum.
 - Durable per-target model residency with demand-triggered llama.cpp router
   loads, fenced load/unload transitions, pinned/manual/auto/off policy, idle
   and quiet-hours unloading, rollback after failed hot-loads, and a strict
   no-speculative-loading rule. Reuse history ranks retention only.
 - PostgreSQL controller store (`migrations/0001_init.sql` through
-  `0014_target_policy_overrides.sql`) and an in-memory development store. PostgreSQL
+  `0020_accelerator_lease_cleanup.sql`) and an in-memory development store. The current
+  source tree contains all 20 ordered migrations, including `0017_node_enrollments.sql`,
+  `0018_workload_revision.sql`, `0019_model_capacity.sql`, and
+  `0020_accelerator_lease_cleanup.sql`; the historical live run recorded only through
+  `0015_creator_studio_contract.sql`. PostgreSQL
   durably backs nodes, runtime/profile records, compatibility jobs, unified
   workloads, prompt mappings, leases, approvals, notifications, incidents,
   learning profiles, transition plans, and operator target-policy overrides.
@@ -81,8 +117,10 @@ results; external-boundary status is tracked in the audit linked above.
 - QoS/deadline ordering, capability-gated disruption under explicit victim
   consent and credential budgets, durable transition plans, exact-hash
   transformation approval, and bounded Comfy step/resolution transforms.
-  Active HTTP runtimes currently prove cancellation but not checkpoint/resume,
-  so resumable disruption is not advertised for those routes.
+  Native HTTP runtimes prove cancellation but do not claim checkpoint/resume.
+  The restricted `managed_comfy_v1` chunk harness implements persistent safe-
+  boundary yield/checkpoint/resume for explicitly chunked workflows; it remains
+  disabled by default until accepted against the physical renderer.
 - Conservative p95 VRAM composition, exclusive-run envelope bootstrapping,
   class/runtime and exact-fingerprint interference profiles, guarded
   exploration, thermal/VRAM/slowdown rollback, production sample learning,
@@ -92,6 +130,18 @@ results; external-boundary status is tracked in the audit linked above.
 - System-agent incident create/read/escalate/propose APIs with S0–S4 ceiling
   clamps, redaction-independent cloud egress checks, and durable recording of
   the actual verifier route. Agents cannot execute remediation.
+
+- Creator Studio integration with immutable hardware-neutral runnable
+  implementations, schemas and Artifact contracts, abstract
+  `LB_MANAGED`/`HOSTED` locality, Artifact-backed async LLM results, provenance
+  and compatibility tokens, generic upload, partial-safe batches, stable
+  blockers, and durable working-set release hints. See
+  `docs/creator-studio-integration.md`.
+
+- A credential-safe live fleet acceptance runner and conservative 3080/3090/
+  CMP170 deployment templates. The runner refuses a passing live report while
+  any required physical scenario remains disabled. See
+  `docs/fleet-rollout-and-acceptance.md`.
 
 ## Run locally
 
@@ -123,18 +173,28 @@ The archive and SHA-256 sidecar are emitted under `.cache/releases`. Its
 guided installer creates a hardened systemd service that reports host, disk,
 network, GPU, runtime, model, queue, and agent-log telemetry. Controller
 actions remain restricted to signed refresh, model lifecycle, Comfy memory
-reclaim, and runtime drain operations; the agent exposes no arbitrary shell.
+reclaim, runtime drain, and configured runtime-profile operations; the agent
+exposes no arbitrary shell.
 See [Node agent](docs/node-agent.md) for installation and removal.
+For a clone-local Controller/Worker role selector and authenticated worker
+join flow, see [Clone-to-mesh setup](docs/mesh-quickstart.md).
 
-The installed single-3080 WSL layout, service locations, model-path policy,
-database bootstrap, and verification commands are documented in
-[WSL local deployment](docs/wsl-local-deployment.md). The deployment does not
-install custom nodes or download model weights.
+The separate-controller three-GPU topology and rollout procedure are documented
+in [Three-GPU fleet rollout and acceptance](docs/fleet-rollout-and-acceptance.md).
+The installable controller package, security boundaries, configuration steps,
+and service lifecycle are documented in
+[Dedicated controller deployment](docs/dedicated-controller-deployment.md).
+The old single-3080 WSL environment is retained only as a historical
+development/acceptance reference in
+[WSL local deployment](docs/wsl-local-deployment.md). Neither deployment path
+installs custom nodes or downloads model weights.
 
 ## PostgreSQL
 
-Apply migrations in order with your normal migration runner, then set
-`database_url` in `configs/controller.yaml`. The entire controller state uses
+Apply all ordered migrations `0001` through `0020` with your normal migration
+runner (including `0017_node_enrollments.sql`, `0018_workload_revision.sql`, and
+`0019_model_capacity.sql`, and `0020_accelerator_lease_cleanup.sql`),
+then set `database_url` in `configs/controller.yaml`. The entire controller state uses
 PostgreSQL, including node/runtime inventory, compatibility jobs, workloads,
 leases, prompt mappings, audit records, approvals, notifications, and
 incidents.
@@ -168,6 +228,7 @@ Generate a credential digest, for example:
 | Plane | Routes |
 |---|---|
 | Common async | `/api/v1/workloads`, status, approval, reprioritization, cancellation, artifacts, events, notifications |
+| Creator Studio | `/api/v1/capabilities`, capability-oriented `/api/v1/workloads`, `/api/v1/workloads/batch`, `/api/v1/batches/{id}`, session working-set hints |
 | OpenAI | `/v1/chat/completions`, `/v1/models`, human chat at `/chat/` |
 | ComfyUI | `/prompt`, `/ws`, `/history`, `/history/{id}`, `/queue`, `/upload/image`, `/view` |
 | Node | `/ws/node`, node engine/profile reporting |

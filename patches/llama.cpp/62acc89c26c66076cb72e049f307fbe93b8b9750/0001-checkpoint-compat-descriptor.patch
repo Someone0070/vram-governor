@@ -1,0 +1,365 @@
+From 62acc89c26c66076cb72e049f307fbe93b8b9750 Mon Sep 17 00:00:00 2001
+Subject: [PATCH] server: expose initialized checkpoint compatibility descriptor
+
+Pinned base: 62acc89c26c66076cb72e049f307fbe93b8b9750
+Descriptor schema: 1; sequence serializer: llama-state-seq-62acc89-v1
+Opt-in: LLAMA_CHECKPOINT_COMPAT_DESCRIPTOR=1 (startup only)
+
+This descriptor is a stable compatibility description only. It does not attest
+to model bytes, executable closure, device placement, or snapshot authority.
+---
+ include/llama.h                 |  5 +++++
+ src/llama-context.cpp           | 89 +++++++++++++++++++++++++++++++++++++++++
+ src/llama-kv-cache.h            |  6 ++++++
+ src/llama-kv-cache.cpp          | 28 ++++++++++++
+ tools/server/server-context.h   |  2 ++
+ tools/server/server-context.cpp | 108 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ tools/server/server.cpp         | 16 +++++++++
+ 7 files changed, 254 insertions(+)
+
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -567,8 +567,13 @@
+     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
++    // Returns the required buffer size including NUL, or zero when this context
++    // is unsupported. A short/null buffer is never written. This reports only
++    // initialized plain-LLAMA KV semantics and carries no restore authority.
++    LLAMA_API size_t llama_checkpoint_compat_descriptor_json(
++            const struct llama_context * ctx, char * buffer, size_t buffer_size);
+     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+ 
+     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -160,4 +160,10 @@ public:
+     uint32_t get_n_stream() const;
++    uint32_t get_n_pad() const;
++    uint32_t get_n_swa() const;
++    bool get_attn_rot_k() const;
++    bool get_attn_rot_v() const;
++    bool get_v_trans() const;
++    ggml_tensor * get_v_storage(int32_t il) const;
+ 
+     bool get_has_shift() const;
+ 
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1203,6 +1203,34 @@ uint32_t llama_kv_cache::get_size() const {
+     return cells.size();
+ }
+ 
++uint32_t llama_kv_cache::get_n_pad() const {
++    return n_pad;
++}
++
++uint32_t llama_kv_cache::get_n_swa() const {
++    return n_swa;
++}
++
++bool llama_kv_cache::get_attn_rot_k() const {
++    return attn_rot_k;
++}
++
++bool llama_kv_cache::get_attn_rot_v() const {
++    return attn_rot_v;
++}
++
++bool llama_kv_cache::get_v_trans() const {
++    return v_trans;
++}
++
++ggml_tensor * llama_kv_cache::get_v_storage(int32_t il) const {
++    const auto it = map_layer_ids.find(il);
++    if (it == map_layer_ids.end()) {
++        return nullptr;
++    }
++    return layers[it->second].v;
++}
++
+ uint32_t llama_kv_cache::get_n_stream() const {
+     return n_stream;
+ }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -17,5 +17,8 @@
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
++#include <iomanip>
++#include <sstream>
++#include "llama-kv-cache.h"
+ #include <stdexcept>
+ #include <string>
+@@ -3744,6 +3747,92 @@ uint32_t llama_n_ctx(const llama_context * ctx) {
+     return ctx->n_ctx();
+ }
+ 
++size_t llama_checkpoint_compat_descriptor_json(const llama_context * ctx, char * buffer, size_t buffer_size) {
++    if (ctx == nullptr) {
++        return 0;
++    }
++
++    const llama_model * model = llama_get_model(ctx);
++    const llama_memory_t memory = llama_get_memory(ctx);
++    const auto * kv = dynamic_cast<const llama_kv_cache *>(memory);
++    if (model == nullptr || kv == nullptr || model->arch != LLM_ARCH_LLAMA ||
++            model->hparams.n_layer() != model->hparams.n_layer_all ||
++            ctx->get_cparams().ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
++            kv->get_n_swa() != 0 || !kv->get_v_trans() ||
++            ctx->get_cparams().n_rs_seq != 0 || ctx->get_cparams().embeddings ||
++            ctx->get_cparams().embeddings_nextn || kv->get_n_stream() == 0) {
++        return 0;
++    }
++
++    const auto & cp = ctx->get_cparams();
++    auto float_bits = [](float value) {
++        uint32_t bits = 0;
++        static_assert(sizeof(bits) == sizeof(value), "float bit width");
++        std::memcpy(&bits, &value, sizeof(bits));
++        std::ostringstream out;
++        out << std::hex << std::setw(8) << std::setfill('0') << bits;
++        return out.str();
++    };
++    auto tensor_json = [](const ggml_tensor * tensor) {
++        if (tensor == nullptr) {
++            return std::string("null");
++        }
++        std::ostringstream out;
++        out << "{\"type\":\"" << ggml_type_name(tensor->type)
++            << "\",\"shape\":[" << tensor->ne[0] << ',' << tensor->ne[1] << ','
++            << tensor->ne[2] << ',' << tensor->ne[3] << "],\"strides\":["
++            << tensor->nb[0] << ',' << tensor->nb[1] << ',' << tensor->nb[2] << ','
++            << tensor->nb[3] << "],\"rowBytes\":" << tensor->nb[1] << '}';
++        return out.str();
++    };
++
++    std::ostringstream out;
++    out << "{\"schemaVersion\":1,\"support\":\"plain-llama-kv\","
++        << "\"architecture\":\"llama\",\"sequenceSerializer\":\"llama-state-seq-62acc89-v1\","
++        << "\"context\":{\"nCtx\":" << cp.n_ctx << ",\"nCtxSeq\":" << cp.n_ctx_seq
++        << ",\"nBatch\":" << cp.n_batch << ",\"nUbatch\":" << cp.n_ubatch
++        << ",\"nSeqMax\":" << cp.n_seq_max << ",\"nRsSeq\":" << cp.n_rs_seq
++        << ",\"kvUnified\":" << (cp.kv_unified ? "true" : "false")
++        << ",\"causalAttention\":" << (cp.causal_attn ? "true" : "false")
++        << ",\"rope\":{\"originalContext\":" << cp.n_ctx_orig_yarn
++        << ",\"freqBaseBits\":\"" << float_bits(cp.rope_freq_base)
++        << "\",\"freqScaleBits\":\"" << float_bits(cp.rope_freq_scale)
++        << "\",\"yarnExtFactorBits\":\"" << float_bits(cp.yarn_ext_factor)
++        << "\",\"yarnAttnFactorBits\":\"" << float_bits(cp.yarn_attn_factor)
++        << "\",\"yarnBetaFastBits\":\"" << float_bits(cp.yarn_beta_fast)
++        << "\",\"yarnBetaSlowBits\":\"" << float_bits(cp.yarn_beta_slow) << "\"}},"
++        << "\"kv\":{\"subtype\":\"llama_kv_cache\",\"typeK\":\""
++        << ggml_type_name(kv->type_k()) << "\",\"typeV\":\"" << ggml_type_name(kv->type_v())
++        << "\",\"streams\":" << kv->get_n_stream() << ",\"cells\":" << kv->get_size()
++        << ",\"padding\":" << kv->get_n_pad() << ",\"vTransposed\":"
++        << (kv->get_v_trans() ? "true" : "false") << ",\"rotation\":{\"k\":"
++        << (kv->get_attn_rot_k() ? "true" : "false") << ",\"v\":"
++        << (kv->get_attn_rot_v() ? "true" : "false") << "},\"layers\":[";
++    const auto layer_ids = kv->get_layer_ids();
++    if (layer_ids.empty()) {
++        return 0;
++    }
++    for (size_t i = 0; i < layer_ids.size(); ++i) {
++        const uint32_t id = layer_ids[i];
++        const ggml_tensor * k = kv->get_k_storage(id);
++        const ggml_tensor * v = kv->get_v_storage(id);
++        if (k == nullptr || v == nullptr) {
++            return 0;
++        }
++        if (i != 0) out << ',';
++        out << "{\"layer\":" << id << ",\"k\":" << tensor_json(k)
++            << ",\"v\":" << tensor_json(v) << '}';
++    }
++    out << "]}}";
++    const std::string result = out.str();
++    const size_t required = result.size() + 1;
++    if (buffer == nullptr || buffer_size < required) {
++        return required;
++    }
++    std::memcpy(buffer, result.c_str(), required);
++    return required;
++}
++
+ uint32_t llama_n_ctx_seq(const llama_context * ctx) {
+     return ctx->n_ctx_seq();
+ }
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -102,4 +102,6 @@ struct server_context {
+     llama_context * get_llama_context() const;
++    bool checkpoint_compat_enabled() const;
++    json get_checkpoint_compat_descriptor() const;
+ 
+     // get a new response reader, used by CLI application
+     server_response_reader get_response_reader();
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,10 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cinttypes>
++#include <cctype>
++#include <cstdlib>
++#include <vector>
+ #include <exception>
++#include <cstring>
+ #include <memory>
+ #include <filesystem>
+@@ -36,2 +39,5 @@
+ #include <windows.h>
++#include <process.h>
++#else
++#include <unistd.h>
+ #endif
+@@ -4147,6 +4154,77 @@ llama_context * server_context::get_llama_context() const {
+     return impl->ctx_tgt;
+ }
+ 
++namespace {
++bool checkpoint_compat_enabled_for_process() {
++    static const bool enabled = []() {
++        const char * value = std::getenv("LLAMA_CHECKPOINT_COMPAT_DESCRIPTOR");
++        return value != nullptr && std::strcmp(value, "1") == 0;
++    }();
++    return enabled;
++}
++
++json checkpoint_compat_canonicalize_json(const json & value) {
++    if (value.is_object()) {
++        std::vector<std::string> keys;
++        for (auto it = value.begin(); it != value.end(); ++it) keys.push_back(it.key());
++        std::sort(keys.begin(), keys.end());
++        json canonical = json::object();
++        for (const auto & key : keys) {
++            canonical[key] = checkpoint_compat_canonicalize_json(value.at(key));
++        }
++        return canonical;
++    }
++    if (value.is_array()) {
++        json canonical = json::array();
++        for (const auto & item : value) {
++            canonical.push_back(checkpoint_compat_canonicalize_json(item));
++        }
++        return canonical;
++    }
++    return value;
++}
++}
++
++bool server_context::checkpoint_compat_enabled() const {
++    return checkpoint_compat_enabled_for_process();
++}
++
++json server_context::get_checkpoint_compat_descriptor() const {
++    if (!checkpoint_compat_enabled() || impl->ctx_tgt == nullptr || impl->model_tgt == nullptr ||
++            impl->mctx != nullptr || !impl->params_base.lora_adapters.empty() ||
++            common_speculative_n_max(&impl->params_base.speculative) > 0) {
++        return nullptr;
++    }
++
++    char bytes[65536];
++    const size_t size = llama_checkpoint_compat_descriptor_json(impl->ctx_tgt, bytes, sizeof(bytes));
++    if (size == 0 || size > sizeof(bytes)) {
++        return nullptr;
++    }
++    json result = json::parse_no_throw(std::string(bytes));
++    if (result.is_discarded() || !result.is_object()) {
++        return nullptr;
++    }
++    json slots = json::array();
++    for (const auto & slot : impl->slots) {
++        if (slot.n_ctx <= 0) return nullptr;
++        slots.push_back({{"id", slot.id}, {"contextCapacity", slot.n_ctx}});
++    }
++    if (slots.empty()) return nullptr;
++    result["slots"] = std::move(slots);
++#if defined(_WIN32)
++    result["processId"] = static_cast<uint64_t>(_getpid());
++#else
++    result["processId"] = static_cast<uint64_t>(getpid());
++#endif
++    result["authority"] = "compatibility-only";
++    json canonical = checkpoint_compat_canonicalize_json(result);
++    if (!canonical.is_object() || canonical.dump().size() > sizeof(bytes) - 1) {
++        return nullptr;
++    }
++    return canonical;
++}
++
+ server_response_reader server_context::get_response_reader() {
+     return impl->get_response_reader();
+ }
+@@ -4235,5 +4313,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+             task_response_type res_type) {
+     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
++    if (checkpoint_compat_enabled_for_process()) {
++        std::function<bool(const json &)> has_adapter = [&](const json & value) {
++            if (value.is_object()) {
++                for (auto it = value.begin(); it != value.end(); ++it) {
++                    std::string key = it.key();
++                    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return std::tolower(c); });
++                    if (key.find("adapter") != std::string::npos || key.find("lora") != std::string::npos) return true;
++                    if (has_adapter(it.value())) return true;
++                }
++            } else if (value.is_array()) {
++                for (const auto & item : value) if (has_adapter(item)) return true;
++            }
++            return false;
++        };
++        if (has_adapter(data)) {
++            auto res = create_response();
++            res->error(format_error_response("per-request adapter mutation disabled by checkpoint descriptor opt-in", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
++    }
+ 
+     auto res = create_response();
+     auto completion_id = gen_chatcmplid();
+@@ -4789,2 +4887,7 @@ void server_routes::init_routes() {
+     this->post_props = [this](const server_http_req &) {
++        if (checkpoint_compat_enabled_for_process()) {
++            auto res = create_response();
++            res->error(format_error_response("properties mutation disabled by checkpoint descriptor opt-in", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
+         auto res = create_response();
+@@ -5228,2 +5331,7 @@ void server_routes::init_routes() {
+     this->post_lora_adapters = [this](const server_http_req & req) {
++        if (checkpoint_compat_enabled_for_process()) {
++            auto res = create_response();
++            res->error(format_error_response("adapter mutation disabled by checkpoint descriptor opt-in", ERROR_TYPE_NOT_SUPPORTED));
++            return res;
++        }
+         auto res = create_response();
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -246,2 +246,18 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
++    ctx_http.get("/checkpoint/compat", [&ctx_server](const server_http_req &) {
++        auto res = std::make_unique<server_http_res>();
++        if (!ctx_server.checkpoint_compat_enabled()) {
++            res->status = 404;
++            res->data = "{\"error\":\"descriptor opt-in is disabled\"}";
++            return res;
++        }
++        const json descriptor = ctx_server.get_checkpoint_compat_descriptor();
++        if (!descriptor.is_object()) {
++            res->status = 409;
++            res->data = "{\"error\":\"initialized backend state is unsupported\"}";
++            return res;
++        }
++        res->data = descriptor.dump();
++        return res;
++    });
+     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)

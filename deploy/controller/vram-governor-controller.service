@@ -1,0 +1,35 @@
+[Unit]
+Description=VRAM Governor dedicated controller and load balancer
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vram-governor
+Group=vram-governor
+WorkingDirectory=/var/lib/vram-governor
+EnvironmentFile=/etc/vram-governor/controller.env
+ExecStartPre=/usr/local/libexec/vram-governor/validate-controller.sh /etc/vram-governor/controller.yaml /etc/vram-governor/controller.env
+ExecStart=/usr/local/bin/vram-governor-controller -config /etc/vram-governor/controller.yaml
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/vram-governor
+
+[Install]
+WantedBy=multi-user.target

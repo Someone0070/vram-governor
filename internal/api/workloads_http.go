@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -12,12 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 
 	"vram-governor/internal/domain"
 	"vram-governor/internal/store"
+	"vram-governor/internal/workloads"
 )
 
 func (s *Server) workloadsUnavailable(w http.ResponseWriter) bool {
@@ -48,7 +51,31 @@ func (s *Server) prepareRequest(r *http.Request, p Principal, req *domain.Worklo
 	req.PrincipalID = p.ID
 	req.ConcurrencyLimit = p.ConcurrencyLimit
 	req.BudgetLimitCents = p.BudgetCents
-	req.PreemptionBudget = p.PreemptionBudget
+	requestedPreemptionBudget := req.PreemptionBudget
+	if req.PreemptionBudget < 0 {
+		return fmt.Errorf("preemption_budget exceeds the authenticated principal limit")
+	}
+	if p.PreemptionBudget > 0 && req.PreemptionBudget > p.PreemptionBudget {
+		req.PreemptionBudget = p.PreemptionBudget
+	}
+	if req.PreemptionBudget == 0 {
+		req.PreemptionBudget = p.PreemptionBudget
+	}
+	// Checkpointability is an all-controls opt-in. A generic caller, or a
+	// partially specified governor extension, remains locked even if one field
+	// happens to request checkpointing; this keeps every safe-default matrix
+	// cell non-preemptible. Preserve the authenticated principal's ordinary
+	// budget on generic requests: it is an accounting limit, not permission to
+	// opt into interruption.
+	if req.Disruption != domain.DisruptionCheckpointable {
+		req.InterruptionConsent = false
+		req.Recoverable = false
+	} else if !req.InterruptionConsent || !req.Recoverable || requestedPreemptionBudget <= 0 || req.PreemptionBudget <= 0 {
+		req.Disruption = domain.DisruptionLocked
+		req.InterruptionConsent = false
+		req.Recoverable = false
+		req.PreemptionBudget = 0
+	}
 	if req.OwnerID == "" {
 		req.OwnerID = p.ID
 	}
@@ -80,8 +107,34 @@ func (s *Server) handleSubmitWorkload(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
+	if err != nil || !json.Valid(raw) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON request"})
+		return
+	}
+	var marker struct {
+		Operation string `json:"operation"`
+	}
+	_ = json.Unmarshal(raw, &marker)
 	var req domain.WorkloadRequest
-	if err := decodeJSONLimit(r, &req, 16<<20); err != nil {
+	creatorRequest := marker.Operation != ""
+	if creatorRequest {
+		var body creatorStudioRequest
+		if err := decodeStrictCreator(raw, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		var blocked *creatorBlockedResponse
+		req, blocked, err = s.buildCreatorWorkload(r, p, body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if blocked != nil {
+			writeJSON(w, http.StatusUnprocessableEntity, blocked)
+			return
+		}
+	} else if err := json.Unmarshal(raw, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -89,7 +142,9 @@ func (s *Server) handleSubmitWorkload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "interactive_stream is reserved for protocol streaming routes"})
 		return
 	}
-	req.Plane = domain.PlaneAPI
+	if !creatorRequest {
+		req.Plane = domain.PlaneAPI
+	}
 	if err := s.prepareRequest(r, p, &req); err != nil {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": err.Error()})
 		return
@@ -102,6 +157,10 @@ func (s *Server) handleSubmitWorkload(w http.ResponseWriter, r *http.Request) {
 	status := http.StatusAccepted
 	if created {
 		status = http.StatusCreated
+	}
+	if creatorRequest {
+		writeJSON(w, status, s.creatorResponse(r, workload))
+		return
 	}
 	writeJSON(w, status, workload)
 }
@@ -154,7 +213,15 @@ func (s *Server) handleListWorkloads(w http.ResponseWriter, r *http.Request) {
 		}
 		rows = filtered
 	}
-	writeJSON(w, http.StatusOK, rows)
+	result := make([]any, 0, len(rows))
+	for _, row := range rows {
+		if row.Request.Plane == domain.PlaneCreatorStudio && !hasScope(p, "admin") {
+			result = append(result, s.creatorResponse(r, row))
+		} else {
+			result = append(result, row)
+		}
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) ownedWorkload(w http.ResponseWriter, r *http.Request, p Principal, id string) (*domain.Workload, bool) {
@@ -180,6 +247,10 @@ func (s *Server) handleGetWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	row, ok := s.ownedWorkload(w, r, p, r.PathValue("id"))
 	if ok {
+		if row.Request.Plane == domain.PlaneCreatorStudio && !hasScope(p, "admin") {
+			writeJSON(w, http.StatusOK, s.creatorResponse(r, row))
+			return
+		}
 		writeJSON(w, http.StatusOK, row)
 	}
 }
@@ -281,6 +352,20 @@ func (s *Server) handleWorkloadArtifacts(w http.ResponseWriter, r *http.Request)
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "artifact store unavailable"})
 		return
 	}
+	if row.Request.Plane == domain.PlaneCreatorStudio && !hasScope(p, "admin") {
+		outputs := make([]creatorArtifactResponse, 0, len(row.OutputRefs))
+		for _, ref := range row.OutputRefs {
+			artifact, reader, err := s.artifacts.Open(r.Context(), ref)
+			if reader != nil {
+				reader.Close()
+			}
+			if err == nil && artifact.OwnerID == p.OwnerID {
+				outputs = append(outputs, publicArtifact(artifact))
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"outputs": outputs})
+		return
+	}
 	refs := append(append([]string(nil), row.Request.ArtifactRefs...), row.OutputRefs...)
 	result := []*domain.Artifact{}
 	for _, ref := range refs {
@@ -302,6 +387,10 @@ func (s *Server) handleExplainWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	row, ok := s.ownedWorkload(w, r, p, r.PathValue("id"))
 	if !ok {
+		return
+	}
+	if row.Request.Plane == domain.PlaneCreatorStudio && !hasScope(p, "admin") {
+		writeJSON(w, http.StatusOK, map[string]any{"workload": s.creatorResponse(r, row)})
 		return
 	}
 	approvals, _ := s.workloadStore.ListTransformationApprovals(r.Context(), row.Request.ID)
@@ -375,6 +464,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			ContextTokens   int                    `json:"context_tokens"`
 			PlacementKey    string                 `json:"placement_key"`
 			PlacementPolicy domain.PlacementPolicy `json:"placement_policy"`
+			// These controls are an explicit, authenticated governor extension.
+			// Their zero values intentionally keep ordinary OpenAI requests locked.
+			Checkpointable      bool `json:"checkpointable"`
+			InterruptionConsent bool `json:"interruption_consent"`
+			Recoverable         bool `json:"recoverable"`
+			PreemptionBudget    int  `json:"preemption_budget"`
 		} `json:"governor"`
 	}
 	_ = json.Unmarshal(body, &envelope)
@@ -394,7 +489,18 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if placementPolicy == "" {
 		placementPolicy = domain.PlacementPolicy(r.Header.Get("X-VRAM-Placement-Policy"))
 	}
-	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: "llm.chat", Payload: body, QoS: domain.QoSInteractive, QueuePolicy: domain.QueueFailFast, Disruption: domain.DisruptionLocked, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: false}
+	disruption := domain.DisruptionLocked
+	if envelope.Governor.Checkpointable && envelope.Governor.InterruptionConsent && envelope.Governor.Recoverable && envelope.Governor.PreemptionBudget > 0 {
+		disruption = domain.DisruptionCheckpointable
+	}
+	queuePolicy := domain.QueueFailFast
+	// A checkpointable stream must be able to remain queued while the higher
+	// priority workload owns the target; otherwise admission would reject the
+	// original HTTP session before its signed restore can deliver the suffix.
+	if disruption == domain.DisruptionCheckpointable {
+		queuePolicy = domain.QueueWait
+	}
+	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: "llm.chat", Payload: body, QoS: domain.QoSInteractive, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
 	if err := s.prepareRequest(r, p, &req); err != nil {
 		writeJSON(w, 403, map[string]string{"error": err.Error()})
 		return
@@ -484,11 +590,18 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	type governorMetadata struct {
-		MaxContextTokens       int   `json:"max_context_tokens,omitempty"`
-		AvailableContextLimits []int `json:"available_context_limits,omitempty"`
-		TargetCount            int   `json:"target_count"`
-		Resident               bool  `json:"resident"`
-		LifecycleCapable       bool  `json:"lifecycle_capable"`
+		MaxContextTokens        int                                `json:"max_context_tokens,omitempty"`
+		AvailableContextLimits  []int                              `json:"available_context_limits,omitempty"`
+		ActiveContextLimits     []int                              `json:"active_context_limits,omitempty"`
+		CapacityProfiles        []workloads.RuntimeCapacityProfile `json:"capacity_profiles,omitempty"`
+		CurrentSlots            int                                `json:"current_slots"`
+		CurrentlyAvailableSlots int                                `json:"currently_available_slots"`
+		MaximumParallelSlots    int                                `json:"maximum_parallel_slots"`
+		MaxAccelerators         int                                `json:"max_accelerators"`
+		TargetCount             int                                `json:"target_count"`
+		Resident                bool                               `json:"resident"`
+		LifecycleCapable        bool                               `json:"lifecycle_capable"`
+		ProfileSwitchSupported  bool                               `json:"profile_switch_supported"`
 	}
 	type modelEntry struct {
 		ID       string           `json:"id"`
@@ -498,6 +611,9 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		Governor governorMetadata `json:"governor"`
 	}
 	byModel := make(map[string]*modelEntry)
+	currentSlots := make(map[string]map[string]int)
+	availableSlots := make(map[string]map[string]int)
+	maximumSlots := make(map[string]map[string]int)
 	for _, target := range s.workloads.Targets() {
 		if !target.Enabled || target.Quarantined || (target.Adapter != "llamacpp" && target.Adapter != "openrouter") || !allowsAdapter(p, target.Adapter) || (target.Cloud && p.EgressPolicy == string(domain.EgressLocalOnly)) {
 			continue
@@ -509,7 +625,15 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 			entry, exists := byModel[model]
 			if !exists {
 				entry = &modelEntry{ID: model, Object: "model", Created: 0, OwnedBy: "vram-governor"}
+				entry.Governor.MaxAccelerators = s.workloads.MaxAcceleratorsForModel(model)
 				byModel[model] = entry
+				currentSlots[model] = make(map[string]int)
+				availableSlots[model] = make(map[string]int)
+				maximumSlots[model] = make(map[string]int)
+			}
+			capacityKey := target.AcceleratorID
+			if capacityKey == "" {
+				capacityKey = "target/" + target.ID
 			}
 			entry.Governor.TargetCount++
 			entry.Governor.Resident = entry.Governor.Resident || stringPresent(target.ResidentModels, model)
@@ -521,16 +645,90 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 				if !intPresent(entry.Governor.AvailableContextLimits, target.ContextLimit) {
 					entry.Governor.AvailableContextLimits = append(entry.Governor.AvailableContextLimits, target.ContextLimit)
 				}
+				if !intPresent(entry.Governor.ActiveContextLimits, target.ContextLimit) {
+					entry.Governor.ActiveContextLimits = append(entry.Governor.ActiveContextLimits, target.ContextLimit)
+				}
+			}
+			if target.Slots > currentSlots[model][capacityKey] {
+				currentSlots[model][capacityKey] = target.Slots
+			}
+			free := s.workloads.CurrentlyAvailableSlotsForModel(r.Context(), target, model)
+			if free > availableSlots[model][capacityKey] {
+				availableSlots[model][capacityKey] = free
+			}
+			if target.Slots > maximumSlots[model][capacityKey] {
+				maximumSlots[model][capacityKey] = target.Slots
+			}
+			currentProfileID := target.ActiveRuntimeProfile
+			if currentProfileID == "" {
+				currentProfileID = target.ID
+			}
+			currentProfile := workloads.RuntimeCapacityProfile{ID: currentProfileID, ContextLimit: target.ContextLimit, Slots: target.Slots}
+			if currentProfile.ContextLimit > 0 && currentProfile.Slots > 0 && !runtimeProfilePresent(entry.Governor.CapacityProfiles, currentProfile) {
+				entry.Governor.CapacityProfiles = append(entry.Governor.CapacityProfiles, currentProfile)
+			}
+			entry.Governor.ProfileSwitchSupported = entry.Governor.ProfileSwitchSupported || target.SupportsRuntimeProfileSwitch
+			for _, profile := range target.RuntimeProfiles {
+				if !runtimeProfilePresent(entry.Governor.CapacityProfiles, profile) {
+					entry.Governor.CapacityProfiles = append(entry.Governor.CapacityProfiles, profile)
+				}
+				if !intPresent(entry.Governor.AvailableContextLimits, profile.ContextLimit) {
+					entry.Governor.AvailableContextLimits = append(entry.Governor.AvailableContextLimits, profile.ContextLimit)
+				}
+				if profile.ContextLimit > entry.Governor.MaxContextTokens {
+					entry.Governor.MaxContextTokens = profile.ContextLimit
+				}
+				if profile.Slots > maximumSlots[model][capacityKey] {
+					maximumSlots[model][capacityKey] = profile.Slots
+				}
 			}
 		}
 	}
 	models := make([]modelEntry, 0, len(byModel))
 	for _, entry := range byModel {
 		sort.Ints(entry.Governor.AvailableContextLimits)
+		sort.Ints(entry.Governor.ActiveContextLimits)
+		sort.Slice(entry.Governor.CapacityProfiles, func(i, j int) bool {
+			if entry.Governor.CapacityProfiles[i].ContextLimit != entry.Governor.CapacityProfiles[j].ContextLimit {
+				return entry.Governor.CapacityProfiles[i].ContextLimit < entry.Governor.CapacityProfiles[j].ContextLimit
+			}
+			return entry.Governor.CapacityProfiles[i].Slots > entry.Governor.CapacityProfiles[j].Slots
+		})
+		entry.Governor.CurrentSlots = sumLargestCapacities(currentSlots[entry.ID], entry.Governor.MaxAccelerators)
+		entry.Governor.CurrentlyAvailableSlots = sumLargestCapacities(availableSlots[entry.ID], entry.Governor.MaxAccelerators)
+		entry.Governor.MaximumParallelSlots = sumLargestCapacities(maximumSlots[entry.ID], entry.Governor.MaxAccelerators)
 		models = append(models, *entry)
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+func runtimeProfilePresent(values []workloads.RuntimeCapacityProfile, wanted workloads.RuntimeCapacityProfile) bool {
+	for _, value := range values {
+		if value.ContextLimit == wanted.ContextLimit && value.Slots == wanted.Slots {
+			return true
+		}
+	}
+	return false
+}
+
+func sumLargestCapacities(values map[string]int, limit int) int {
+	capacities := make([]int, 0, len(values))
+	for _, value := range values {
+		capacities = append(capacities, value)
+	}
+	sort.Sort(sort.Reverse(sort.IntSlice(capacities)))
+	if limit < 1 {
+		limit = 1
+	}
+	if len(capacities) > limit {
+		capacities = capacities[:limit]
+	}
+	total := 0
+	for _, capacity := range capacities {
+		total += capacity
+	}
+	return total
 }
 
 func stringPresent(values []string, wanted string) bool {
@@ -667,15 +865,234 @@ func (s *Server) comfyRow(w http.ResponseWriter, r *http.Request, p Principal, p
 		return nil, false
 	}
 	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
 		return nil, false
 	}
-	return s.ownedWorkload(w, r, p, mapping.WorkloadID)
+	if mapping == nil || mapping.WorkloadID == "" {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+		return nil, false
+	}
+	row, err := s.workloads.Get(r.Context(), mapping.WorkloadID)
+	if errors.Is(err, store.ErrNotFound) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "prompt not found"})
+		return nil, false
+	}
+	if err != nil || row == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+		return nil, false
+	}
+	if !hasScope(p, "admin") && row.Request.OwnerID != p.OwnerID {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "prompt not found"})
+		return nil, false
+	}
+	if mapping.PublicPromptID != publicID || row.Request.ID != mapping.WorkloadID || row.Request.ItemID != publicID || row.Request.Plane != domain.PlaneComfy || row.Request.Adapter != "comfy" || (mapping.TargetID != "" && (row.Plan == nil || row.Plan.TargetID != mapping.TargetID)) || (mapping.BackendPromptID != "" && row.Execution != nil && row.Execution.ExternalID != "" && mapping.BackendPromptID != row.Execution.ExternalID) {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+		return nil, false
+	}
+	return row, true
+}
+
+const (
+	comfyHistoryMaxInputBytes = 8 << 20
+	comfyHistoryMaxOutputBytes = 16 << 20
+	comfyHistoryMaxRows = 500
+)
+
+var errComfyHistoryTooLarge = errors.New("Comfy history exceeds public response bounds")
+
+func duplicateFreeJSON(raw []byte) error {
+	if !utf8.Valid(raw) {
+		return errors.New("invalid UTF-8 JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var scan func() error
+	scan = func() error {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		delim, isDelim := token.(json.Delim)
+		if !isDelim {
+			return nil
+		}
+		switch delim {
+		case '{':
+			seen := make(map[string]struct{})
+			for decoder.More() {
+				keyToken, err := decoder.Token()
+				if err != nil {
+					return err
+				}
+				key, ok := keyToken.(string)
+				if !ok {
+					return errors.New("invalid object key")
+				}
+				if _, exists := seen[key]; exists {
+					return errors.New("duplicate object key")
+				}
+				seen[key] = struct{}{}
+				if err := scan(); err != nil {
+					return err
+				}
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim('}') {
+				return errors.New("invalid object end")
+			}
+		case '[':
+			for decoder.More() {
+				if err := scan(); err != nil {
+					return err
+				}
+			}
+			end, err := decoder.Token()
+			if err != nil || end != json.Delim(']') {
+				return errors.New("invalid array end")
+			}
+		default:
+			return errors.New("unexpected JSON delimiter")
+		}
+		return nil
+	}
+	if err := scan(); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("trailing JSON value")
+		}
+		return err
+	}
+	return nil
+}
+
+func comfyExpectedGraphCount(payload json.RawMessage) (int, error) {
+	if len(payload) == 0 || len(payload) > comfyHistoryMaxInputBytes || duplicateFreeJSON(payload) != nil {
+		return 0, errors.New("invalid Comfy request payload")
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &body); err != nil || body == nil {
+		return 0, errors.New("invalid Comfy request payload")
+	}
+	if chunksRaw, exists := body["managed_chunks"]; exists {
+		var chunks []json.RawMessage
+		if json.Unmarshal(chunksRaw, &chunks) != nil {
+			return 0, errors.New("invalid managed Comfy chunks")
+		}
+		if len(chunks) > 0 {
+			for _, chunkRaw := range chunks {
+				var chunk map[string]json.RawMessage
+				if json.Unmarshal(chunkRaw, &chunk) != nil || chunk == nil {
+					return 0, errors.New("invalid managed Comfy chunk")
+				}
+				var prompt map[string]json.RawMessage
+				if json.Unmarshal(chunk["prompt"], &prompt) != nil || len(prompt) == 0 {
+					return 0, errors.New("invalid managed Comfy prompt")
+				}
+			}
+			return len(chunks), nil
+		}
+	}
+	var prompt map[string]json.RawMessage
+	if json.Unmarshal(body["prompt"], &prompt) != nil || len(prompt) == 0 {
+		return 0, errors.New("invalid Comfy prompt")
+	}
+	return 1, nil
+}
+
+func normalizeComfyHistory(row *domain.Workload, publicID string) (json.RawMessage, error) {
+	if row == nil || publicID == "" || row.Request.ItemID != publicID || row.Request.Plane != domain.PlaneComfy || row.Request.Adapter != "comfy" {
+		return nil, errors.New("invalid Comfy workload identity")
+	}
+	if len(row.InlineOutput) > comfyHistoryMaxInputBytes {
+		return nil, errComfyHistoryTooLarge
+	}
+	if len(row.InlineOutput) == 0 || duplicateFreeJSON(row.InlineOutput) != nil {
+		return nil, errors.New("invalid Comfy history JSON")
+	}
+	graphCount, err := comfyExpectedGraphCount(row.Request.Payload)
+	if err != nil {
+		return nil, err
+	}
+	var backend map[string]json.RawMessage
+	if err := json.Unmarshal(row.InlineOutput, &backend); err != nil || backend == nil || len(backend) == 0 {
+		return nil, errors.New("invalid Comfy history object")
+	}
+	if graphCount == 1 && len(backend) != 1 || graphCount > 1 && len(backend) != graphCount {
+		return nil, errors.New("Comfy history graph count mismatch")
+	}
+	managedExecution := row.Plan != nil && row.Plan.RuntimeProtocol == "managed_comfy_v1"
+	if graphCount == 1 && !managedExecution && row.Execution != nil && row.Execution.ExternalID != "" {
+		if _, exists := backend[row.Execution.ExternalID]; !exists {
+			return nil, errors.New("Comfy execution identity mismatch")
+		}
+	}
+	for backendID, rawRecord := range backend {
+		if backendID == "" || len(rawRecord) == 0 || len(rawRecord) > comfyHistoryMaxInputBytes || duplicateFreeJSON(rawRecord) != nil {
+			return nil, errors.New("invalid Comfy history record")
+		}
+		var record map[string]json.RawMessage
+		if json.Unmarshal(rawRecord, &record) != nil || record == nil || len(record) == 0 {
+			return nil, errors.New("invalid Comfy history record")
+		}
+		var outputs map[string]json.RawMessage
+		if json.Unmarshal(record["outputs"], &outputs) != nil || outputs == nil {
+			return nil, errors.New("invalid Comfy history outputs")
+		}
+		var status struct {
+			StatusStr string `json:"status_str"`
+			Completed bool   `json:"completed"`
+		}
+		if json.Unmarshal(record["status"], &status) != nil || status.StatusStr != "success" || !status.Completed {
+			return nil, errors.New("invalid Comfy history status")
+		}
+		if promptRaw, present := record["prompt"]; present {
+			var promptTuple []json.RawMessage
+			if json.Unmarshal(promptRaw, &promptTuple) != nil || len(promptTuple) < 2 {
+				return nil, errors.New("invalid Comfy history prompt tuple")
+			}
+			var tupleID string
+			if json.Unmarshal(promptTuple[1], &tupleID) != nil || tupleID != backendID {
+				return nil, errors.New("Comfy history prompt identity mismatch")
+			}
+			publicJSON, _ := json.Marshal(publicID)
+			promptTuple[1] = publicJSON
+			promptJSON, _ := json.Marshal(promptTuple)
+			record["prompt"] = promptJSON
+			rewritten, _ := json.Marshal(record)
+			backend[backendID] = rewritten
+		}
+	}
+	var normalized json.RawMessage
+	if graphCount == 1 {
+		for _, record := range backend {
+			normalized = append([]byte(nil), record...)
+		}
+	} else {
+		normalized, err = json.Marshal(backend)
+		if err != nil {
+			return nil, err
+		}
+	}
+	publicOutput, err := json.Marshal(map[string]json.RawMessage{publicID: normalized})
+	if err != nil {
+		return nil, err
+	}
+	if len(publicOutput) > comfyHistoryMaxOutputBytes {
+		return nil, errComfyHistoryTooLarge
+	}
+	return publicOutput, nil
 }
 
 func (s *Server) handleComfyHistory(w http.ResponseWriter, r *http.Request) {
 	p, ok := s.requirePrincipal(w, r, "comfy:read")
 	if !ok {
+		return
+	}
+	if !allowsAdapter(p, "comfy") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient_scope"})
 		return
 	}
 	id := r.PathValue("id")
@@ -687,11 +1104,18 @@ func (s *Server) handleComfyHistory(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{})
 		return
 	}
-	var backend any
-	if len(row.InlineOutput) > 0 {
-		_ = json.Unmarshal(row.InlineOutput, &backend)
+	normalized, err := normalizeComfyHistory(row, id)
+	if err != nil {
+		if errors.Is(err, errComfyHistoryTooLarge) {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "history limit exceeded"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+		return
 	}
-	writeJSON(w, 200, map[string]any{id: backend})
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(normalized)
 }
 
 func (s *Server) handleComfyHistoryAll(w http.ResponseWriter, r *http.Request) {
@@ -699,17 +1123,79 @@ func (s *Server) handleComfyHistoryAll(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, _ := s.workloads.List(r.Context())
-	out := map[string]any{}
+	if !allowsAdapter(p, "comfy") {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient_scope"})
+		return
+	}
+	if s.workloads == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "history unavailable"})
+		return
+	}
+	rows, err := s.workloads.List(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+		return
+	}
+	out := make(map[string]json.RawMessage)
+	outputBytes := 2
+	ownedRows := 0
+	seenIDs := make(map[string]struct{})
 	for _, row := range rows {
-		if row.Request.Plane != domain.PlaneComfy || (!hasScope(p, "admin") && row.Request.OwnerID != p.OwnerID) || row.Status != domain.WorkloadSucceeded {
+		if row == nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		if row.Request.Plane != domain.PlaneComfy || (!hasScope(p, "admin") && row.Request.OwnerID != p.OwnerID) {
 			continue
 		}
-		var value any
-		_ = json.Unmarshal(row.InlineOutput, &value)
-		out[row.Request.ItemID] = value
+		ownedRows++
+		if ownedRows > comfyHistoryMaxRows {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "history limit exceeded"})
+			return
+		}
+		if row.Request.Adapter != "comfy" || row.Request.ItemID == "" {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		if _, duplicate := seenIDs[row.Request.ItemID]; duplicate {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		seenIDs[row.Request.ItemID] = struct{}{}
+		if row.Status != domain.WorkloadSucceeded {
+			continue
+		}
+		if _, duplicate := out[row.Request.ItemID]; duplicate {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		normalized, err := normalizeComfyHistory(row, row.Request.ItemID)
+		if err != nil {
+			if errors.Is(err, errComfyHistoryTooLarge) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "history limit exceeded"})
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		publicKey, err := json.Marshal(row.Request.ItemID)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		outputBytes += len(publicKey) + len(normalized) + 3
+		if outputBytes > comfyHistoryMaxOutputBytes {
+			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "history limit exceeded"})
+			return
+		}
+		var entry map[string]json.RawMessage
+		if json.Unmarshal(normalized, &entry) != nil || len(entry) != 1 {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "history unavailable"})
+			return
+		}
+		out[row.Request.ItemID] = entry[row.Request.ItemID]
 	}
-	writeJSON(w, 200, out)
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) handleComfyQueue(w http.ResponseWriter, r *http.Request) {
@@ -865,7 +1351,15 @@ func (s *Server) handleViewArtifact(w http.ResponseWriter, r *http.Request) {
 		id = r.URL.Query().Get("filename")
 	}
 	artifact, reader, err := s.artifacts.Open(r.Context(), id)
-	if err != nil || (!hasScope(p, "admin") && artifact.OwnerID != p.OwnerID) {
+	if err != nil || artifact == nil || reader == nil {
+		if reader != nil {
+			_ = reader.Close()
+		}
+		writeJSON(w, 404, map[string]string{"error": "artifact not found"})
+		return
+	}
+	if !hasScope(p, "admin") && artifact.OwnerID != p.OwnerID {
+		_ = reader.Close()
 		writeJSON(w, 404, map[string]string{"error": "artifact not found"})
 		return
 	}

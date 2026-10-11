@@ -159,9 +159,9 @@ func restrictedNotificationIP(ip net.IP) bool {
 	return ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
 }
 
-func (m *Manager) enqueueNotification(ctx context.Context, workload *domain.Workload, eventType string) {
+func (m *Manager) enqueueNotification(ctx context.Context, workload *domain.Workload, eventType string) error {
 	if workload == nil || len(workload.Request.Notifications.Webhooks) == 0 {
-		return
+		return nil
 	}
 	now := time.Now().UTC()
 	payload, _ := json.Marshal(map[string]any{
@@ -179,10 +179,12 @@ func (m *Manager) enqueueNotification(ctx context.Context, workload *domain.Work
 		}
 		if _, created, err := m.store.CreateNotification(ctx, delivery); err != nil {
 			m.log.Warn("enqueue webhook notification", "workload", workload.Request.ID, "event", eventType, "err", err)
+			return err
 		} else if created {
 			m.signal()
 		}
 	}
+	return nil
 }
 
 func (m *Manager) notificationLoop(ctx context.Context) {

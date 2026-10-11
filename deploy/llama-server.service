@@ -1,0 +1,37 @@
+[Unit]
+Description=Locally controlled llama.cpp checkpoint worker
+After=local-fs.target
+ConditionPathIsRegular=/etc/vram-governor/llama-server-plan.json
+
+[Service]
+Type=notify
+ExitType=cgroup
+NotifyAccess=all
+KillMode=control-group
+User=root
+Group=vram-governor
+EnvironmentFile=-/etc/vram-governor/node-agent.env
+ExecStart=/usr/libexec/vram-governor/checkpoint-fixed-launcher
+Restart=no
+TimeoutStartSec=60s
+TimeoutStopSec=15s
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=true
+PrivateTmp=true
+RuntimeDirectory=vram-governor-owned-stop
+RuntimeDirectoryMode=0750
+StateDirectory=vram-governor-stop-private vram-governor-stop-public
+StateDirectoryMode=0750
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/var/lib/vram-governor/checkpoint-custody
+ReadWritePaths=/var/lib/vram-governor/checkpoint-snapshots
+ReadWritePaths=/var/lib/vram-governor-stop-private
+ReadWritePaths=/var/lib/vram-governor-stop-public
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+MemoryDenyWriteExecute=false
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' data: blob:; connect-src 'self'; worker-src 'none'; img-src 'self' data: blob:; media-src 'self' data: blob:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    />
+    <title>Load Balancer Plus · Comfy canvas</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font: 16px/1.5 system-ui, sans-serif;
+      }
+      body {
+        min-height: 100vh;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        background: #17191d;
+        color: #f2f4f7;
+      }
+      #canvas-login {
+        width: min(28rem, calc(100vw - 3rem));
+        padding: 2rem;
+        border: 1px solid #454b54;
+        border-radius: 0.75rem;
+        background: #22262c;
+        box-shadow: 0 1.5rem 4rem #0008;
+      }
+      h1 { margin: 0 0 0.4rem; font-size: 1.45rem; }
+      p { color: #c5cbd3; }
+      label { display: block; margin: 1.25rem 0 0.35rem; font-weight: 600; }
+      input, button {
+        box-sizing: border-box;
+        width: 100%;
+        min-height: 2.8rem;
+        border: 1px solid #646d79;
+        border-radius: 0.35rem;
+        font: inherit;
+      }
+      input { padding: 0.55rem 0.7rem; background: #14171b; color: inherit; }
+      button { margin-top: 1rem; background: #d7e6ff; color: #101722; font-weight: 700; cursor: pointer; }
+      button:disabled { cursor: progress; opacity: 0.65; }
+      #canvas-login-status { min-height: 1.5rem; margin-bottom: 0; }
+      .canvas-legal { margin-top: 1.5rem; font-size: 0.85rem; }
+      .canvas-legal a { color: #a9ccff; }
+      #canvas-session-overlay {
+        position: fixed;
+        inset: 0;
+        z-index: 2147483000;
+        display: grid;
+        place-items: center;
+        background: #080a0dcc;
+      }
+      #canvas-session-overlay[hidden] { display: none; }
+      #canvas-session-overlay #canvas-login { margin: 1rem; }
+      #canvas-service-notice {
+        position: fixed;
+        z-index: 2147482000;
+        inset: 0 0 auto;
+        padding: 0.55rem 1rem;
+        background: #332c16;
+        color: #fff4c4;
+        font: 0.9rem/1.4 system-ui, sans-serif;
+      }
+      #canvas-service-notice a { color: #ffe39a; }
+      #canvas-service-notice button { float: right; width: auto; min-height: 0; margin: 0; padding: 0.1rem 0.5rem; }
+    </style>
+    <script defer src="./launcher.js"></script>
+  </head>
+  <body>
+    <main id="canvas-login" aria-labelledby="canvas-title">
+      <h1 id="canvas-title">Comfy canvas</h1>
+      <p>Sign in with a Load Balancer Plus UI credential to open the workflow editor.</p>
+      <form id="canvas-login-form">
+        <label for="canvas-credential">UI credential</label>
+        <input
+          id="canvas-credential"
+          name="credential"
+          type="password"
+          autocomplete="new-password"
+          autocapitalize="off"
+          spellcheck="false"
+          required
+        />
+        <button id="canvas-login-submit" type="submit">Open editor</button>
+      </form>
+      <p id="canvas-login-status" role="status" aria-live="polite"></p>
+      <p class="canvas-legal">
+        The ComfyUI frontend is licensed under GPL-3.0-only.
+        <a href="./upstream/frontend-1.51.9/LICENSE">View license</a>.
+        Selected workflow templates are MIT licensed.
+      </p>
+    </main>
+  </body>
+</html>

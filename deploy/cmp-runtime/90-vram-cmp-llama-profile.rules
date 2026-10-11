@@ -1,0 +1,14 @@
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        subject.user !== "vram-governor") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (/^vram-cmp-llama-profile@(ctx-8k-4|ctx-32k-1|ctx-32k-2)\.service$/.test(unit) &&
+        verb === "start") {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
+

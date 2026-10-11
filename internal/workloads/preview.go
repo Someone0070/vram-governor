@@ -50,6 +50,15 @@ func (m *Manager) Preview(ctx context.Context, req domain.WorkloadRequest) (*dom
 			continue
 		}
 		candidate := domain.PlacementCandidate{TargetID: target.ID, AcceleratorID: target.AcceleratorID, Eligible: true, ContextLimit: target.ContextLimit, Slots: target.Slots, AvailableSlots: m.availableSlots(target), CapacitySource: target.CapacitySource, CapacityVerified: target.CapacityVerified, Resident: requirements.Model == "" || containsString(target.ResidentModels, requirements.Model)}
+		if req.Disruption == domain.DisruptionCheckpointable {
+			// Preview must use the same target-scoped proof predicate as
+			// admission. A generic or stale proof must never make the UI promise
+			// checkpoint/resume merely because the caller opted in.
+			candidate.SessionCheckpointable = targetSupportsDisruption(adapter, target, domain.DisruptionCheckpointable)
+			if !candidate.SessionCheckpointable {
+				candidate.Blocker = "target cannot prove checkpoint/resume execution"
+			}
+		}
 		if estimate := estimates[target.ID]; estimate != nil {
 			candidate.EstimatedStart, candidate.EstimatedEnd, candidate.Confidence, candidate.Score = &estimate.start, &estimate.end, estimate.confidence, estimate.score
 		}

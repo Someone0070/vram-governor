@@ -5,6 +5,7 @@
 .vscode/
 .idea/
 .cache/
+.unlazy/
 data/
 web/ui/node_modules/
 .env
@@ -15,3 +16,11 @@ web/ui/node_modules/
 id_rsa*
 id_ed25519*
 configs/*.local.yaml
+# local build caches and generated/vendored artifacts
+.tmp-*/
+/dist/
+web/comfy/build-artifacts/
+web/comfy/build-artifacts-v2/
+web/comfy/upstream/
+web/comfy/vendor/
+web/comfy/dist/

@@ -1,0 +1,51 @@
+controller_url: "wss://10.0.0.115:18082/ws/node"
+controller_ca_file: "/etc/vram-governor/controller-ca.pem"
+token: ""
+token_env: "VRAM_NODE_TOKEN"
+command_signing_secret: ""
+command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
+command_state_path: "/var/lib/vram-governor/node-command-state.json"
+
+node_id: "cmp170-node"
+node_name: "cmp170"
+log_level: "info"
+location_class: "local"
+power_control_mode: "dont_touch"
+heartbeat_interval_seconds: 2
+capability_refresh_seconds: 30
+reconnect_min_seconds: 1
+reconnect_max_seconds: 15
+
+llamacpp:
+  servers:
+    - id: "cmp170-llm"
+      endpoint: "http://127.0.0.1:8080"
+      # Both controller routes below terminate on LB-loopback SSH forwards.
+      # The inference services themselves never listen on the LAN.
+      public_endpoint: "http://127.0.0.1:9445"
+      accelerator_index: 0
+      router_managed: true
+      max_resident_models: 1
+      context_limit: 8192
+      slots: 4
+      runtime_args: ["llama.cpp-router", "models-max=1"]
+      runtime_profiles:
+        - id: "ctx-8k-4"
+          context_limit: 8192
+          slots: 4
+          switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-cmp-llama-profile@ctx-8k-4.service"]
+        - id: "ctx-32k-1"
+          context_limit: 32768
+          slots: 1
+          switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-cmp-llama-profile@ctx-32k-1.service"]
+        - id: "ctx-32k-2"
+          context_limit: 32768
+          slots: 2
+          switch_command: ["/usr/bin/systemctl", "start", "--wait", "vram-cmp-llama-profile@ctx-32k-2.service"]
+
+comfyui:
+  endpoint: "http://127.0.0.1:8188"
+  # Discovery/reclaim only. This raw target is disabled at the controller;
+  # client workflows enter through the managed harness instead.
+  public_endpoint: "http://127.0.0.1:8188"
+  accelerator_index: 0

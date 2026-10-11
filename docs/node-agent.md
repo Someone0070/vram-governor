@@ -14,7 +14,8 @@ require `token_env` and a 32-byte-or-longer secret supplied through
 
 Controller commands carry a node binding, issue/expiry time, idempotency key,
 and HMAC signature. The agent durably remembers completed command IDs and
-accepts only capability refresh, model load/unload, and accelerator-cache drain operations;
+accepts only capability refresh, model load/unload, accelerator-cache drain,
+runtime drain, and locally configured runtime-profile operations;
 late, replayed, cross-node, unsigned, or unknown commands are rejected.
 
 ## Existing llama.cpp discovery
@@ -27,6 +28,20 @@ busy slots, and a capability fingerprint. `/props`, `context_limit`, and
 `slots` are conservative fallbacks for older or locked-down servers. The
 advertisement records its source and is marked verified only when `/slots`
 supplies both context and slot capacity.
+
+An optional `runtime_profiles` list binds context/slot modes to fixed local
+argv arrays. The controller can select only a listed profile ID, only while the
+physical accelerator is idle. The agent never evaluates controller-provided
+shell text and waits for `/slots` to report the exact selected values before
+returning refreshed capabilities. See
+[Runtime context and slot profiles](ollama-multi-profile.md) for the hardened
+systemd/polkit example and the stock-Ollama limitation.
+
+For a standalone llama.cpp service, use the
+[existing-server setup checklist](llamacpp-node-setup.md). It separates
+read-only model/capacity discovery from managed load/unload and profile
+switching, which require a verified control protocol or fixed local service
+commands.
 
 Runtime target IDs are namespaced by node at the controller, so one node
 cannot replace another node's target by advertising the same local ID.
@@ -80,5 +95,5 @@ software/model installation are intentionally absent.
 Validate a built amd64 archive in Linux or WSL with:
 
 ```bash
-./scripts/verify-node-agent-package.sh .cache/releases/vram-governor-node-agent-1.1.0-linux-amd64.tar.gz
+./scripts/verify-node-agent-package.sh .cache/releases/vram-governor-node-agent-1.2.0-linux-amd64.tar.gz
 ```

@@ -1,0 +1,36 @@
+[Unit]
+Description=Fixed read-only local checkpoint association observer
+After=local-fs.target vram-governor-node-agent.service
+Requires=vram-governor-node-agent.service
+ConditionPathExists=/etc/vram-governor/checkpoint-local-observer-policy.json
+ConditionPathExists=/etc/vram-governor/checkpoint-local-observer.key
+ConditionPathExists=/etc/vram-governor/checkpoint-local-observer.pub
+
+[Service]
+Type=simple
+User=root
+Group=vram-governor
+ExecStart=/usr/local/libexec/checkpoint-local-observer
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=vram-governor-local-observer
+RuntimeDirectoryMode=0750
+UMask=0027
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=CAP_SYS_PTRACE
+SystemCallFilter=~ptrace process_vm_writev
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/etc/vram-governor
+ReadOnlyPaths=/var/lib/vram-governor
+ReadWritePaths=/run/vram-governor-local-observer
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

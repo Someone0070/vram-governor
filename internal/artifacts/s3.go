@@ -82,6 +82,10 @@ func (s *S3Store) objectURL(id string) (*url.URL, string, error) {
 }
 
 func (s *S3Store) Put(ctx context.Context, ownerID, workloadID, name, mediaType string, src io.Reader) (*domain.Artifact, error) {
+	return s.PutWithMetadata(ctx, PutOptions{OwnerID: ownerID, WorkloadID: workloadID, Name: name, MediaType: mediaType}, src)
+}
+
+func (s *S3Store) PutWithMetadata(ctx context.Context, options PutOptions, src io.Reader) (*domain.Artifact, error) {
 	id := artifactID()
 	objectURL, key, err := s.objectURL(id)
 	if err != nil {
@@ -94,15 +98,19 @@ func (s *S3Store) Put(ctx context.Context, ownerID, workloadID, name, mediaType 
 	temporaryPath := temporary.Name()
 	defer os.Remove(temporaryPath)
 	hash := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(temporary, hash), &contextReader{ctx: ctx, reader: io.LimitReader(src, 2<<30)})
+	size, copyErr := io.Copy(io.MultiWriter(temporary, hash), &contextReader{ctx: ctx, reader: io.LimitReader(src, MaxArtifactBytes+1)})
 	if closeErr := temporary.Close(); copyErr != nil || closeErr != nil {
 		if copyErr != nil {
 			return nil, copyErr
 		}
 		return nil, closeErr
 	}
+	if size > MaxArtifactBytes {
+		return nil, fmt.Errorf("artifact exceeds %d-byte limit", MaxArtifactBytes)
+	}
 	digest := hex.EncodeToString(hash.Sum(nil))
-	artifact := &domain.Artifact{ID: id, OwnerID: ownerID, WorkloadID: workloadID, Name: path.Base(name), MediaType: mediaType, Size: size, StorageRef: "s3://" + s.bucket + "/" + key, SHA256: digest, CreatedAt: time.Now().UTC()}
+	artifact := &domain.Artifact{ID: id, OwnerID: options.OwnerID, WorkloadID: options.WorkloadID, Name: path.Base(options.Name), Producer: options.Producer, Media: options.Media, Compatibility: options.Compatibility, MediaType: options.MediaType, Size: size, StorageRef: "s3://" + s.bucket + "/" + key, SHA256: digest, CreatedAt: time.Now().UTC()}
+	normalizeArtifactMetadata(artifact)
 	metadata, _ := json.Marshal(artifact)
 	file, err := os.Open(temporaryPath)
 	if err != nil {
@@ -114,8 +122,8 @@ func (s *S3Store) Put(ctx context.Context, ownerID, workloadID, name, mediaType 
 		return nil, err
 	}
 	req.ContentLength = size
-	if mediaType != "" {
-		req.Header.Set("Content-Type", mediaType)
+	if options.MediaType != "" {
+		req.Header.Set("Content-Type", options.MediaType)
 	}
 	req.Header.Set("X-Amz-Meta-Vram-Governor", base64.RawURLEncoding.EncodeToString(metadata))
 	s.sign(req, digest, time.Now().UTC())
@@ -161,6 +169,7 @@ func (s *S3Store) Open(ctx context.Context, id string) (*domain.Artifact, io.Rea
 		response.Body.Close()
 		return nil, nil, fmt.Errorf("S3 artifact metadata mismatch")
 	}
+	normalizeArtifactMetadata(&artifact)
 	return &artifact, response.Body, nil
 }
 

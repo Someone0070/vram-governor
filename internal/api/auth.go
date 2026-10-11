@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -44,8 +45,9 @@ type browserSession struct {
 }
 
 const (
-	uiSessionCookie    = "vg_ui_session"
-	adminSessionCookie = "vg_admin_session"
+	uiSessionCookie     = "vg_ui_session"
+	adminSessionCookie  = "vg_admin_session"
+	passwordlessAdminID = "lan-passwordless-admin"
 )
 
 func bearerToken(r *http.Request) (string, bool) {
@@ -90,7 +92,7 @@ func (s *Server) buildCredentials() {
 func (s *Server) authenticate(r *http.Request) (Principal, bool) {
 	token, ok := bearerToken(r)
 	if ok {
-		return s.authenticateToken(token)
+		return s.authenticateTokenContext(r.Context(), token)
 	}
 	if session, found := s.browserSessionForRequest(r); found {
 		return session.Principal, true
@@ -114,19 +116,31 @@ func sessionCookieName(kind string) string {
 
 func (s *Server) browserSessionForRequest(r *http.Request) (browserSession, bool) {
 	kind := sessionKindForPath(r.URL.Path)
-	cookie, err := r.Cookie(sessionCookieName(kind))
-	if err != nil {
-		return browserSession{}, false
+	kinds := []string{kind}
+	if kind == "ui" {
+		// An admin session can operate the UI planes; the reverse is never true.
+		kinds = []string{"admin", "ui"}
 	}
-	stored, err := s.authSessions.GetBrowserSession(r.Context(), digestSecret(cookie.Value))
-	if err != nil || stored.Kind != kind {
-		return browserSession{}, false
+	for _, candidate := range kinds {
+		cookie, err := r.Cookie(sessionCookieName(candidate))
+		if err != nil {
+			continue
+		}
+		stored, err := s.authSessions.GetBrowserSession(r.Context(), digestSecret(cookie.Value))
+		if err != nil || stored.Kind != candidate {
+			continue
+		}
+		if !stored.ExpiresAt.After(time.Now()) {
+			_ = s.authSessions.DeleteBrowserSession(r.Context(), stored.IDHash)
+			continue
+		}
+		if stored.PrincipalID == passwordlessAdminID && (!s.cfg.Auth.PasswordlessAdminLAN || !s.adminRemoteAllowed(r)) {
+			_ = s.authSessions.DeleteBrowserSession(r.Context(), stored.IDHash)
+			continue
+		}
+		return browserSession{Principal: principalFromSession(stored), Kind: stored.Kind, CSRFHash: stored.CSRFHash, ExpiresAt: stored.ExpiresAt}, true
 	}
-	if !stored.ExpiresAt.After(time.Now()) {
-		_ = s.authSessions.DeleteBrowserSession(r.Context(), stored.IDHash)
-		return browserSession{}, false
-	}
-	return browserSession{Principal: principalFromSession(stored), Kind: stored.Kind, CSRFHash: stored.CSRFHash, ExpiresAt: stored.ExpiresAt}, true
+	return browserSession{}, false
 }
 
 func digestSecret(secret string) string {
@@ -173,6 +187,10 @@ func principalFromSession(session *domain.BrowserSession) Principal {
 }
 
 func (s *Server) authenticateToken(token string) (Principal, bool) {
+	return s.authenticateTokenContext(context.Background(), token)
+}
+
+func (s *Server) authenticateTokenContext(ctx context.Context, token string) (Principal, bool) {
 	hash := sha256.Sum256([]byte(token))
 	for _, credential := range s.credentials {
 		if subtle.ConstantTimeCompare(hash[:], credential.hash[:]) == 1 {
@@ -181,6 +199,14 @@ func (s *Server) authenticateToken(token string) (Principal, bool) {
 	}
 	if s.cfg.Auth.SharedToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(s.cfg.Auth.SharedToken)) == 1 {
 		return Principal{ID: "legacy", Plane: "legacy", OwnerID: "legacy", MaxPriority: 100, Scopes: map[string]struct{}{"*": {}}, Adapters: map[string]struct{}{"*": {}}}, true
+	}
+	if s.enrollments != nil {
+		lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		value, err := s.enrollments.GetNodeEnrollmentByHash(lookupCtx, hex.EncodeToString(hash[:]))
+		if err == nil && value.Status == "active" {
+			return Principal{ID: value.NodeID, Plane: "node", OwnerID: "system", NodeID: value.NodeID, Scopes: map[string]struct{}{"node:connect": {}, "node:report": {}}, Adapters: map[string]struct{}{"llamacpp": {}, "comfy": {}}, EgressPolicy: "local_only"}, true
+		}
 	}
 	return Principal{}, false
 }
@@ -203,6 +229,14 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p, ok := s.authenticateToken(body.Token)
+	if !ok && body.Token == "" && body.Kind == "admin" && s.cfg.Auth.PasswordlessAdminLAN && s.adminRemoteAllowed(r) {
+		p = Principal{
+			ID: passwordlessAdminID, Plane: "admin", OwnerID: "local-operator",
+			Scopes: map[string]struct{}{"*": {}}, Adapters: map[string]struct{}{"*": {}},
+			MaxPriority: 100, MaxIncidentSeverity: "S4", EgressPolicy: "cloud_allowed", PreemptionBudget: 100,
+		}
+		ok = true
+	}
 	if !ok && body.Token == "" && s.cfg.Auth.DevelopmentBypass && !s.cfg.Production && s.adminRemoteAllowed(r) {
 		p = Principal{
 			ID:                  "local-development",
@@ -256,6 +290,15 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
+	principal, ok := s.authenticate(r)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": principal.ID, "owner_id": principal.OwnerID, "plane": principal.Plane})
+}
+
 func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.cfg.Production && r.TLS == nil {
@@ -284,6 +327,8 @@ func planeAllowsScope(p Principal, scope string) bool {
 		return true
 	case "node":
 		return strings.HasPrefix(scope, "node:")
+	case "enrollment":
+		return scope == "node:enroll"
 	case "agent":
 		return strings.HasPrefix(scope, "agent:") || strings.HasPrefix(scope, "incidents:") || scope == "workloads:read" || scope == "artifacts:read" || scope == "events:read"
 	case "ui", "api", "mcp", "workflow":

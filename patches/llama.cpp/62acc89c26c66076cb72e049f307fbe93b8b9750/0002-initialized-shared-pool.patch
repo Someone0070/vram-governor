@@ -1,0 +1,622 @@
+From 58f4f01b71ac68f0d1db8d73a18c2dfd8e3f091a Mon Sep 17 00:00:00 2001
+Subject: [PATCH] server: expose initialized unified KV pool observations
+
+Pinned base: ggml-org/llama.cpp 62acc89c26c66076cb72e049f307fbe93b8b9750
+Apply after 0001-checkpoint-compat-descriptor.patch.
+
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -566,6 +566,11 @@
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+     LLAMA_API uint32_t llama_n_ctx      (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ctx_seq  (const struct llama_context * ctx);
++    // Bounded initialized unified-KV observation. Physical occupancy is counted once.
++    LLAMA_API bool llama_shared_pool_get_counts(
++            struct llama_context * ctx, uint32_t n_seq,
++            uint32_t * total_cells, uint32_t * used_cells,
++            uint32_t * unattributed_cells, uint32_t * memberships);
+     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
+     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -22,6 +22,7 @@
+ #include "llama-kv-cache.h"
+ #include <stdexcept>
+ #include <string>
++#include <algorithm>
+ 
+ //
+ // llama_context
+@@ -3837,6 +3838,45 @@
+     return ctx->n_ctx_seq();
+ }
+ 
++bool llama_shared_pool_get_counts(
++        llama_context * ctx, uint32_t n_seq,
++        uint32_t * total_cells, uint32_t * used_cells,
++        uint32_t * unattributed_cells, uint32_t * memberships) {
++    constexpr uint32_t max_sequences = 64;
++    constexpr uint32_t max_cells = 65536;
++    if (ctx == nullptr || total_cells == nullptr || used_cells == nullptr ||
++            unattributed_cells == nullptr || memberships == nullptr || n_seq == 0 ||
++            n_seq > max_sequences || n_seq != ctx->get_cparams().n_seq_max ||
++            !ctx->get_cparams().kv_unified || ctx->get_model().arch != LLM_ARCH_LLAMA ||
++            ctx->get_model().hparams.n_layer() != ctx->get_model().hparams.n_layer_all ||
++            ctx->get_cparams().ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT ||
++            ctx->get_cparams().n_rs_seq != 0 || ctx->get_cparams().embeddings ||
++            ctx->get_cparams().embeddings_nextn) return false;
++    ctx->synchronize();
++    const auto * kv = dynamic_cast<const llama_kv_cache *>(llama_get_memory(ctx));
++    if (kv == nullptr || kv->get_n_stream() != 1 || kv->get_n_swa() != 0 || !kv->get_v_trans()) return false;
++    const uint32_t total = kv->get_size();
++    if (total == 0 || total > max_cells) return false;
++    const auto & cells = kv->get_cells(0);
++    if (cells.size() != total) return false;
++    std::fill(memberships, memberships + n_seq, 0);
++    const uint32_t used = cells.get_used();
++    uint32_t scanned_used = 0;
++    uint32_t unattributed = 0;
++    for (uint32_t i = 0; i < total; ++i) {
++        if (cells.is_empty(i)) continue;
++        ++scanned_used;
++        bool attributed = false;
++        for (uint32_t seq = 0; seq < n_seq; ++seq) {
++            if (cells.seq_has(i, seq)) { ++memberships[seq]; attributed = true; }
++        }
++        if (!attributed) ++unattributed;
++    }
++    if (used != scanned_used || used > total || unattributed > used) return false;
++    *total_cells = total; *used_cells = used; *unattributed_cells = unattributed;
++    return true;
++}
++
+ uint32_t llama_n_batch(const llama_context * ctx) {
+     return ctx->n_batch();
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -27,6 +27,8 @@
+     SERVER_TASK_TYPE_SLOT_ERASE,
+     SERVER_TASK_TYPE_GET_LORA,
+     SERVER_TASK_TYPE_SET_LORA,
++    SERVER_TASK_TYPE_SHARED_POOL_GET,
++    SERVER_TASK_TYPE_SHARED_POOL_CLEAR,
+ };
+ 
+ // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
+@@ -167,6 +169,11 @@
+         std::string filename;
+         std::string filepath;
+     };
++    struct shared_pool_clear_request {
++        int id_slot = -1;
++        std::string incarnation;
++        std::string epoch;
++    } shared_pool_clear;
+     slot_action slot_action;
+ 
+     // used by SERVER_TASK_TYPE_METRICS
+@@ -547,6 +554,10 @@
+         return out;
+     }
+ };
++struct server_task_result_shared_pool : server_task_result {
++    json data;
++    virtual json to_json() override { return data; }
++};
+ 
+ struct server_task_result_get_lora : server_task_result {
+     struct lora {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -100,6 +100,7 @@
+     // get the underlaying llama_context, can return nullptr if sleeping
+     // not thread-safe, should only be used from the main thread
+     llama_context * get_llama_context() const;
++    bool shared_pool_enabled() const;
+     bool checkpoint_compat_enabled() const;
+     json get_checkpoint_compat_descriptor() const;
+ 
+@@ -134,6 +135,8 @@
+     server_http_context::handler_t get_metrics;
+     server_http_context::handler_t get_slots;
+     server_http_context::handler_t post_slots;
++    server_http_context::handler_t get_shared_pool;
++    server_http_context::handler_t post_shared_pool_clear;
+     server_http_context::handler_t get_props;
+     server_http_context::handler_t post_props;
+     server_http_context::handler_t post_infill;
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -21,16 +21,20 @@
+ #include <cstddef>
+ #include <cinttypes>
+ #include <cctype>
+ #include <cstdlib>
+ #include <vector>
+ #include <exception>
+ #include <cstring>
+ #include <memory>
++#include <limits>
++#include <atomic>
++#include <iomanip>
++#include <sstream>
+ #include <filesystem>
+ #include <random>
+ #include <utility>
+ #include <fstream>
+ 
+ // fix problem with std::min and std::max
+ #if defined(_WIN32)
+ #define WIN32_LEAN_AND_MEAN
+@@ -851,16 +855,69 @@
+     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
+     const llama_vocab * vocab = nullptr;
+ 
+     server_queue    queue_tasks;
+     server_response queue_results;
+ 
+     // note: chat_params must not be refreshed upon existing sleeping state
+     server_chat_params chat_params;
++    static bool shared_pool_enabled_for_process() {
++        static const bool enabled = []() {
++            const char * value = std::getenv("LLAMA_CHECKPOINT_COMPAT_SHARED_POOL");
++            return value != nullptr && std::strcmp(value, "1") == 0;
++        }();
++        return enabled;
++    }
++    static bool shared_pool_state_enabled_for_process() {
++        static const bool enabled = []() {
++            const char * descriptor = std::getenv("LLAMA_CHECKPOINT_COMPAT_DESCRIPTOR");
++            return shared_pool_enabled_for_process() && descriptor != nullptr && std::strcmp(descriptor, "1") == 0;
++        }();
++        return enabled;
++    }
++    uint64_t shared_pool_epoch = 0;
++    bool shared_pool_epoch_overflow = false;
++    std::string shared_pool_incarnation;
++    uint64_t shared_pool_active_count() const {
++        uint64_t active = 0;
++        for (const auto & slot : slots) if (slot.is_processing()) ++active;
++        return active;
++    }
++    bool shared_pool_can_advance_epoch(uint64_t extra) const {
++        if (!shared_pool_state_enabled_for_process()) return true;
++        if (slots.size() > 64) return false;
++        const uint64_t max_epoch = std::numeric_limits<uint64_t>::max();
++        const uint64_t active = shared_pool_active_count();
++        return !shared_pool_epoch_overflow && active <= max_epoch - extra && shared_pool_epoch <= max_epoch - active - extra;
++    }
++    bool shared_pool_advance_epoch(bool releasing = false) {
++        if (!shared_pool_state_enabled_for_process()) return true;
++        if (!shared_pool_can_advance_epoch(releasing ? 0 : 1)) {
++            shared_pool_epoch_overflow = true;
++            return false;
++        }
++        ++shared_pool_epoch;
++        return true;
++    }
++    void shared_pool_new_incarnation() {
++        if (!shared_pool_state_enabled_for_process()) return;
++        try {
++        std::random_device random;
++        std::ostringstream value;
++        value << std::hex << std::setfill('0');
++        for (int i = 0; i < 4; ++i) value << std::setw(8) << static_cast<uint32_t>(random());
++        shared_pool_incarnation = value.str();
++        shared_pool_epoch = 0;
++        shared_pool_epoch_overflow = false;
++        } catch (...) {
++            shared_pool_incarnation.clear();
++            shared_pool_epoch_overflow = true;
++        }
++    }
+ 
+     server_state_callback_t callback_state = [](server_state, json) -> void {};
+ 
+     server_context_impl() {
+         mtmd_helper_log_set(common_log_default_callback, nullptr);
+     }
+ 
+     ~server_context_impl() {
+@@ -1303,16 +1360,17 @@
+ 
+             slot.mctx                   = mctx;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
+ 
+             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+             slot.callback_on_release = [this](int id_slot) {
+                 queue_tasks.pop_deferred_task(id_slot);
++                shared_pool_advance_epoch(true);
+             };
+ 
+             slot.callback_on_reset = [this](const server_slot & slot) {
+                 // flush the generated token stats before reset()
+                 if (slot.stats.n_gen > 0) {
+                     metrics_on_prediction(slot);
+                 }
+             };
+@@ -1403,28 +1461,30 @@
+ 
+         return true;
+     }
+ 
+     // unlike load_model(), this is only called once during initialization
+     bool init() {
+         GGML_ASSERT(ctx_tgt   != nullptr);
+         GGML_ASSERT(model_tgt != nullptr);
++        shared_pool_new_incarnation();
+ 
+         GGML_ASSERT(!sleeping);
+ 
+         // wiring up server queues
+         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
+             return process_single_task(std::move(task), is_yielding);
+         });
+         queue_tasks.on_update_slots([this]() {
+             update_slots();
+         });
+         queue_tasks.on_sleeping_state([this](bool sleeping) {
+             handle_sleeping_state(sleeping);
++            if (!sleeping) shared_pool_new_incarnation();
+         });
+ 
+         metrics.init();
+ 
+         if (params_base.cache_idle_slots) {
+             if (params_base.cache_ram_mib == 0) {
+                 SRV_WRN("%s", "--cache-idle-slots requires --cache-ram, disabling\n");
+                 params_base.cache_idle_slots = false;
+@@ -2355,32 +2415,137 @@
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only reading the server state is safe
+         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
+             return false;
+         }
+ 
+         switch (task.type) {
++            case SERVER_TASK_TYPE_SHARED_POOL_GET: {
++                if (sleeping || ctx_tgt == nullptr || mctx != nullptr || !params_base.lora_adapters.empty() ||
++                    common_speculative_n_max(&params_base.speculative) > 0 || shared_pool_epoch_overflow) {
++                    auto error = std::make_unique<server_task_result_error>();
++                    error->id = task.id; error->err_type = ERROR_TYPE_UNAVAILABLE;
++                    error->err_msg = "initialized shared pool is unavailable";
++                    queue_results.send(std::move(error)); break;
++                }
++                constexpr uint32_t max_slots = 64;
++                if (slots.empty() || slots.size() > max_slots) {
++                    auto error = std::make_unique<server_task_result_error>();
++                    error->id = task.id; error->err_type = ERROR_TYPE_NOT_SUPPORTED;
++                    error->err_msg = "shared pool slot geometry is unsupported";
++                    queue_results.send(std::move(error)); break;
++                }
++                std::vector<uint32_t> members(slots.size());
++                uint32_t total = 0, used = 0, unattributed = 0;
++                if (!llama_shared_pool_get_counts(ctx_tgt, members.size(), &total, &used, &unattributed, members.data()) || unattributed != 0) {
++                    auto error = std::make_unique<server_task_result_error>();
++                    error->id = task.id; error->err_type = ERROR_TYPE_NOT_SUPPORTED;
++                    error->err_msg = "initialized unified plain KV pool is unsupported";
++                    queue_results.send(std::move(error)); break;
++                }
++                json slots_json = json::array();
++                for (size_t i = 0; i < slots.size(); ++i) {
++                    const auto & slot = slots[i];
++                    if (slot.id != static_cast<int>(i)) {
++                        auto error = std::make_unique<server_task_result_error>();
++                        error->id = task.id; error->err_type = ERROR_TYPE_NOT_SUPPORTED;
++                        error->err_msg = "shared pool slot ids are not canonical";
++                        queue_results.send(std::move(error)); slots_json.clear(); break;
++                    }
++                    slots_json.push_back({{"id", slot.id}, {"state", slot.is_processing() ? "active" : "idle"},
++                        {"effectiveContextCap", slot.n_ctx}, {"membershipCells", members[i]}});
++                }
++                if (slots_json.empty()) break;
++                auto result = std::make_unique<server_task_result_shared_pool>();
++                result->id = task.id;
++                result->data = {{"schemaVersion", 1}, {"support", "initialized-unified-plain-llama-kv"},
++                    {"incarnation", shared_pool_incarnation}, {"epoch", std::to_string(shared_pool_epoch)},
++                    {"pool", {{"initialized", true}, {"totalCells", total}, {"usedCells", used},
++                        {"freeCells", total - used}, {"unattributedCells", unattributed}}}, {"slots", slots_json}};
++                queue_results.send(std::move(result)); break;
++            }
++            case SERVER_TASK_TYPE_SHARED_POOL_CLEAR: {
++                auto fail_clear = [&](const char * message) {
++                    auto error = std::make_unique<server_task_result_error>();
++                    error->id = task.id; error->err_type = ERROR_TYPE_UNAVAILABLE; error->err_msg = message;
++                    queue_results.send(std::move(error));
++                };
++                const auto & request = task.shared_pool_clear;
++                if (sleeping || ctx_tgt == nullptr || mctx != nullptr || !params_base.lora_adapters.empty() ||
++                    common_speculative_n_max(&params_base.speculative) > 0 || shared_pool_epoch_overflow ||
++                    request.incarnation != shared_pool_incarnation || request.epoch != std::to_string(shared_pool_epoch)) {
++                    fail_clear("stale pool incarnation or epoch"); break;
++                }
++                constexpr uint32_t max_slots = 64;
++                if (slots.empty() || slots.size() > max_slots) { fail_clear("shared pool slot geometry is unsupported"); break; }
++                std::vector<uint32_t> before(slots.size());
++                uint32_t before_total = 0, before_used = 0, before_unattributed = 0;
++                if (!llama_shared_pool_get_counts(ctx_tgt, before.size(), &before_total, &before_used, &before_unattributed, before.data()) || before_unattributed != 0) {
++                    fail_clear("initialized unified plain KV pool is unsupported"); break;
++                }
++                if (request.epoch.empty() || request.epoch.size() > 20 ||
++                    (request.epoch.size() > 1 && request.epoch[0] == '0') ||
++                    !std::all_of(request.epoch.begin(), request.epoch.end(), [](unsigned char c) { return c >= '0' && c <= '9'; })) {
++                    fail_clear("invalid decimal epoch"); break;
++                }
++                uint64_t supplied_epoch = 0;
++                try { supplied_epoch = std::stoull(request.epoch); } catch (...) { fail_clear("epoch overflow"); break; }
++                if (supplied_epoch != shared_pool_epoch || request.id_slot < 0 || (size_t) request.id_slot >= slots.size()) {
++                    fail_clear("stale epoch or invalid slot"); break;
++                }
++                server_slot & slot = slots[request.id_slot];
++                bool any_active = false;
++                for (const auto & candidate : slots) any_active = any_active || candidate.is_processing();
++                bool canonical_slots = true;
++                for (size_t i = 0; i < slots.size(); ++i) canonical_slots = canonical_slots && slots[i].id == static_cast<int>(i);
++                if (!canonical_slots) { fail_clear("shared pool slot ids are not canonical"); break; }
++                if (any_active || !queue_tasks.with_empty_task_queues([&]() {
++                    if (!shared_pool_advance_epoch()) return false;
++                    slot.prompt_clear();
++                    slot.reset();
++                    return true;
++                })) {
++                    fail_clear("a slot is active, work is queued, or the worker is unavailable"); break;
++                }
++                llama_synchronize(ctx_tgt);
++                std::vector<uint32_t> after(slots.size());
++                uint32_t total = 0, used = 0, unattributed = 0;
++                if (!llama_shared_pool_get_counts(ctx_tgt, after.size(), &total, &used, &unattributed, after.data()) ||
++                    unattributed != 0 || after[request.id_slot] != 0) {
++                    fail_clear("target sequence remains in KV pool"); break;
++                }
++                auto result = std::make_unique<server_task_result_shared_pool>();
++                result->id = task.id;
++                result->data = {{"schemaVersion", 1}, {"cleared", true}, {"incarnation", shared_pool_incarnation},
++                    {"epoch", std::to_string(shared_pool_epoch)}, {"slot", request.id_slot}, {"membershipCells", 0},
++                    {"pool", {{"totalCells", total}, {"usedCells", used}, {"freeCells", total - used}, {"unattributedCells", unattributed}}}};
++                queue_results.send(std::move(result)); break;
++            }
+             case SERVER_TASK_TYPE_COMPLETION:
+             case SERVER_TASK_TYPE_INFILL:
+             case SERVER_TASK_TYPE_EMBEDDING:
+             case SERVER_TASK_TYPE_RERANK:
+                 {
+                     // special case: if input is provided via CLI, tokenize it first
+                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
+                     if (task.cli) {
+                         if (!tokenize_cli_input(task)) {
+                             break;
+                         }
+                     }
+ 
+                     const int id_task = task.id;
+ 
++                    if (!shared_pool_can_advance_epoch(2)) {
++                        send_error(task, "shared pool epoch lacks launch/release headroom", ERROR_TYPE_UNAVAILABLE); break;
++                    }
+                     server_slot * slot = get_available_slot(task);
++                    if (slot != nullptr && !shared_pool_advance_epoch()) { send_error(task, "shared pool epoch overflow", ERROR_TYPE_UNAVAILABLE); break; }
+ 
+                     //
+                     // slot scheduling logic
+                     //
+ 
+                     if (slot == nullptr) {
+                         // if no slot is available, we defer this task for processing later
+                         SRV_DBG("no slot is available, defer task, id_task = %d\n", id_task);
+@@ -2589,16 +2754,17 @@
+ 
+                     const int64_t t_start = ggml_time_us();
+ 
+                     std::string filename = task.slot_action.filename;
+                     std::string filepath = task.slot_action.filepath;
+ 
+                     size_t nread = 0;
+                     try {
++                        if (!shared_pool_advance_epoch()) throw std::runtime_error("shared pool epoch overflow");
+                         size_t n_packed = 0;
+                         llama_tokens packed;
+                         nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, nullptr, 0, &n_packed);
+                         if (nread != 0) {
+                             packed.resize(std::max<size_t>(1, n_packed));
+                             nread = llama_state_seq_load_file(ctx_tgt, filepath.c_str(), slot->id, packed.data(), packed.size(), &n_packed);
+                         }
+                         if (nread == 0) {
+@@ -2648,16 +2814,17 @@
+                     if (slot->is_processing()) {
+                         // if requested slot is unavailable, we defer this task for processing later
+                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                         queue_tasks.defer(std::move(task));
+                         break;
+                     }
+ 
+                     // Erase token cache
++                    if (!shared_pool_advance_epoch()) { send_error(task, "shared pool epoch overflow", ERROR_TYPE_UNAVAILABLE); break; }
+                     const size_t n_erased = slot->prompt.tokens.size();
+ 
+                     slot->prompt_clear();
+ 
+                     auto res = std::make_unique<server_task_result_slot_erase>();
+                     res->id       = task.id;
+                     res->id_slot  = id_slot;
+                     res->n_erased = n_erased;
+@@ -4183,16 +4350,19 @@
+     }
+     return value;
+ }
+ }
+ 
+ bool server_context::checkpoint_compat_enabled() const {
+     return checkpoint_compat_enabled_for_process();
+ }
++bool server_context::shared_pool_enabled() const {
++    return server_context_impl::shared_pool_enabled_for_process();
++}
+ 
+ json server_context::get_checkpoint_compat_descriptor() const {
+     if (!checkpoint_compat_enabled() || impl->ctx_tgt == nullptr || impl->model_tgt == nullptr ||
+             impl->mctx != nullptr || !impl->params_base.lora_adapters.empty() ||
+             common_speculative_n_max(&impl->params_base.speculative) > 0) {
+         return nullptr;
+     }
+ 
+@@ -4867,16 +5037,76 @@
+         if (action == "erase") {
+             return handle_slots_erase(req, id_slot);
+         }
+ 
+         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
+         return res;
+     };
+ 
++    static std::atomic<uint32_t> shared_pool_requests{0};
++    struct shared_pool_request_guard { std::atomic<uint32_t> & count; ~shared_pool_request_guard() { count.fetch_sub(1); } };
++    auto admit_shared_pool_request = [&]() {
++        uint32_t current = shared_pool_requests.load();
++        while (current < 4) if (shared_pool_requests.compare_exchange_weak(current, current + 1)) return true;
++        return false;
++    };
++    this->get_shared_pool = [this, admit_shared_pool_request](const server_http_req & req) {
++        auto res = create_response(true);
++        if (!checkpoint_compat_enabled_for_process() || !server_context_impl::shared_pool_enabled_for_process()) { res->status = 404; res->data = "{\"error\":\"shared pool opt-in is disabled\"}"; return res; }
++        if (!admit_shared_pool_request()) { res->status = 429; res->data = "{\"error\":\"shared pool request limit reached\"}"; return res; }
++        shared_pool_request_guard request_guard{shared_pool_requests};
++        server_task task(SERVER_TASK_TYPE_SHARED_POOL_GET); task.id = res->rd.get_new_id();
++        const int task_id = task.id;
++        res->rd.id_tasks.insert(task_id); res->rd.queue_results.add_waiting_task_id(task_id);
++        if (!res->rd.queue_tasks.post_if_awake(std::move(task))) {
++            res->rd.id_tasks.erase(task_id); res->rd.queue_results.remove_waiting_task_id(task_id);
++            res->status = 409; res->data = "{\"error\":\"shared pool is sleeping or unavailable\"}"; return res;
++        }
++        auto result = res->rd.next(req.should_stop);
++        if (!result) return res;
++        if (result->is_error()) { res->status = 409; res->data = result->to_json().dump(); return res; }
++        res->ok(result->to_json()); return res;
++    };
++    this->post_shared_pool_clear = [this, admit_shared_pool_request](const server_http_req & req) {
++        auto res = create_response(true);
++        if (!checkpoint_compat_enabled_for_process() || !server_context_impl::shared_pool_enabled_for_process()) { res->status = 404; res->data = "{\"error\":\"shared pool opt-in is disabled\"}"; return res; }
++        if (!admit_shared_pool_request()) { res->status = 429; res->data = "{\"error\":\"shared pool request limit reached\"}"; return res; }
++        shared_pool_request_guard request_guard{shared_pool_requests};
++        if (req.body.size() > 512) { res->status = 400; res->data = "{\"error\":\"clear request is too large\"}"; return res; }
++        json body = json::parse_no_throw(req.body);
++        if (!body.is_object() || body.size() != 3 || !body.contains("slot") || !body.contains("incarnation") || !body.contains("epoch") ||
++            !body["slot"].is_number_integer() || !body["incarnation"].is_string() || !body["epoch"].is_string()) {
++            res->status = 400; res->data = "{\"error\":\"invalid exact clear request\"}"; return res;
++        }
++        const std::string slot_text = body["slot"].dump();
++        uint64_t requested_slot = 0;
++        if (slot_text.empty() || slot_text[0] == '-') { res->status = 400; res->data = "{\"error\":\"slot is out of bounds\"}"; return res; }
++        for (const char digit_char : slot_text) {
++            if (digit_char < '0' || digit_char > '9') { res->status = 400; res->data = "{\"error\":\"slot is out of bounds\"}"; return res; }
++            const uint64_t digit = static_cast<uint64_t>(digit_char - '0');
++            if (requested_slot > (63U - digit) / 10U) { res->status = 400; res->data = "{\"error\":\"slot is out of bounds\"}"; return res; }
++            requested_slot = requested_slot * 10U + digit;
++        }
++        if (requested_slot >= 64) { res->status = 400; res->data = "{\"error\":\"slot is out of bounds\"}"; return res; }
++        server_task task(SERVER_TASK_TYPE_SHARED_POOL_CLEAR); task.id = res->rd.get_new_id();
++        task.shared_pool_clear.id_slot = static_cast<int>(requested_slot);
++        task.shared_pool_clear.incarnation = body["incarnation"].get<std::string>();
++        task.shared_pool_clear.epoch = body["epoch"].get<std::string>();
++        const int task_id = task.id;
++        res->rd.id_tasks.insert(task_id); res->rd.queue_results.add_waiting_task_id(task_id);
++        if (!res->rd.queue_tasks.post_if_awake(std::move(task))) {
++            res->rd.id_tasks.erase(task_id); res->rd.queue_results.remove_waiting_task_id(task_id);
++            res->status = 409; res->data = "{\"error\":\"shared pool is sleeping or unavailable\"}"; return res;
++        }
++        auto result = res->rd.next(req.should_stop);
++        if (!result) return res;
++        if (result->is_error()) { res->status = 409; res->data = result->to_json().dump(); return res; }
++        res->ok(result->to_json()); return res;
++    };
+     this->get_props = [this](const server_http_req &) {
+         auto res = create_response(true);
+         // note: do NOT use ctx_server here, this endpoint must be accessible during sleep
+         if (queue_tasks.is_sleeping()) {
+             std::unique_lock<std::mutex> lock(mutex_cache);
+             res->ok(cached_props);
+         } else {
+             res->ok(get_res_props(*meta, params, false));
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -244,11 +244,18 @@
+     }
+ 
+     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
++    ctx_http.get("/checkpoint/shared-pool", ex_wrapper(routes.get_shared_pool));
++    ctx_http.post("/checkpoint/shared-pool/clear", ex_wrapper(routes.post_shared_pool_clear));
+     ctx_http.get("/checkpoint/compat", [&ctx_server](const server_http_req &) {
+         auto res = std::make_unique<server_http_res>();
+         if (!ctx_server.checkpoint_compat_enabled()) {
+             res->status = 404;
+             res->data = "{\"error\":\"descriptor opt-in is disabled\"}";
++            return res;
++        }
++        if (ctx_server.shared_pool_enabled()) {
++            res->status = 409;
++            res->data = "{\"error\":\"descriptor route is unavailable in shared-pool mode\"}";
+             return res;
+         }
+         const json descriptor = ctx_server.get_checkpoint_compat_descriptor();
+
+diff --git a/tools/server/server-queue.h b/tools/server/server-queue.h
+--- a/tools/server/server-queue.h
++++ b/tools/server/server-queue.h
+@@ -51,6 +51,7 @@
+ 
+     // Add a new task to the end of the queue
+     int post(server_task && task, bool front = false);
++    bool post_if_awake(server_task && task);
+ 
+     // multi-task version of post()
+     int post(std::vector<server_task> && tasks, bool front = false);
+@@ -108,6 +109,7 @@
+         std::unique_lock<std::mutex> lock(mutex_tasks);
+         return queue_tasks_deferred.size();
+     }
++    bool with_empty_task_queues(const std::function<bool()> & mutation);
+ 
+     //
+     // Functions below are not thread-safe, must only be used before start_loop() is called
+diff --git a/tools/server/server-queue.cpp b/tools/server/server-queue.cpp
+--- a/tools/server/server-queue.cpp
++++ b/tools/server/server-queue.cpp
+@@ -45,6 +45,16 @@
+     }
+     condition_tasks.notify_one();
+     return task_id;
++}
++bool server_queue::post_if_awake(server_task && task) {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    if (!running || sleeping) return false;
++    GGML_ASSERT(task.id != -1);
++    const int task_id = task.id;
++    queue_tasks.push_back(std::move(task));
++    time_last_task = ggml_time_ms();
++    condition_tasks.notify_one();
++    return true;
+ }
+ 
+ int server_queue::post(std::vector<server_task> && tasks, bool front) {
+@@ -110,6 +120,12 @@
+     }
+     time_last_task = ggml_time_ms();
+     condition_tasks.notify_one();
++}
++bool server_queue::with_empty_task_queues(const std::function<bool()> & mutation) {
++    std::unique_lock<std::mutex> lock(mutex_tasks);
++    if (!running || sleeping || worker.busy || worker.yielding || !queue_tasks.empty() ||
++            !queue_tasks_deferred.empty() || !queue_tasks_unhandled.empty()) return false;
++    return mutation();
+ }
+ 
+ void server_queue::wait_until_no_sleep() {

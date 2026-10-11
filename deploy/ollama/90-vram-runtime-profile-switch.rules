@@ -1,0 +1,13 @@
+polkit.addRule(function(action, subject) {
+    if (action.id !== "org.freedesktop.systemd1.manage-units" ||
+        subject.user !== "vram-governor") {
+        return polkit.Result.NOT_HANDLED;
+    }
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if (/^vram-runtime-profile-switch@[A-Za-z0-9_.:-]+\.service$/.test(unit) &&
+        (verb === "start" || verb === "restart")) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});

@@ -1,0 +1,31 @@
+[
+  {
+    "moduleName": "Load Balancer Plus",
+    "title": "Load Balancer Plus",
+    "isEssential": true,
+    "templates": [
+      {
+        "name": "image_sdxl_simple",
+        "title": "SDXL Base — Text to Image",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Editable SDXL base text-to-image workflow using the registered SDXL 1.0 model.",
+        "models": ["sd_xl_base_1.0.safetensors"],
+        "openSource": true
+      },
+      {
+        "name": "video_wan2_2_5B_ti2v",
+        "title": "Wan 2.2 5B — Text/Image to Video",
+        "mediaType": "image",
+        "mediaSubtype": "webp",
+        "description": "Editable Wan 2.2 5B text/image-to-video workflow using the registered Wan 2.2 model set.",
+        "models": [
+          "wan2.2_ti2v_5B_fp16.safetensors",
+          "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+          "wan2.2_vae.safetensors"
+        ],
+        "openSource": true
+      }
+    ]
+  }
+]

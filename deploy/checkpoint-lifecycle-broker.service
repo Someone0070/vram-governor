@@ -1,0 +1,34 @@
+[Unit]
+Description=VRAM Governor fixed checkpoint plan lifecycle broker
+After=local-fs.target systemd-udevd.service
+Before=vram-governor-llama-server.service
+
+[Service]
+Type=simple
+User=root
+Group=vram-governor
+ExecStart=/usr/local/bin/checkpoint-lifecycle-broker
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+UMask=0077
+RuntimeDirectory=vram-governor-plan
+RuntimeDirectoryMode=0750
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/etc/vram-governor /var/lib/vram-governor-plan-private /var/lib/vram-governor-plan-public
+ReadOnlyPaths=/etc/vram-governor/checkpoint-plan-catalog.json /etc/vram-governor/node-agent.yaml /etc/vram-governor/node-agent.env /var/lib/vram-governor/node-command-state.json /var/lib/vram-governor/node-command-state.json.journal /var/lib/vram-governor-stop-public/receipts /var/lib/vram-governor-stop-public/ed25519.pub
+ExecStartPre=/usr/bin/test -r /etc/vram-governor/checkpoint-plan-catalog.json
+ExecStartPre=/usr/bin/test -r /var/lib/vram-governor-plan-private/ed25519.key
+ExecStartPre=/usr/bin/test -r /var/lib/vram-governor-plan-public/ed25519.pub
+
+[Install]
+WantedBy=multi-user.target

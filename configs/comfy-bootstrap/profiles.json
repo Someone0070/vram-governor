@@ -1,0 +1,73 @@
+{
+  "target_id": "cmp170-video-managed",
+  "adapter": "comfy",
+  "runtime_protocol": "managed_comfy_v1",
+  "profiles": [
+    {
+      "profile_id": "image-sdxl-base",
+      "version": "1",
+      "digest": "a704222094339ff2865bf4f102e7c1ceaae08efff4a483358a916d40475a3084",
+      "capability_revision": "1",
+      "modality": "IMAGE",
+      "execution_locality": "LB_MANAGED",
+      "adapter": "comfy",
+      "model": "sd_xl_base_1.0.safetensors",
+      "workflow": "image-sdxl-base.json",
+      "operations": ["image.generate"],
+      "input_schema": {
+        "type": "object",
+        "required": ["managed_chunks"],
+        "properties": {
+          "managed_chunks": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["id", "prompt"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "prompt": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "object", "required": ["class_type", "inputs"], "properties": {"class_type": {"type": "string"}, "inputs": {"type": "object"}}}}
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {"type": "object", "required": ["outputs"], "properties": {"outputs": {"type": "array"}}},
+      "accepted_artifact_types": ["application/json"],
+      "produced_artifact_types": ["application/json", "image/png"]
+    },
+    {
+      "profile_id": "video-wan22-5b",
+      "version": "1",
+      "digest": "12fb32685441d03363ac9f8a177691f4af7ec7fd08d53b78ebcd1045fcc9faf7",
+      "capability_revision": "1",
+      "modality": "VIDEO",
+      "execution_locality": "LB_MANAGED",
+      "adapter": "comfy",
+      "model": "wan2.2_ti2v_5B_fp16.safetensors",
+      "workflow": "video-wan22-5b.json",
+      "operations": ["video.generate_sequence"],
+      "input_schema": {
+        "type": "object",
+        "required": ["managed_chunks"],
+        "properties": {
+          "managed_chunks": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["id", "prompt"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "prompt": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "object", "required": ["class_type", "inputs"], "properties": {"class_type": {"type": "string"}, "inputs": {"type": "object"}}}}
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {"type": "object", "required": ["outputs"], "properties": {"outputs": {"type": "array"}}},
+      "accepted_artifact_types": ["application/json"],
+      "produced_artifact_types": ["application/json", "video/mp4"]
+    }
+  ]
+}

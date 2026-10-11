@@ -1,6 +1,10 @@
 # Live verification — 2026-08-30
 
-This report contains only behavior exercised against the current PostgreSQL +
+> **Historical evidence:** This report describes the former WSL acceptance
+> environment, not the current fleet topology. The controller/load balancer now
+> belongs on its own machine; WSL is not an architectural requirement.
+
+This report contains only behavior exercised against the then-current PostgreSQL +
 WSL + physical RTX 3080 deployment. Deterministic tests are listed separately
 in `docs/acceptance.md` and are not promoted to live evidence here.
 

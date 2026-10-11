@@ -1,0 +1,41 @@
+# Merge this entry into workloads.targets in a production-local controller
+# config. Native LLM and Comfy routes are discovered by the three node agents.
+# The managed harness is static because it is a cooperative control boundary,
+# not a raw ComfyUI runtime.
+workloads:
+  targets:
+    - id: "cmp170-video-managed"
+      adapter: "comfy"
+      runtime_protocol: "managed_comfy_v1"
+      # Encrypted reverse SSH tunnel; harness and raw Comfy remain loopback-only.
+      endpoint: "http://127.0.0.1:9444"
+      authorization_env: "VRAM_MANAGED_COMFY_AUTHORIZATION"
+      accelerator_id: "cmp170-node-gpu0"
+      models:
+        - "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+        - "ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+        - "ltx-2.5-video-vae-bf16.safetensors"
+      custom_nodes:
+        - "CLIPLoader"
+        - "CLIPTextEncode"
+        - "CreateVideo"
+        - "EmptyImage"
+        - "EmptyLTXVLatentVideo"
+        - "KSampler"
+        - "LTXVConditioning"
+        - "LTXVLatentUpsampler"
+        - "LatentUpscaleModelLoader"
+        - "SaveVideo"
+        - "SaveImage"
+        - "UNETLoader"
+        - "UnloadModel"
+        - "VAEDecode"
+        - "VAELoader"
+      slots: 1
+      workload_class: "video"
+      vram_reserve_mb: 2048
+      sharing_enabled: true
+      guarded_exploration: true
+      max_slowdown: 1.35
+      safety_critical: false
+      enabled: true

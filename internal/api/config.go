@@ -4,11 +4,15 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"vram-governor/internal/domain"
 )
 
 // Config is the controller's configuration file shape (configs/controller.yaml).
@@ -23,8 +27,11 @@ type Config struct {
 	// Auth defines scoped identities for every security plane. SharedToken is
 	// retained only for development compatibility and is forbidden in production.
 	Auth struct {
-		SharedToken             string             `yaml:"shared_token"`
-		DevelopmentBypass       bool               `yaml:"development_bypass"`
+		SharedToken       string `yaml:"shared_token"`
+		DevelopmentBypass bool   `yaml:"development_bypass"`
+		// PasswordlessAdminLAN temporarily permits blank-token admin browser
+		// sessions from admin_private_cidrs. API and node bearer tokens remain required.
+		PasswordlessAdminLAN    bool               `yaml:"passwordless_admin_lan"`
 		Credentials             []CredentialConfig `yaml:"credentials"`
 		AdminPrivateCIDRs       []string           `yaml:"admin_private_cidrs"`
 		CommandSigningSecret    string             `yaml:"command_signing_secret"`
@@ -32,12 +39,20 @@ type Config struct {
 	} `yaml:"auth"`
 
 	Workloads struct {
-		LeaseTTLSeconds int                    `yaml:"lease_ttl_seconds"`
-		ArtifactRoot    string                 `yaml:"artifact_root"`
-		ArtifactStore   ArtifactStoreConfig    `yaml:"artifact_store"`
-		Residency       ResidencyConfig        `yaml:"residency"`
-		Targets         []WorkloadTargetConfig `yaml:"targets"`
+		LeaseTTLSeconds                int                          `yaml:"lease_ttl_seconds"`
+		DefaultMaxAcceleratorsPerModel int                          `yaml:"default_max_accelerators_per_model"`
+		MaxAcceleratorsPerWorkload     int                          `yaml:"max_accelerators_per_workload"`
+		CapabilityVersion              string                       `yaml:"capability_version"`
+		Capabilities                   domain.ResidencyCapabilities `yaml:"capabilities"`
+		Capacity                       domain.CapacityBudget        `yaml:"capacity"`
+		ModelCapacityPolicies          []ModelCapacityPolicyConfig  `yaml:"model_capacity_policies"`
+		ArtifactRoot                   string                       `yaml:"artifact_root"`
+		ArtifactStore                  ArtifactStoreConfig          `yaml:"artifact_store"`
+		Checkpoint                     CheckpointConfig             `yaml:"checkpoint"`
+		Residency                      ResidencyConfig              `yaml:"residency"`
+		Targets                        []WorkloadTargetConfig       `yaml:"targets"`
 	} `yaml:"workloads"`
+	SmartPlugs []SmartPlugConfig `yaml:"smart_plugs"`
 
 	Notifications NotificationConfig `yaml:"notifications"`
 	Agents        AgentConfig        `yaml:"agents"`
@@ -55,6 +70,39 @@ type Config struct {
 		ReaperIntervalMillis int `yaml:"reaper_interval_millis"`
 		DefaultMaxAttempts   int `yaml:"default_max_attempts"`
 	} `yaml:"jobs"`
+}
+
+// CheckpointConfig controls the controller-side durable KV bundle store. It
+// is deliberately disabled unless an operator supplies every bound; a probe
+// or a default path must never create a resumability promise.
+type CheckpointConfig struct {
+	Enabled                      bool   `yaml:"enabled"`
+	Root                         string `yaml:"root"`
+	MaxBytes                     int64  `yaml:"max_bytes"`
+	MaxFiles                     int    `yaml:"max_files"`
+	PerOwnerMaxBytes             int64  `yaml:"per_owner_max_bytes"`
+	PerOwnerMaxFiles             int    `yaml:"per_owner_max_files"`
+	MaxMetadataBytes             int64  `yaml:"max_metadata_bytes"`
+	MaxOutputBytes               int64  `yaml:"max_output_bytes"`
+	ExpirySeconds                int    `yaml:"expiry_seconds"`
+	LockStaleSeconds             int    `yaml:"lock_stale_seconds"`
+	ProofJournalRetentionSeconds int    `yaml:"proof_journal_retention_seconds"`
+}
+
+func (c CheckpointConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Root == "" || !filepath.IsAbs(c.Root) || filepath.Clean(c.Root) != c.Root || strings.ContainsAny(c.Root, "\r\n\x00") {
+		return fmt.Errorf("checkpoint root must be canonical absolute path")
+	}
+	if c.MaxBytes <= 0 || c.MaxFiles <= 0 || c.PerOwnerMaxBytes <= 0 || c.PerOwnerMaxFiles <= 0 || c.PerOwnerMaxBytes > c.MaxBytes || c.PerOwnerMaxFiles > c.MaxFiles {
+		return fmt.Errorf("checkpoint quotas are invalid")
+	}
+	if c.MaxMetadataBytes <= 0 || c.MaxOutputBytes <= 0 || c.ExpirySeconds <= 0 || c.LockStaleSeconds <= 0 || c.ProofJournalRetentionSeconds < 0 {
+		return fmt.Errorf("checkpoint bounds and lock expiry are required")
+	}
+	return nil
 }
 
 func LoadConfig(path string) (*Config, error) {
@@ -92,6 +140,76 @@ func LoadConfig(path string) (*Config, error) {
 	}
 	if c.Workloads.LeaseTTLSeconds == 0 {
 		c.Workloads.LeaseTTLSeconds = 30
+	}
+	if c.Workloads.DefaultMaxAcceleratorsPerModel == 0 {
+		c.Workloads.DefaultMaxAcceleratorsPerModel = 1
+	}
+	if c.Workloads.DefaultMaxAcceleratorsPerModel < 1 {
+		return nil, fmt.Errorf("default_max_accelerators_per_model must be at least 1")
+	}
+	// This is the fleet-wide placement ceiling. Keep it independent from
+	// the legacy per-model policy, which may be explicitly raised later.
+	normalizedMax, err := domain.NormalizeAcceleratorCeiling(c.Workloads.MaxAcceleratorsPerWorkload, c.Workloads.Capabilities.MaxAcceleratorsPerWorkload)
+	if err != nil {
+		return nil, err
+	}
+	c.Workloads.MaxAcceleratorsPerWorkload = normalizedMax
+	c.Workloads.Capabilities.MaxAcceleratorsPerWorkload = normalizedMax
+	if c.Workloads.CapabilityVersion == "" {
+		c.Workloads.CapabilityVersion = domain.CapabilityContractVersion
+	}
+	if err := domain.ValidateCapabilityVersion(c.Workloads.CapabilityVersion); err != nil {
+		return nil, err
+	}
+	if c.Workloads.Capabilities.Version == "" {
+		c.Workloads.Capabilities.Version = c.Workloads.CapabilityVersion
+	}
+	if err := domain.ValidateOperatorCapabilities(c.Workloads.Capabilities); err != nil {
+		return nil, fmt.Errorf("workloads.capabilities: %w", err)
+	}
+	if err := c.Workloads.Capabilities.Validate(); err != nil {
+		return nil, fmt.Errorf("workloads.capabilities: %w", err)
+	}
+	if c.Workloads.Capacity.VRAMHardCapBytes == 0 && c.Workloads.Capacity.VRAMTotalBytes > 0 {
+		c.Workloads.Capacity.VRAMHardCapBytes = c.Workloads.Capacity.VRAMTotalBytes
+	}
+	if c.Workloads.Capacity.RAMHardCapBytes == 0 && c.Workloads.Capacity.RAMTotalBytes > 0 {
+		c.Workloads.Capacity.RAMHardCapBytes = c.Workloads.Capacity.RAMTotalBytes
+	}
+	if c.Workloads.Checkpoint.ProofJournalRetentionSeconds == 0 {
+		c.Workloads.Checkpoint.ProofJournalRetentionSeconds = 48 * 60 * 60
+	}
+	if err := c.Workloads.Capacity.Validate(); err != nil {
+		return nil, fmt.Errorf("workloads.capacity: %w", err)
+	}
+	if err := c.Workloads.Checkpoint.Validate(); err != nil {
+		return nil, fmt.Errorf("workloads.checkpoint: %w", err)
+	}
+	seenPlugNodes := map[string]bool{}
+	seenPlugHosts := map[string]bool{}
+	for _, plug := range c.SmartPlugs {
+		parsed, err := url.Parse(plug.URL)
+		if plug.NodeID == "" || err != nil || parsed.Scheme != "http" || parsed.Host == "" || parsed.Path != "" || parsed.RawQuery != "" || parsed.User != nil || parsed.Fragment != "" {
+			return nil, fmt.Errorf("smart_plugs require node_id and a bare http URL")
+		}
+		ip := net.ParseIP(parsed.Hostname())
+		if ip == nil || !ip.IsPrivate() || ip.To4() == nil {
+			return nil, fmt.Errorf("smart plug %q must use a private IPv4 address", plug.NodeID)
+		}
+		if seenPlugNodes[plug.NodeID] || seenPlugHosts[parsed.Host] {
+			return nil, fmt.Errorf("smart plug node IDs and addresses must be unique")
+		}
+		seenPlugNodes[plug.NodeID], seenPlugHosts[parsed.Host] = true, true
+	}
+	seenModelPolicies := make(map[string]struct{}, len(c.Workloads.ModelCapacityPolicies))
+	for _, policy := range c.Workloads.ModelCapacityPolicies {
+		if policy.Model == "" || policy.MaxAccelerators < 1 {
+			return nil, fmt.Errorf("model capacity policies require model and max_accelerators of at least 1")
+		}
+		if _, exists := seenModelPolicies[policy.Model]; exists {
+			return nil, fmt.Errorf("duplicate model capacity policy for %q", policy.Model)
+		}
+		seenModelPolicies[policy.Model] = struct{}{}
 	}
 	if c.Workloads.ArtifactRoot == "" {
 		c.Workloads.ArtifactRoot = "data/artifacts"
@@ -138,7 +256,85 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("invalid quiet_hours_end: %w", err)
 		}
 	}
-	for _, target := range c.Workloads.Targets {
+	for targetIndex := range c.Workloads.Targets {
+		target := &c.Workloads.Targets[targetIndex]
+		aliases := domain.CapabilityAliases{
+			SupportsModelLifecycle:     target.SupportsModelLifecycle,
+			SupportsAcceleratorReclaim: target.SupportsAcceleratorReclaim,
+			MaxResidentModels:          target.MaxResidentModels,
+			WarmRAMSupported:           target.WarmRAMSupported,
+		}
+		capabilitiesSpecified := target.Capabilities != (domain.ResidencyCapabilities{}) || target.CapabilityRevision != "" || aliases != (domain.CapabilityAliases{})
+		targetRevision := target.CapabilityRevision
+		if targetRevision == "" {
+			targetRevision = target.Capabilities.Version
+		}
+		if targetRevision == "" {
+			targetRevision = c.Workloads.CapabilityVersion
+		}
+		if err := domain.ValidateCapabilityVersion(targetRevision); err != nil {
+			return nil, fmt.Errorf("target %q: %w", target.ID, err)
+		}
+		overlay := target.Capabilities
+		if overlay.Version == "" {
+			overlay.Version = targetRevision
+		}
+		if capabilitiesSpecified {
+			if err := domain.ValidateOperatorCapabilities(overlay); err != nil {
+				return nil, fmt.Errorf("target %q capabilities: %w", target.ID, err)
+			}
+		}
+		capabilities, err := domain.MergeResidencyCapabilities(c.Workloads.Capabilities, overlay, aliases)
+		if err != nil {
+			return nil, fmt.Errorf("target %q capabilities: %w", target.ID, err)
+		}
+		capabilities.Version = targetRevision
+		target.Capabilities = capabilities
+		target.CapabilityRevision = targetRevision
+		if target.CapacityVerified {
+			return nil, fmt.Errorf("target %q capacity_verified is runtime-only and may not be set in static configuration", target.ID)
+		}
+		if err := domain.ValidateCapacityOverride(c.Workloads.Capacity, target.Capacity); err != nil {
+			return nil, fmt.Errorf("target %q capacity override: %w", target.ID, err)
+		}
+		target.Capacity = domain.MergeCapacityBudget(c.Workloads.Capacity, target.Capacity)
+		if err := target.Capabilities.Validate(); err != nil {
+			return nil, fmt.Errorf("target %q capabilities: %w", target.ID, err)
+		}
+		if err := target.Capacity.Validate(); err != nil {
+			return nil, fmt.Errorf("target %q capacity: %w", target.ID, err)
+		}
+		nestedMaxOverride := overlay.MaxAcceleratorsPerWorkload
+		if target.MaxAcceleratorsPerWorkload < 0 || nestedMaxOverride < 0 {
+			return nil, fmt.Errorf("target %q max_accelerators_per_workload may not be negative", target.ID)
+		}
+		if target.MaxAcceleratorsPerWorkload > 0 && nestedMaxOverride > 0 && target.MaxAcceleratorsPerWorkload != nestedMaxOverride {
+			return nil, fmt.Errorf("target %q max_accelerators_per_workload conflicts with nested capability ceiling", target.ID)
+		}
+		effectiveMax := target.MaxAcceleratorsPerWorkload
+		if effectiveMax == 0 {
+			effectiveMax = nestedMaxOverride
+		}
+		if effectiveMax == 0 {
+			effectiveMax = c.Workloads.MaxAcceleratorsPerWorkload
+		}
+		if effectiveMax > c.Workloads.MaxAcceleratorsPerWorkload {
+			return nil, fmt.Errorf("target %q max_accelerators_per_workload %d exceeds inherited ceiling %d", target.ID, effectiveMax, c.Workloads.MaxAcceleratorsPerWorkload)
+		}
+		target.MaxAcceleratorsPerWorkload = effectiveMax
+		target.Capabilities.MaxAcceleratorsPerWorkload = effectiveMax
+		target.SupportsModelLifecycle = target.Capabilities.SupportsModelLifecycle
+		target.SupportsAcceleratorReclaim = target.Capabilities.SupportsAcceleratorReclaim
+		target.MaxResidentModels = target.Capabilities.MaxResidentModels
+		target.WarmRAMSupported = target.Capabilities.SupportsWarmRAM
+		switch target.RuntimeProtocol {
+		case "", "native", "managed_comfy_v1":
+		default:
+			return nil, fmt.Errorf("target %q has invalid runtime_protocol %q", target.ID, target.RuntimeProtocol)
+		}
+		if target.RuntimeProtocol == "managed_comfy_v1" && target.Adapter != "comfy" {
+			return nil, fmt.Errorf("target %q runtime_protocol managed_comfy_v1 requires adapter comfy", target.ID)
+		}
 		switch target.ResidencyPolicy {
 		case "", "auto", "pinned", "manual", "off":
 		default:
@@ -156,6 +352,11 @@ func LoadConfig(path string) (*Config, error) {
 		if target.PredictedSlowdown < 0 || target.MaxSlowdown < 0 {
 			return nil, fmt.Errorf("target %q slowdown factors may not be negative", target.ID)
 		}
+		for _, profile := range target.Profiles {
+			if profile.ProfileID == "" || profile.Version == "" || len(profile.Operations) == 0 {
+				return nil, fmt.Errorf("target %q Creator Studio profiles require profile_id, version, and operations", target.ID)
+			}
+		}
 		if target.SharingEnabled && target.AcceleratorVRAMMB == 0 {
 			return nil, fmt.Errorf("target %q sharing requires accelerator_vram_mb; standalone_vram_mb may be learned from exclusive runs", target.ID)
 		}
@@ -171,9 +372,12 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("credential id and owner_id are required")
 		}
 		switch credential.Plane {
-		case "admin", "node", "agent", "ui", "api", "mcp", "workflow":
+		case "admin", "node", "enrollment", "agent", "ui", "api", "mcp", "workflow":
 		default:
 			return nil, fmt.Errorf("credential %q has invalid plane %q", credential.ID, credential.Plane)
+		}
+		if credential.Plane == "enrollment" && (credential.NodeID != "" || len(credential.Scopes) != 1 || credential.Scopes[0] != "node:enroll") {
+			return nil, fmt.Errorf("credential %q enrollment plane must have only node:enroll scope and no node_id", credential.ID)
 		}
 		switch credential.EgressPolicy {
 		case "", "local_only", "sanitized_cloud", "cloud_allowed":
@@ -292,6 +496,17 @@ type ArtifactStoreConfig struct {
 	SessionTokenEnv string `yaml:"session_token_env"`
 }
 
+type ModelCapacityPolicyConfig struct {
+	Model           string `yaml:"model"`
+	MaxAccelerators int    `yaml:"max_accelerators"`
+}
+
+type SmartPlugConfig struct {
+	NodeID         string `yaml:"node_id"`
+	URL            string `yaml:"url"`
+	ControlEnabled bool   `yaml:"control_enabled"`
+}
+
 type NotificationConfig struct {
 	Enabled                 bool     `yaml:"enabled"`
 	SigningSecret           string   `yaml:"signing_secret"`
@@ -342,41 +557,47 @@ type CredentialConfig struct {
 }
 
 type WorkloadTargetConfig struct {
-	ID                         string   `yaml:"id"`
-	Adapter                    string   `yaml:"adapter"`
-	Endpoint                   string   `yaml:"endpoint"`
-	AcceleratorID              string   `yaml:"accelerator_id"`
-	Models                     []string `yaml:"models"`
-	ResidentModels             []string `yaml:"resident_models"`
-	CustomNodes                []string `yaml:"custom_nodes"`
-	ContextLimit               int      `yaml:"context_limit"`
-	Slots                      int      `yaml:"slots"`
-	CapabilityVersion          string   `yaml:"capability_version"`
-	ModelFingerprint           string   `yaml:"model_fingerprint"`
-	CapacitySource             string   `yaml:"capacity_source"`
-	CapacityVerified           bool     `yaml:"capacity_verified"`
-	SupportsModelLifecycle     bool     `yaml:"supports_model_lifecycle"`
-	SupportsAcceleratorReclaim bool     `yaml:"supports_accelerator_reclaim"`
-	MaxResidentModels          int      `yaml:"max_resident_models"`
-	WarmRAMSupported           bool     `yaml:"warm_ram_supported"`
-	ResidencyPolicy            string   `yaml:"residency_policy"`
-	IdleUnloadSeconds          int      `yaml:"idle_unload_seconds"`
-	MinResidencySeconds        int      `yaml:"min_residency_seconds"`
-	Cloud                      bool     `yaml:"cloud"`
-	Enabled                    *bool    `yaml:"enabled"`
-	Authorization              string   `yaml:"authorization"`
-	AuthorizationEnv           string   `yaml:"authorization_env"`
-	InputCentsPerMTok          int64    `yaml:"input_cents_per_million_tokens"`
-	OutputCentsPerMTok         int64    `yaml:"output_cents_per_million_tokens"`
-	WorkloadClass              string   `yaml:"workload_class"`
-	StandaloneVRAMMB           int64    `yaml:"standalone_vram_mb"`
-	AcceleratorVRAMMB          int64    `yaml:"accelerator_vram_mb"`
-	VRAMReserveMB              int64    `yaml:"vram_reserve_mb"`
-	SharingEnabled             bool     `yaml:"sharing_enabled"`
-	GuardedExploration         bool     `yaml:"guarded_exploration"`
-	PredictedSlowdown          float64  `yaml:"predicted_slowdown"`
-	MaxSlowdown                float64  `yaml:"max_slowdown"`
-	SafetyCritical             bool     `yaml:"safety_critical"`
-	Provider                   string   `yaml:"provider"`
-	Quarantined                bool     `yaml:"quarantined"`
+	ID                         string                       `yaml:"id"`
+	Adapter                    string                       `yaml:"adapter"`
+	Endpoint                   string                       `yaml:"endpoint"`
+	RuntimeProtocol            string                       `yaml:"runtime_protocol"`
+	AcceleratorID              string                       `yaml:"accelerator_id"`
+	Models                     []string                     `yaml:"models"`
+	Profiles                   []domain.RuntimeProfile      `yaml:"profiles"`
+	ResidentModels             []string                     `yaml:"resident_models"`
+	CustomNodes                []string                     `yaml:"custom_nodes"`
+	ContextLimit               int                          `yaml:"context_limit"`
+	Slots                      int                          `yaml:"slots"`
+	CapabilityVersion          string                       `yaml:"capability_version"`
+	CapabilityRevision         string                       `yaml:"capability_revision"`
+	Capabilities               domain.ResidencyCapabilities `yaml:"capabilities"`
+	Capacity                   domain.CapacityBudget        `yaml:"capacity"`
+	MaxAcceleratorsPerWorkload int                          `yaml:"max_accelerators_per_workload"`
+	ModelFingerprint           string                       `yaml:"model_fingerprint"`
+	CapacitySource             string                       `yaml:"capacity_source"`
+	CapacityVerified           bool                         `yaml:"capacity_verified"`
+	SupportsModelLifecycle     bool                         `yaml:"supports_model_lifecycle"`
+	SupportsAcceleratorReclaim bool                         `yaml:"supports_accelerator_reclaim"`
+	MaxResidentModels          int                          `yaml:"max_resident_models"`
+	WarmRAMSupported           bool                         `yaml:"warm_ram_supported"`
+	ResidencyPolicy            string                       `yaml:"residency_policy"`
+	IdleUnloadSeconds          int                          `yaml:"idle_unload_seconds"`
+	MinResidencySeconds        int                          `yaml:"min_residency_seconds"`
+	Cloud                      bool                         `yaml:"cloud"`
+	Enabled                    *bool                        `yaml:"enabled"`
+	Authorization              string                       `yaml:"authorization"`
+	AuthorizationEnv           string                       `yaml:"authorization_env"`
+	InputCentsPerMTok          int64                        `yaml:"input_cents_per_million_tokens"`
+	OutputCentsPerMTok         int64                        `yaml:"output_cents_per_million_tokens"`
+	WorkloadClass              string                       `yaml:"workload_class"`
+	StandaloneVRAMMB           int64                        `yaml:"standalone_vram_mb"`
+	AcceleratorVRAMMB          int64                        `yaml:"accelerator_vram_mb"`
+	VRAMReserveMB              int64                        `yaml:"vram_reserve_mb"`
+	SharingEnabled             bool                         `yaml:"sharing_enabled"`
+	GuardedExploration         bool                         `yaml:"guarded_exploration"`
+	PredictedSlowdown          float64                      `yaml:"predicted_slowdown"`
+	MaxSlowdown                float64                      `yaml:"max_slowdown"`
+	SafetyCritical             bool                         `yaml:"safety_critical"`
+	Provider                   string                       `yaml:"provider"`
+	Quarantined                bool                         `yaml:"quarantined"`
 }

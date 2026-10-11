@@ -1,0 +1,25 @@
+[Unit]
+Description=VRAM Governor managed Comfy chunk harness
+After=network-online.target comfyui.service
+Wants=network-online.target
+Requires=comfyui.service
+
+[Service]
+Type=simple
+User=vram-governor
+Group=vram-governor
+EnvironmentFile=/etc/vram-governor/comfy-harness.env
+ExecStart=/usr/local/bin/vram-governor-comfy-harness -listen 127.0.0.1:8190 -comfy-url http://127.0.0.1:8188 -state-dir /var/lib/vram-governor/comfy-harness
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/vram-governor/comfy-harness
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target

@@ -10,7 +10,300 @@
 // the shape, but Phase 1 does not wire them into the store or API.
 package domain
 
-import "time"
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+// CapabilityContractVersion is the additive wire/configuration contract for
+// fleet residency. It is intentionally independent of a runtime or device
+// product name; a node may advertise an older version and must then fail
+// closed for fields it does not understand.
+const CapabilityContractVersion = "fleet-residency.v1"
+
+// CapabilityVersion validates the only contract versions understood by this
+// binary. Empty is accepted for legacy records and is normalized by config
+// loaders to CapabilityContractVersion.
+func ValidateCapabilityVersion(version string) error {
+	if version == "" || version == CapabilityContractVersion {
+		return nil
+	}
+	return fmt.Errorf("unsupported capability contract version %q", version)
+}
+
+// CapacityBudget uses bytes internally. Display layers may convert to MiB,
+// but admission must never make a decision from rounded display units.
+type CapacityBudget struct {
+	VRAMTotalBytes     int64 `json:"vram_total_bytes" yaml:"vram_total_bytes"`
+	VRAMReserveBytes   int64 `json:"vram_reserve_bytes" yaml:"vram_reserve_bytes"`
+	VRAMHardCapBytes   int64 `json:"vram_hard_cap_bytes" yaml:"vram_hard_cap_bytes"`
+	RAMTotalBytes      int64 `json:"ram_total_bytes" yaml:"ram_total_bytes"`
+	RAMReserveBytes    int64 `json:"ram_reserve_bytes" yaml:"ram_reserve_bytes"`
+	RAMHardCapBytes    int64 `json:"ram_hard_cap_bytes" yaml:"ram_hard_cap_bytes"`
+	DiskAvailableBytes int64 `json:"disk_available_bytes" yaml:"disk_available_bytes"`
+}
+
+func (b CapacityBudget) Validate() error {
+	values := []struct {
+		name  string
+		value int64
+	}{
+		{"vram_total_bytes", b.VRAMTotalBytes}, {"vram_reserve_bytes", b.VRAMReserveBytes},
+		{"vram_hard_cap_bytes", b.VRAMHardCapBytes}, {"ram_total_bytes", b.RAMTotalBytes},
+		{"ram_reserve_bytes", b.RAMReserveBytes}, {"ram_hard_cap_bytes", b.RAMHardCapBytes},
+		{"disk_available_bytes", b.DiskAvailableBytes},
+	}
+	for _, field := range values {
+		if field.value < 0 {
+			return fmt.Errorf("%s may not be negative", field.name)
+		}
+	}
+	if b.VRAMTotalBytes > 0 && b.VRAMReserveBytes > b.VRAMTotalBytes {
+		return fmt.Errorf("vram_reserve_bytes may not exceed vram_total_bytes")
+	}
+	if b.VRAMTotalBytes > 0 && b.VRAMHardCapBytes > b.VRAMTotalBytes {
+		return fmt.Errorf("vram_hard_cap_bytes may not exceed vram_total_bytes")
+	}
+	if b.VRAMHardCapBytes > 0 && b.VRAMReserveBytes > b.VRAMHardCapBytes {
+		return fmt.Errorf("vram_reserve_bytes may not exceed vram_hard_cap_bytes")
+	}
+	if b.RAMTotalBytes > 0 && b.RAMReserveBytes > b.RAMTotalBytes {
+		return fmt.Errorf("ram_reserve_bytes may not exceed ram_total_bytes")
+	}
+	if b.RAMTotalBytes > 0 && b.RAMHardCapBytes > b.RAMTotalBytes {
+		return fmt.Errorf("ram_hard_cap_bytes may not exceed ram_total_bytes")
+	}
+	if b.RAMHardCapBytes > 0 && b.RAMReserveBytes > b.RAMHardCapBytes {
+		return fmt.Errorf("ram_reserve_bytes may not exceed ram_hard_cap_bytes")
+	}
+	return nil
+}
+
+// ValidateCapacityOverride checks a partial child budget before inheritance
+// fills omitted fields. Parent non-zero hard caps are ceilings; a child may
+// narrow them but cannot raise them.
+func ValidateCapacityOverride(parent, override CapacityBudget) error {
+	if err := override.Validate(); err != nil {
+		return err
+	}
+	if parent.VRAMHardCapBytes > 0 && override.VRAMHardCapBytes > parent.VRAMHardCapBytes {
+		return fmt.Errorf("vram_hard_cap_bytes %d exceeds inherited ceiling %d", override.VRAMHardCapBytes, parent.VRAMHardCapBytes)
+	}
+	if parent.RAMHardCapBytes > 0 && override.RAMHardCapBytes > parent.RAMHardCapBytes {
+		return fmt.Errorf("ram_hard_cap_bytes %d exceeds inherited ceiling %d", override.RAMHardCapBytes, parent.RAMHardCapBytes)
+	}
+	return nil
+}
+
+// MergeCapacityBudget applies a partial target/adapter override over fleet
+// defaults while retaining global reserves and hard caps when omitted. A
+// smaller explicit total safely narrows an inherited hard cap.
+func MergeCapacityBudget(defaults, override CapacityBudget) CapacityBudget {
+	merged := defaults
+	if override.VRAMTotalBytes > 0 {
+		merged.VRAMTotalBytes = override.VRAMTotalBytes
+	}
+	if override.VRAMReserveBytes > 0 {
+		merged.VRAMReserveBytes = override.VRAMReserveBytes
+	}
+	if override.VRAMHardCapBytes > 0 {
+		merged.VRAMHardCapBytes = override.VRAMHardCapBytes
+	}
+	if override.RAMTotalBytes > 0 {
+		merged.RAMTotalBytes = override.RAMTotalBytes
+	}
+	if override.RAMReserveBytes > 0 {
+		merged.RAMReserveBytes = override.RAMReserveBytes
+	}
+	if override.RAMHardCapBytes > 0 {
+		merged.RAMHardCapBytes = override.RAMHardCapBytes
+	}
+	if override.DiskAvailableBytes > 0 {
+		merged.DiskAvailableBytes = override.DiskAvailableBytes
+	}
+	if merged.VRAMTotalBytes > 0 && (merged.VRAMHardCapBytes == 0 || merged.VRAMHardCapBytes > merged.VRAMTotalBytes) {
+		merged.VRAMHardCapBytes = merged.VRAMTotalBytes
+	}
+	if merged.RAMTotalBytes > 0 && (merged.RAMHardCapBytes == 0 || merged.RAMHardCapBytes > merged.RAMTotalBytes) {
+		merged.RAMHardCapBytes = merged.RAMTotalBytes
+	}
+	return merged
+}
+
+// ResidencyCapabilities deliberately separates warm model bytes from session
+// checkpointing. WarmRAMVerified says model bytes were proven resident by an
+// OS oracle; SessionCheckpointVerified is an independent proof of pause,
+// snapshot, restore, and measured KV reuse.
+type ResidencyCapabilities struct {
+	Version                    string `json:"version" yaml:"version"`
+	SupportsWarmRAM            bool   `json:"supports_warm_ram" yaml:"supports_warm_ram"`
+	WarmRAMVerified            bool   `json:"warm_ram_verified" yaml:"warm_ram_verified"`
+	WarmRAMVerification        string `json:"warm_ram_verification,omitempty" yaml:"warm_ram_verification"`
+	SupportsSessionCheckpoint  bool   `json:"supports_session_checkpoint" yaml:"supports_session_checkpoint"`
+	SessionCheckpointVerified  bool   `json:"session_checkpoint_verified" yaml:"session_checkpoint_verified"`
+	SessionCheckpointProof     string `json:"session_checkpoint_proof,omitempty" yaml:"session_checkpoint_proof"`
+	SupportsYield              bool   `json:"supports_yield" yaml:"supports_yield"`
+	YieldVerified              bool   `json:"yield_verified" yaml:"yield_verified"`
+	YieldProof                 string `json:"yield_proof,omitempty" yaml:"yield_proof"`
+	SupportsModelLifecycle     bool   `json:"supports_model_lifecycle" yaml:"supports_model_lifecycle"`
+	SupportsAcceleratorReclaim bool   `json:"supports_accelerator_reclaim" yaml:"supports_accelerator_reclaim"`
+	MaxResidentModels          int    `json:"max_resident_models" yaml:"max_resident_models"`
+	MaxAcceleratorsPerWorkload int    `json:"max_accelerators_per_workload" yaml:"max_accelerators_per_workload"`
+}
+
+func (c ResidencyCapabilities) Validate() error {
+	if err := ValidateCapabilityVersion(c.Version); err != nil {
+		return err
+	}
+	if c.MaxResidentModels < 0 || c.MaxAcceleratorsPerWorkload < 0 {
+		return fmt.Errorf("capability ceilings may not be negative")
+	}
+	if err := validateResidencyEvidence(c); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateResidencyEvidence(c ResidencyCapabilities) error {
+	if strings.TrimSpace(c.WarmRAMVerification) != "" && (!c.SupportsWarmRAM || !c.WarmRAMVerified) {
+		return fmt.Errorf("warm_ram_verification requires supported, verified warm RAM")
+	}
+	if c.SupportsWarmRAM && c.WarmRAMVerified && !isResidencyOracle(c.WarmRAMVerification) {
+		return fmt.Errorf("warm_ram_verified requires an OS residency oracle")
+	}
+	if c.WarmRAMVerified && !c.SupportsWarmRAM {
+		return fmt.Errorf("warm_ram_verified requires supports_warm_ram")
+	}
+	if strings.TrimSpace(c.SessionCheckpointProof) != "" && (!c.SupportsSessionCheckpoint || !c.SessionCheckpointVerified) {
+		return fmt.Errorf("session_checkpoint_proof requires supported, verified checkpointing")
+	}
+	if c.SessionCheckpointVerified && (!c.SupportsSessionCheckpoint || strings.TrimSpace(c.SessionCheckpointProof) == "") {
+		return fmt.Errorf("session_checkpoint_verified requires support and proof")
+	}
+	if c.SupportsSessionCheckpoint && !c.SessionCheckpointVerified {
+		return fmt.Errorf("supports_session_checkpoint requires verified runtime proof")
+	}
+	if c.SupportsYield && !c.YieldVerified {
+		return fmt.Errorf("supports_yield requires verified runtime proof")
+	}
+	if c.YieldVerified && (!c.SupportsYield || strings.TrimSpace(c.YieldProof) == "") {
+		return fmt.Errorf("yield_verified requires supports_yield and proof")
+	}
+	if strings.TrimSpace(c.YieldProof) != "" && (!c.SupportsYield || !c.YieldVerified) {
+		return fmt.Errorf("yield_proof requires supported, verified yield")
+	}
+	return nil
+}
+
+// ValidateOperatorCapabilities rejects claims that cannot originate from
+// static YAML. Runtime probes are the only authority for verified residency
+// and checkpoint status; configuration may request support, but may not mint
+// proof strings or mark a capability verified.
+func ValidateOperatorCapabilities(c ResidencyCapabilities) error {
+	if c.WarmRAMVerified || c.SessionCheckpointVerified || c.SupportsSessionCheckpoint || c.SupportsYield || c.YieldVerified || strings.TrimSpace(c.WarmRAMVerification) != "" || strings.TrimSpace(c.SessionCheckpointProof) != "" || strings.TrimSpace(c.YieldProof) != "" {
+		return fmt.Errorf("verified residency and checkpoint claims require authoritative runtime proof")
+	}
+	return nil
+}
+
+// CapabilityAliases are the legacy operational fields carried beside the
+// versioned nested capability block. They are inputs to normalization only;
+// callers should use the returned nested contract as the canonical value.
+type CapabilityAliases struct {
+	SupportsModelLifecycle     bool
+	SupportsAcceleratorReclaim bool
+	MaxResidentModels          int
+	WarmRAMSupported           bool
+}
+
+// MergeResidencyCapabilities applies a partial nested capability block over
+// inherited defaults, then reconciles legacy aliases. Compatible truths are
+// preserved. A non-zero MaxResidentModels disagreement is rejected rather
+// than silently choosing a value, because it changes admission semantics.
+func MergeResidencyCapabilities(base, overlay ResidencyCapabilities, aliases CapabilityAliases) (ResidencyCapabilities, error) {
+	if err := validateResidencyEvidence(base); err != nil {
+		return ResidencyCapabilities{}, err
+	}
+	if err := validateResidencyEvidence(overlay); err != nil {
+		return ResidencyCapabilities{}, err
+	}
+	merged := base
+	if base.Version != "" && overlay.Version != "" && base.Version != overlay.Version {
+		return ResidencyCapabilities{}, fmt.Errorf("capability versions %q and %q conflict", base.Version, overlay.Version)
+	}
+	if overlay.Version != "" {
+		merged.Version = overlay.Version
+	}
+	merged.SupportsWarmRAM = base.SupportsWarmRAM || overlay.SupportsWarmRAM || aliases.WarmRAMSupported
+	merged.SupportsModelLifecycle = base.SupportsModelLifecycle || overlay.SupportsModelLifecycle || aliases.SupportsModelLifecycle
+	merged.SupportsAcceleratorReclaim = base.SupportsAcceleratorReclaim || overlay.SupportsAcceleratorReclaim || aliases.SupportsAcceleratorReclaim
+	merged.SupportsYield = base.SupportsYield || overlay.SupportsYield
+	merged.SupportsSessionCheckpoint = base.SupportsSessionCheckpoint || overlay.SupportsSessionCheckpoint
+
+	resident := []int{}
+	for _, value := range []int{base.MaxResidentModels, overlay.MaxResidentModels, aliases.MaxResidentModels} {
+		if value < 0 {
+			return ResidencyCapabilities{}, fmt.Errorf("max_resident_models may not be negative")
+		}
+		if value > 0 {
+			resident = append(resident, value)
+		}
+	}
+	if len(resident) > 0 {
+		merged.MaxResidentModels = resident[0]
+		for _, value := range resident[1:] {
+			if value != merged.MaxResidentModels {
+				return ResidencyCapabilities{}, fmt.Errorf("max_resident_models values conflict")
+			}
+		}
+	}
+
+	// Verified runtime facts are inherited until a new authoritative fact is
+	// supplied. Static callers are rejected separately by ValidateOperatorCapabilities.
+	if overlay.WarmRAMVerified || strings.TrimSpace(overlay.WarmRAMVerification) != "" {
+		merged.WarmRAMVerified = overlay.WarmRAMVerified
+		merged.WarmRAMVerification = overlay.WarmRAMVerification
+	}
+	if overlay.SessionCheckpointVerified || strings.TrimSpace(overlay.SessionCheckpointProof) != "" {
+		merged.SessionCheckpointVerified = overlay.SessionCheckpointVerified
+		merged.SessionCheckpointProof = overlay.SessionCheckpointProof
+	}
+	if overlay.YieldVerified || strings.TrimSpace(overlay.YieldProof) != "" {
+		merged.YieldVerified = overlay.YieldVerified
+		merged.YieldProof = overlay.YieldProof
+	}
+	return merged, nil
+}
+
+// NormalizeAcceleratorCeiling reconciles the legacy outer ceiling with the
+// nested capability advertisement. Zero is the legacy single-accelerator
+// default; a non-zero nested value must agree with the effective outer value.
+func NormalizeAcceleratorCeiling(outer, nested int) (int, error) {
+	if outer < 0 || nested < 0 {
+		return 0, fmt.Errorf("max_accelerators_per_workload may not be negative")
+	}
+	effective := outer
+	if effective == 0 && nested > 0 {
+		effective = nested
+	}
+	if effective == 0 {
+		effective = 1
+	}
+	if outer > 0 && nested != 0 && nested != effective {
+		return 0, fmt.Errorf("max_accelerators_per_workload %d conflicts with nested capability ceiling %d", effective, nested)
+	}
+	return effective, nil
+}
+
+func isResidencyOracle(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "mincore", "os_residency_oracle", "mincore+lock":
+		return true
+	default:
+		return false
+	}
+}
 
 // LocationClass answers "can the controller power-cycle this node?" (§45 #34).
 // It is a capability flag, not an architectural split.
@@ -150,11 +443,15 @@ type LogEntry struct {
 
 // Node is the §32 Node entity plus the desired/observed split from §14.
 type Node struct {
-	ID              string          `json:"id"`
-	Name            string          `json:"name"`
-	LocationClass   LocationClass   `json:"location_class"`
-	PriorityTier    PriorityTier    `json:"priority_tier"`
-	SchedulingState SchedulingState `json:"scheduling_state"`
+	ID                         string                `json:"id"`
+	Name                       string                `json:"name"`
+	CapabilityVersion          string                `json:"capability_version,omitempty"`
+	Capabilities               ResidencyCapabilities `json:"capabilities"`
+	Capacity                   CapacityBudget        `json:"capacity"`
+	MaxAcceleratorsPerWorkload int                   `json:"max_accelerators_per_workload"`
+	LocationClass              LocationClass         `json:"location_class"`
+	PriorityTier               PriorityTier          `json:"priority_tier"`
+	SchedulingState            SchedulingState       `json:"scheduling_state"`
 
 	Desired  Desired  `json:"desired"`
 	Observed Observed `json:"observed"`
@@ -181,13 +478,13 @@ type RuntimeCapabilities struct {
 }
 
 // Accelerator is the §32 Accelerator entity, extended with the live
-// telemetry fields the node agent reports every heartbeat cycle (Phase 1
-// gets these straight from nvidia-smi).
+// telemetry fields the node agent reports every heartbeat cycle.
 type Accelerator struct {
 	ID          string `json:"id"`
 	NodeID      string `json:"node_id"`
 	Vendor      string `json:"vendor"`
 	Model       string `json:"model"`
+	MemoryKind  string `json:"memory_kind,omitempty"`
 	VRAMTotalMB int64  `json:"vram_total_mb"`
 	Driver      string `json:"driver,omitempty"`
 

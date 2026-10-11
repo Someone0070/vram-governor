@@ -16,10 +16,38 @@ log_level: "info"
 location_class: "local"       # local | remote
 power_control_mode: "manual"  # auto | manual | off | dont_touch | external
 
+# Optional per-GPU performance control. This is separate from node power
+# (power_control_mode). Calibrate commands on the actual card before enabling.
+# The controller selects only idle/active and never sends shell or clock values.
+# gpu_performance:
+#   accelerators:
+#     - index: 0
+#       idle_command: ["/usr/bin/nvidia-smi", "-i", "0", "--lock-gpu-clocks=300,450"]
+#       active_command: ["/usr/bin/nvidia-smi", "-i", "0", "--reset-gpu-clocks"]
+
 heartbeat_interval_seconds: 2
 capability_refresh_seconds: 30
 reconnect_min_seconds: 1
 reconnect_max_seconds: 15
+
+# Production LLM checkpointing is fail-closed and disabled by default. Enable
+# only after a live signed pause/save/stop/reload/restore/reuse proof.
+checkpoint:
+  enabled: false
+  proof_exercise_enabled: false
+  root: "/var/lib/vram-governor/checkpoints"
+  max_bytes: 0
+  max_files: 0
+  per_owner_max_bytes: 0
+  per_owner_max_files: 0
+  max_metadata_bytes: 1048576
+  max_output_bytes: 1048576
+  expiry_seconds: 86400
+  cleanup_interval_seconds: 300
+  proof_path: "/var/lib/vram-governor/checkpoints/production-proof.json"
+  # Separate durable node-local issuance high-water. Never place this in a
+  # controller-shared filesystem or rely on process memory for proof epochs.
+  issuance_state_path: "/var/lib/vram-governor/checkpoints/production-proof-issuance.json"
 
 llamacpp:
   servers:

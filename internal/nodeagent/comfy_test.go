@@ -38,6 +38,9 @@ func TestDiscoverComfyUIReportsExistingCapabilitiesOnly(t *testing.T) {
 	if advertisement.Endpoint != cfg.ComfyUI.PublicEndpoint || advertisement.AcceleratorIndex != 2 || advertisement.Version != "0.3.50" {
 		t.Fatalf("bad advertisement: %+v", advertisement)
 	}
+	if advertisement.SupportsAcceleratorReclaim {
+		t.Fatal("native ComfyUI was advertised as authoritative reclaim")
+	}
 	if len(advertisement.Models) != 4 || advertisement.Models[0] != "a.safetensors" || advertisement.Models[2] != "modern.safetensors" {
 		t.Fatalf("models not discovered/sorted: %v", advertisement.Models)
 	}

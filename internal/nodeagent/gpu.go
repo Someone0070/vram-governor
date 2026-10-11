@@ -3,6 +3,7 @@ package nodeagent
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strconv"
@@ -28,11 +29,23 @@ func QueryGPUTelemetry(ctx context.Context) ([]wsproto.AcceleratorTelemetry, err
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
-	if err := cmd.Run(); err != nil {
-		return []wsproto.AcceleratorTelemetry{}, fmt.Errorf("nvidia-smi: %w (stderr: %s)", err, strings.TrimSpace(errBuf.String()))
+	nvidiaErr := cmd.Run()
+	if nvidiaErr == nil {
+		rows, err := parseNvidiaSMICSV(out.String())
+		if err != nil || len(rows) > 0 {
+			return rows, err
+		}
 	}
-
-	return parseNvidiaSMICSV(out.String())
+	// AMD-only nodes have no nvidia-smi. Read the documented amdgpu sysfs
+	// counters rather than treating the machine as GPU-less.
+	amd, amdErr := queryAMDGPUTelemetry(ctx, "/sys/class/drm")
+	if amdErr == nil && len(amd) > 0 {
+		return amd, nil
+	}
+	if nvidiaErr != nil && !errors.Is(nvidiaErr, exec.ErrNotFound) {
+		return nil, fmt.Errorf("nvidia-smi: %w (stderr: %s)", nvidiaErr, strings.TrimSpace(errBuf.String()))
+	}
+	return amd, amdErr
 }
 
 func parseNvidiaSMICSV(csv string) ([]wsproto.AcceleratorTelemetry, error) {
@@ -77,6 +90,8 @@ func parseNvidiaSMICSV(csv string) ([]wsproto.AcceleratorTelemetry, error) {
 		row := wsproto.AcceleratorTelemetry{
 			Index:          idx,
 			Name:           fields[1],
+			Vendor:         "nvidia",
+			MemoryKind:     "dedicated",
 			VRAMTotalMB:    total,
 			VRAMUsedMB:     used,
 			VRAMFreeMB:     free,

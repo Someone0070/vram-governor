@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "sdxl-base-1.0",
+      "publisher": "stabilityai",
+      "repository": "stable-diffusion-xl-base-1.0",
+      "revision": "462165984030d82259a11f4367a4eed129e94a7b",
+      "source_path": "sd_xl_base_1.0.safetensors",
+      "target_directory": "checkpoints",
+      "filename": "sd_xl_base_1.0.safetensors",
+      "bytes": 6938078334,
+      "sha256": "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
+    },
+    {
+      "id": "wan22-ti2v-5b",
+      "publisher": "Comfy-Org",
+      "repository": "Wan_2.2_ComfyUI_Repackaged",
+      "revision": "ee6f4a40737a995bf5818954cfce6d59443b0f04",
+      "source_path": "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+      "target_directory": "diffusion_models",
+      "filename": "wan2.2_ti2v_5B_fp16.safetensors",
+      "bytes": 9999658848,
+      "sha256": "456f901338bd9eadbded3828b819109a9b68e8a525ca5cf8d0049a69fcfeca1e"
+    },
+    {
+      "id": "wan22-umt5-xxl-fp8",
+      "publisher": "Comfy-Org",
+      "repository": "Wan_2.2_ComfyUI_Repackaged",
+      "revision": "ee6f4a40737a995bf5818954cfce6d59443b0f04",
+      "source_path": "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "target_directory": "text_encoders",
+      "filename": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+      "bytes": 6735906897,
+      "sha256": "c3355d30191f1f066b26d93fba017ae9809dce6c627dda5f6a66eaa651204f68"
+    },
+    {
+      "id": "wan22-vae",
+      "publisher": "Comfy-Org",
+      "repository": "Wan_2.2_ComfyUI_Repackaged",
+      "revision": "ee6f4a40737a995bf5818954cfce6d59443b0f04",
+      "source_path": "split_files/vae/wan2.2_vae.safetensors",
+      "target_directory": "vae",
+      "filename": "wan2.2_vae.safetensors",
+      "bytes": 1409400960,
+      "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
+    }
+  ]
+}

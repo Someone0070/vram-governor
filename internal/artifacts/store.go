@@ -18,7 +18,20 @@ import (
 
 type Store interface {
 	Put(context.Context, string, string, string, string, io.Reader) (*domain.Artifact, error)
+	PutWithMetadata(context.Context, PutOptions, io.Reader) (*domain.Artifact, error)
 	Open(context.Context, string) (*domain.Artifact, io.ReadCloser, error)
+}
+
+const MaxArtifactBytes int64 = 2 << 30
+
+type PutOptions struct {
+	OwnerID       string
+	WorkloadID    string
+	Name          string
+	MediaType     string
+	Producer      *domain.ArtifactProducer
+	Media         domain.ArtifactMedia
+	Compatibility *domain.ArtifactCompatibility
 }
 
 // FileStore is the development ArtifactStore. IDs, not caller filenames,
@@ -55,6 +68,10 @@ func (s *FileStore) paths(id string) (string, string, error) {
 }
 
 func (s *FileStore) Put(ctx context.Context, ownerID, workloadID, name, mediaType string, src io.Reader) (*domain.Artifact, error) {
+	return s.PutWithMetadata(ctx, PutOptions{OwnerID: ownerID, WorkloadID: workloadID, Name: name, MediaType: mediaType}, src)
+}
+
+func (s *FileStore) PutWithMetadata(ctx context.Context, options PutOptions, src io.Reader) (*domain.Artifact, error) {
 	id := artifactID()
 	dataPath, metaPath, _ := s.paths(id)
 	temp := dataPath + ".tmp"
@@ -63,7 +80,7 @@ func (s *FileStore) Put(ctx context.Context, ownerID, workloadID, name, mediaTyp
 		return nil, err
 	}
 	h := sha256.New()
-	size, copyErr := io.Copy(io.MultiWriter(f, h), &contextReader{ctx: ctx, reader: io.LimitReader(src, 2<<30)})
+	size, copyErr := io.Copy(io.MultiWriter(f, h), &contextReader{ctx: ctx, reader: io.LimitReader(src, MaxArtifactBytes+1)})
 	closeErr := f.Close()
 	if copyErr != nil {
 		_ = os.Remove(temp)
@@ -73,11 +90,17 @@ func (s *FileStore) Put(ctx context.Context, ownerID, workloadID, name, mediaTyp
 		_ = os.Remove(temp)
 		return nil, closeErr
 	}
+	if size > MaxArtifactBytes {
+		_ = os.Remove(temp)
+		return nil, fmt.Errorf("artifact exceeds %d-byte limit", MaxArtifactBytes)
+	}
 	if err := os.Rename(temp, dataPath); err != nil {
 		_ = os.Remove(temp)
 		return nil, err
 	}
-	artifact := &domain.Artifact{ID: id, OwnerID: ownerID, WorkloadID: workloadID, Name: filepath.Base(name), MediaType: mediaType, Size: size, StorageRef: "file://" + dataPath, SHA256: hex.EncodeToString(h.Sum(nil)), CreatedAt: time.Now().UTC()}
+	digest := hex.EncodeToString(h.Sum(nil))
+	artifact := &domain.Artifact{ID: id, OwnerID: options.OwnerID, WorkloadID: options.WorkloadID, Name: filepath.Base(options.Name), Producer: options.Producer, Media: options.Media, Compatibility: options.Compatibility, MediaType: options.MediaType, Size: size, StorageRef: "file://" + dataPath, SHA256: digest, CreatedAt: time.Now().UTC()}
+	normalizeArtifactMetadata(artifact)
 	metadata, _ := json.Marshal(artifact)
 	if err := os.WriteFile(metaPath, metadata, 0o640); err != nil {
 		_ = os.Remove(dataPath)
@@ -99,11 +122,33 @@ func (s *FileStore) Open(ctx context.Context, id string) (*domain.Artifact, io.R
 	if err := json.Unmarshal(metadata, &artifact); err != nil {
 		return nil, nil, err
 	}
+	normalizeArtifactMetadata(&artifact)
 	f, err := os.Open(dataPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	return &artifact, f, nil
+}
+
+func normalizeArtifactMetadata(artifact *domain.Artifact) {
+	if artifact == nil {
+		return
+	}
+	if artifact.MediaType == "" {
+		artifact.MediaType = artifact.Media.MediaType
+	}
+	if artifact.Size == 0 {
+		artifact.Size = artifact.Media.ByteSize
+	}
+	if artifact.SHA256 == "" {
+		artifact.SHA256 = artifact.Media.SHA256
+	}
+	artifact.Media.MediaType = artifact.MediaType
+	artifact.Media.ByteSize = artifact.Size
+	artifact.Media.SHA256 = artifact.SHA256
+	if artifact.Compatibility != nil {
+		artifact.Compatibility.SourceArtifactID = artifact.ID
+	}
 }
 
 type contextReader struct {

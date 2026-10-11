@@ -9,6 +9,7 @@ unit_path="/etc/systemd/system/${agent_name}.service"
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 controller_url=""
+controller_ca=""
 node_id=""
 node_name=""
 location_class="remote"
@@ -28,6 +29,7 @@ Usage:
 
 Options:
   --controller-url URL          Controller WebSocket URL ending in /ws/node
+  --controller-ca FILE         PEM certificate for a private/self-signed controller
   --node-id ID                 Stable unique node ID
   --node-name NAME             Fleet display name (defaults to hostname)
   --location local|remote      Scheduling locality label (default: remote)
@@ -39,14 +41,16 @@ Options:
   --skip-connectivity-check    Install even if controller/Comfy checks fail
   -h, --help                   Show this help
 
-Secrets are read without echo unless VRAM_NODE_TOKEN and
-VRAM_NODE_COMMAND_SECRET are already set in the environment.
+Set VRAM_NODE_TOKEN for an existing node. For a new node, provide the reusable
+VRAM_ENROLLMENT_TOKEN instead; the installer requests a unique node token.
+VRAM_NODE_COMMAND_SECRET is still required for the signed command channel.
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --controller-url) controller_url=${2:?missing controller URL}; shift 2 ;;
+    --controller-ca) controller_ca=${2:?missing controller CA}; shift 2 ;;
     --node-id) node_id=${2:?missing node ID}; shift 2 ;;
     --node-name) node_name=${2:?missing node name}; shift 2 ;;
     --location) location_class=${2:?missing location}; shift 2 ;;
@@ -100,6 +104,10 @@ fi
 
 [[ "$controller_url" =~ ^wss?://[^/]+(/.*)?$ ]] || { echo "controller URL must be an absolute ws:// or wss:// URL" >&2; exit 2; }
 [[ "$controller_url" == */ws/node ]] || { echo "controller URL must end in /ws/node" >&2; exit 2; }
+if [[ -n "$controller_ca" ]]; then
+  [[ -r "$controller_ca" ]] || { echo "controller CA is not readable" >&2; exit 2; }
+  [[ "$controller_url" == wss://* ]] || { echo "controller CA requires wss://" >&2; exit 2; }
+fi
 [[ "$node_id" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "node ID may contain only letters, digits, dot, underscore, and dash" >&2; exit 2; }
 [[ "$node_name" =~ ^[A-Za-z0-9._[:space:]-]+$ ]] || { echo "node name contains unsupported characters" >&2; exit 2; }
 for value in "$controller_url" "$comfy_endpoint" "$comfy_public_endpoint"; do
@@ -114,10 +122,13 @@ case "$power_mode" in auto|manual|off|dont_touch|external) ;; *) echo "invalid p
 
 node_token=${VRAM_NODE_TOKEN:-}
 command_secret=${VRAM_NODE_COMMAND_SECRET:-}
-if [[ -z "$node_token" && -t 0 ]]; then read -r -s -p "Node credential token: " node_token; echo; fi
+enrollment_token=${VRAM_ENROLLMENT_TOKEN:-}
+if [[ -z "$node_token" && -z "$enrollment_token" && -t 0 ]]; then read -r -s -p "Fleet enrollment token (blank to use an existing node token): " enrollment_token; echo; fi
+if [[ -z "$node_token" && -z "$enrollment_token" && -t 0 ]]; then read -r -s -p "Node credential token: " node_token; echo; fi
 if [[ -z "$command_secret" && -t 0 ]]; then read -r -s -p "Command signing secret: " command_secret; echo; fi
-[[ "$node_token" =~ ^[A-Za-z0-9._~+-]+$ ]] || { echo "node token is missing or contains unsupported characters" >&2; exit 2; }
-[[ "$command_secret" =~ ^[A-Za-z0-9._~+-]{32,}$ ]] || { echo "command signing secret must contain at least 32 safe characters" >&2; exit 2; }
+[[ -n "$node_token" || -n "$enrollment_token" ]] || { echo "node or enrollment token is required" >&2; exit 2; }
+[[ -z "$node_token" || "$node_token" =~ ^[A-Za-z0-9._~+_-]+$ ]] || { echo "node token contains unsupported characters" >&2; exit 2; }
+[[ "$command_secret" =~ ^[A-Za-z0-9._~+_-]{32,}$ ]] || { echo "command signing secret must contain at least 32 safe characters" >&2; exit 2; }
 
 if [[ -n "$comfy_endpoint" ]]; then
   [[ "$comfy_endpoint" =~ ^https?:// ]] || { echo "ComfyUI endpoint must be http:// or https://" >&2; exit 2; }
@@ -129,7 +140,9 @@ if [[ "$skip_checks" != "true" ]]; then
   controller_health=${controller_url/ws:/http:}
   controller_health=${controller_health/wss:/https:}
   controller_health=${controller_health%/ws/node}/healthz
-  curl --fail --silent --show-error --max-time 10 "$controller_health" >/dev/null || {
+  curl_ca_options=()
+  [[ -z "$controller_ca" ]] || curl_ca_options=(--cacert "$controller_ca")
+  curl --fail --silent --show-error --max-time 10 "${curl_ca_options[@]}" "$controller_health" >/dev/null || {
     echo "controller health check failed: $controller_health" >&2
     exit 1
   }
@@ -141,10 +154,30 @@ if [[ "$skip_checks" != "true" ]]; then
   fi
 fi
 
+if [[ -z "$node_token" ]]; then
+  [[ "$controller_url" == wss://* ]] || { echo "self-enrollment requires wss://" >&2; exit 2; }
+  command -v curl >/dev/null && command -v python3 >/dev/null || { echo "curl and python3 are required for self-enrollment" >&2; exit 1; }
+  curl_ca_options=()
+  [[ -z "$controller_ca" ]] || curl_ca_options=(--cacert "$controller_ca")
+  enrollment_url="https://${controller_url#wss://}"
+  enrollment_url="${enrollment_url%/ws/node}/api/v1/nodes/enroll"
+  enrollment_body=$(python3 -c 'import json,sys; print(json.dumps({"node_id":sys.argv[1],"node_name":sys.argv[2]}))' "$node_id" "$node_name")
+  enrollment_response=$(curl --fail --silent --show-error --max-time 15 "${curl_ca_options[@]}" \
+    -H "Authorization: Bearer ${enrollment_token}" -H 'Content-Type: application/json' \
+    --data "$enrollment_body" "$enrollment_url") || { echo "node enrollment failed" >&2; exit 1; }
+  node_token=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["node_token"])' <<<"$enrollment_response")
+  [[ "$node_token" =~ ^[A-Za-z0-9._~+_-]+$ ]] || { echo "controller returned an invalid node token" >&2; exit 1; }
+  unset enrollment_token enrollment_response enrollment_body
+fi
+
 getent group vram-governor >/dev/null || groupadd --system vram-governor
 id vram-governor >/dev/null 2>&1 || useradd --system --gid vram-governor --home-dir "$state_dir" --shell /usr/sbin/nologin vram-governor
 install -d -m 0750 -o root -g vram-governor "$config_dir"
 install -d -m 0750 -o vram-governor -g vram-governor "$state_dir"
+if [[ -n "$controller_ca" ]]; then
+  install -m 0644 -o root -g vram-governor "$controller_ca" "$config_dir/controller-ca.pem"
+  controller_ca="$config_dir/controller-ca.pem"
+fi
 
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 [[ ! -f "${config_dir}/node-agent.yaml" ]] || cp -a "${config_dir}/node-agent.yaml" "${config_dir}/node-agent.yaml.${timestamp}.bak"
@@ -163,6 +196,7 @@ chmod 0640 "${config_dir}/node-agent.env"
 
 cat >"${config_dir}/node-agent.yaml" <<EOF
 controller_url: "${controller_url}"
+controller_ca_file: "${controller_ca}"
 token_env: "VRAM_NODE_TOKEN"
 command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
 command_state_path: "${state_dir}/node-command-state.json"

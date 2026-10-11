@@ -1,0 +1,24 @@
+[Unit]
+Description=Apply allowlisted CMP llama.cpp profile %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=LLAMA_PROFILE_PROBE_MODEL=nanbeige-fast_latest
+ExecStart=/usr/libexec/vram-governor/switch-cmp-llama-profile.sh %i
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/etc/vram-governor
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+TimeoutStartSec=180

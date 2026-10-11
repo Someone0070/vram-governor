@@ -55,6 +55,22 @@ func TestAdminBrowserSessionIsIndependentFromUISession(t *testing.T) {
 	if allowed.Code != http.StatusOK {
 		t.Fatalf("admin cookie rejected: %d %s", allowed.Code, allowed.Body.String())
 	}
+	for _, path := range []string{"/nodes", "/api/v1/workloads"} {
+		uiRequest := httptest.NewRequest(http.MethodGet, path, nil)
+		uiRequest.AddCookie(adminCookies[0])
+		uiResponse := httptest.NewRecorder()
+		handler.ServeHTTP(uiResponse, uiRequest)
+		if uiResponse.Code == http.StatusUnauthorized || uiResponse.Code == http.StatusForbidden {
+			t.Fatalf("admin cookie rejected by %s: %d %s", path, uiResponse.Code, uiResponse.Body.String())
+		}
+	}
+	identityRequest := httptest.NewRequest(http.MethodGet, "/auth/whoami", nil)
+	identityRequest.AddCookie(adminCookies[0])
+	identity := httptest.NewRecorder()
+	handler.ServeHTTP(identity, identityRequest)
+	if identity.Code != http.StatusOK || !strings.Contains(identity.Body.String(), `"plane":"admin"`) {
+		t.Fatalf("admin session not recognized across tabs: %d %s", identity.Code, identity.Body.String())
+	}
 }
 
 func TestDevelopmentBypassCreatesProtectedSessionsOnlyOnAdmittedNetworks(t *testing.T) {
@@ -97,6 +113,51 @@ func TestDevelopmentBypassCreatesProtectedSessionsOnlyOnAdmittedNetworks(t *test
 	handler.ServeHTTP(public, publicRequest)
 	if public.Code != http.StatusUnauthorized {
 		t.Fatalf("public client received bypass session: %d %s", public.Code, public.Body.String())
+	}
+}
+
+func TestPasswordlessAdminLANOnlyCreatesAdminBrowserSession(t *testing.T) {
+	srv, _, cancel := testServer(t)
+	defer cancel()
+	srv.cfg.Auth.PasswordlessAdminLAN = true
+	handler := srv.Handler()
+	login := func(addr, kind string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"kind":"`+kind+`"}`))
+		req.RemoteAddr = addr
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, req)
+		return response
+	}
+	if got := login("203.0.113.8:1234", "admin"); got.Code != http.StatusUnauthorized {
+		t.Fatalf("public network obtained passwordless admin: %d", got.Code)
+	}
+	if got := login("127.0.0.1:1234", "ui"); got.Code != http.StatusUnauthorized {
+		t.Fatalf("UI login accepted passwordless admin bypass: %d", got.Code)
+	}
+	admin := login("127.0.0.1:1234", "admin")
+	if admin.Code != http.StatusOK || len(admin.Result().Cookies()) != 1 {
+		t.Fatalf("LAN admin login failed: %d %s", admin.Code, admin.Body.String())
+	}
+	cookie := admin.Result().Cookies()[0]
+	if cookie.Name != adminSessionCookie {
+		t.Fatalf("unexpected cookie: %s", cookie.Name)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/admin/api/overview", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("passwordless admin session unusable: %d %s", response.Code, response.Body.String())
+	}
+	srv.cfg.Auth.PasswordlessAdminLAN = false
+	request = httptest.NewRequest(http.MethodGet, "/admin/api/overview", nil)
+	request.RemoteAddr = "127.0.0.1:1234"
+	request.AddCookie(cookie)
+	response = httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("passwordless session survived feature disable: %d", response.Code)
 	}
 }
 

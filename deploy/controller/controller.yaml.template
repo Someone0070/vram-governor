@@ -1,0 +1,209 @@
+# Dedicated controller/load-balancer configuration.
+# Render every double-underscore placeholder before installation. Never place raw bearer
+# tokens in this file; token_sha256 contains only SHA-256 digests.
+listen_addr: ":8443"
+log_level: "info"
+production: true
+tls_cert_file: "/etc/vram-governor/tls/controller.crt"
+tls_key_file: "/etc/vram-governor/tls/controller.key"
+# Local PostgreSQL on the dedicated controller host, authenticated as the
+# vram-governor service account through peer auth.
+database_url: "postgresql:///vram_governor?host=/var/run/postgresql"
+
+auth:
+  shared_token: ""
+  development_bypass: false
+  # Temporary, explicitly opt-in Fleet login without a token on admin_private_cidrs.
+  # Anyone on that management LAN can administer the fleet while enabled.
+  passwordless_admin_lan: false
+  command_signing_secret: ""
+  command_signing_secret_env: "VRAM_NODE_COMMAND_SECRET"
+  # Narrow this to the actual management VLAN before installation.
+  admin_private_cidrs: ["__ADMIN_PRIVATE_CIDR__"]
+  credentials:
+    - id: "rtx3080-node"
+      token_sha256: "__RTX3080_NODE_TOKEN_SHA256__"
+      plane: "node"
+      owner_id: "system"
+      node_id: "rtx3080-node"
+      scopes: ["node:connect", "node:report"]
+      adapters: ["llamacpp", "comfy"]
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "rtx3090-node"
+      token_sha256: "__RTX3090_NODE_TOKEN_SHA256__"
+      plane: "node"
+      owner_id: "system"
+      node_id: "rtx3090-node"
+      scopes: ["node:connect", "node:report"]
+      adapters: ["llamacpp", "comfy"]
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "cmp170-node"
+      token_sha256: "__CMP170_NODE_TOKEN_SHA256__"
+      plane: "node"
+      owner_id: "system"
+      node_id: "cmp170-node"
+      scopes: ["node:connect", "node:report"]
+      adapters: ["llamacpp", "comfy"]
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "fleet-enrollment"
+      token_sha256: "__FLEET_ENROLLMENT_TOKEN_SHA256__"
+      plane: "enrollment"
+      owner_id: "system"
+      scopes: ["node:enroll"]
+      adapters: []
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "780m-node"
+      token_sha256: "__NODE_780M_TOKEN_SHA256__"
+      plane: "node"
+      owner_id: "system"
+      node_id: "780m-node"
+      scopes: ["node:connect", "node:report"]
+      adapters: ["llamacpp", "comfy"]
+      max_priority: 0
+      egress_policy: "local_only"
+    - id: "interactive-ui"
+      token_sha256: "__INTERACTIVE_UI_TOKEN_SHA256__"
+      plane: "ui"
+      owner_id: "home"
+      scopes: ["workloads:submit", "workloads:read", "workloads:cancel", "workloads:approve", "workloads:reprioritize", "events:read", "inference:submit", "comfy:submit", "comfy:read", "comfy:cancel", "artifacts:write", "artifacts:read"]
+      adapters: ["llamacpp", "comfy", "openrouter"]
+      max_priority: 60
+      concurrency_limit: 4
+      preemption_budget: 1
+      egress_policy: "sanitized_cloud"
+    - id: "workflow-runner"
+      token_sha256: "__WORKFLOW_TOKEN_SHA256__"
+      plane: "workflow"
+      owner_id: "home"
+      scopes: ["workloads:submit", "workloads:read", "workloads:cancel", "events:read", "inference:submit", "comfy:submit", "comfy:read", "comfy:cancel", "artifacts:write", "artifacts:read"]
+      adapters: ["llamacpp", "comfy", "openrouter"]
+      max_priority: 50
+      concurrency_limit: 8
+      preemption_budget: 0
+      egress_policy: "sanitized_cloud"
+    - id: "comfy-mcp"
+      token_sha256: "__COMFY_MCP_TOKEN_SHA256__"
+      plane: "mcp"
+      owner_id: "home"
+      scopes: ["workloads:submit", "workloads:read", "workloads:cancel", "events:read", "comfy:submit", "comfy:read", "comfy:cancel", "artifacts:write", "artifacts:read"]
+      adapters: ["comfy"]
+      max_priority: 60
+      concurrency_limit: 4
+      preemption_budget: 1
+      egress_policy: "local_only"
+    - id: "system-monitor"
+      token_sha256: "__SYSTEM_AGENT_TOKEN_SHA256__"
+      plane: "agent"
+      owner_id: "home"
+      scopes: ["incidents:create", "incidents:read", "incidents:propose", "incidents:escalate", "agent:events", "workloads:read", "artifacts:read"]
+      adapters: ["llamacpp", "openrouter"]
+      max_priority: 70
+      concurrency_limit: 2
+      preemption_budget: 1
+      max_incident_severity: "S2"
+      egress_policy: "sanitized_cloud"
+    - id: "operator"
+      token_sha256: "__ADMIN_TOKEN_SHA256__"
+      plane: "admin"
+      owner_id: "home"
+      scopes: ["*"]
+      adapters: ["*"]
+      max_priority: 100
+      preemption_budget: 10
+      max_incident_severity: "S4"
+      egress_policy: "cloud_allowed"
+
+notifications:
+  enabled: false
+  signing_secret: ""
+  signing_secret_env: "VRAM_WEBHOOK_SIGNING_SECRET"
+  allowed_hosts: []
+  allowed_private_cidrs: []
+  allow_http: false
+  max_attempts: 8
+  base_retry_seconds: 1
+  request_timeout_seconds: 10
+  dispatch_interval_seconds: 1
+
+# User-confirmed CMP170 outlet. Telemetry only: never issue relay commands
+# from the controller while this rig is live.
+smart_plugs:
+  - node_id: "cmp170-node"
+    url: "http://10.0.0.222"
+    control_enabled: false
+
+workloads:
+  lease_ttl_seconds: 30
+  # A model may use all slots on one card, but cannot fan out across cards
+  # unless an explicit per-model override raises this ceiling.
+  default_max_accelerators_per_model: 1
+  model_capacity_policies: []
+  artifact_root: "/var/lib/vram-governor/artifacts"
+  artifact_store:
+    type: "s3"
+    endpoint: "__S3_HTTPS_ENDPOINT__"
+    bucket: "__S3_BUCKET__"
+    region: "__S3_REGION__"
+    prefix: "vram-governor"
+    access_key_env: "VRAM_S3_ACCESS_KEY"
+    secret_key_env: "VRAM_S3_SECRET_KEY"
+    session_token_env: "VRAM_S3_SESSION_TOKEN"
+  residency:
+    enabled: true
+    reconcile_seconds: 10
+    idle_unload_seconds: 900
+    min_residency_seconds: 300
+    transition_timeout_seconds: 120
+    quiet_hours_start: ""
+    quiet_hours_end: ""
+  # Native LLM and ComfyUI targets are discovered by node agents. Only the
+  # cooperative managed-video harness requires a static controller target.
+  targets:
+    - id: "cmp170-video-managed"
+      adapter: "comfy"
+      runtime_protocol: "managed_comfy_v1"
+      endpoint: "__CMP170_MANAGED_HTTPS_ENDPOINT__"
+      authorization_env: "VRAM_MANAGED_COMFY_AUTHORIZATION"
+      accelerator_id: "cmp170-node-gpu0"
+      models: ["__CMP170_VIDEO_MODEL__"]
+      custom_nodes: ["ManagedVideoSequence"]
+      slots: 1
+      workload_class: "video"
+      vram_reserve_mb: 2048
+      sharing_enabled: false
+      guarded_exploration: false
+      max_slowdown: 1.35
+      safety_critical: false
+      enabled: true
+    - id: "openrouter-safety-net"
+      adapter: "openrouter"
+      endpoint: "https://openrouter.ai/api"
+      authorization_env: "OPENROUTER_AUTHORIZATION"
+      cloud: true
+      models: ["__OPENROUTER_MODEL__"]
+      provider: "__OPENROUTER_PROVIDER__"
+      slots: 8
+      quarantined: true
+      enabled: false
+
+agents:
+  allowed_cloud_providers: []
+  allowed_cloud_models: []
+  quarantined_models: []
+  local_verifier_models: []
+  paid_emergency_fallback: false
+  monitor_node_loss: true
+
+liveness:
+  heartbeat_interval_seconds: 2
+  suspect_after_seconds: 6
+  lost_after_seconds: 15
+
+jobs:
+  lease_ttl_seconds: 10
+  reaper_interval_millis: 500
+  default_max_attempts: 8

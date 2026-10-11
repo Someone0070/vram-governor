@@ -73,7 +73,7 @@ function Chat() {
     const controller=new AbortController();abortRef.current=controller;
     let assistant="";
     try {
-      const response=await fetch("/v1/chat/completions",{method:"POST",credentials:"same-origin",signal:controller.signal,headers:{"Content-Type":"application/json","X-CSRF-Token":sessionStorage.getItem("vg_csrf_ui")||""},body:JSON.stringify({model,messages:requestMessages,max_completion_tokens:maxOutput,stream:true,governor:{context_tokens:contextTokens,placement_key:placementKey,placement_policy:"sticky"}})});
+      const response=await fetch("/v1/chat/completions",{method:"POST",credentials:"same-origin",signal:controller.signal,headers:{"Content-Type":"application/json","X-CSRF-Token":sessionStorage.getItem("vg_csrf_admin")||sessionStorage.getItem("vg_csrf_ui")||""},body:JSON.stringify({model,messages:requestMessages,max_completion_tokens:maxOutput,stream:true,governor:{context_tokens:contextTokens,placement_key:placementKey,placement_policy:"sticky"}})});
       if(!response.ok){const body=await response.json().catch(()=>({}));const alternatives=body.admission?.alternatives as string[]|undefined;const detail=body.error?.message||body.error||`Request failed (${response.status})`;throw new Error(alternatives?.length&&!String(detail).includes(alternatives[0])?`${detail}: ${alternatives.join("; ")}`:detail)}
       if(!response.body)throw new Error("Streaming response unavailable");
       const reader=response.body.getReader();const decoder=new TextDecoder();let buffer="";

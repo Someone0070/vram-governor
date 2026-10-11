@@ -1,5 +1,9 @@
 # Live verification — 2026-08-26
 
+> **Historical evidence:** This report describes the former WSL acceptance
+> environment, not the current fleet topology. The controller/load balancer now
+> belongs on its own machine; WSL is not an architectural requirement.
+
 This report counts only observations from the deployed WSL stack. Unit tests,
 HTTP test servers, mock adapters, and deterministic scheduler tests are useful
 regression gates but are **not** counted as live acceptance evidence here.
@@ -80,5 +84,5 @@ These are not passes:
 6. Comfy binary preview frames no longer terminate native progress observation; terminal workloads retain their last node/current/total counters.
 7. Runtime target safety policy is durably recovered for targets discovered after controller startup.
 
-The current deployment is a useful exclusive-scheduling dual-workload system,
+The then-current deployment was a useful exclusive-scheduling dual-workload system,
 not the complete A–Z roadmap. The unavailable rows above remain release gates.

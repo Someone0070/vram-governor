@@ -42,7 +42,10 @@ func TestLivenessObserverCreatesOneNodeLossIncidentAndVerifiesRecovery(t *testin
 		t.Fatalf("node was not marked lost: %+v", node.Observed)
 	}
 
-	reconnected := srv.registerNode(ctx, wsproto.RegisterPayload{NodeID: "gpu-node", NodeName: "test GPU node", LocationClass: "local", PowerControlMode: "manual"})
+	reconnected, err := srv.registerNode(ctx, wsproto.RegisterPayload{NodeID: "gpu-node", NodeName: "test GPU node", LocationClass: "local", PowerControlMode: "manual"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if reconnected.Observed.Connectivity != domain.ConnectivityConnected || reconnected.SchedulingState != domain.SchedulingDraining || reconnected.Desired.SchedulingEnabled {
 		t.Fatalf("reconnect erased durable node intent: %+v", reconnected)
 	}

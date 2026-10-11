@@ -1,7 +1,7 @@
 param(
   [ValidateSet('amd64','arm64')]
   [string]$Architecture = 'amd64',
-  [string]$Version = '1.1.0',
+  [string]$Version = '1.2.0',
   [string]$OutputDirectory = '.cache/releases'
 )
 
@@ -50,7 +50,19 @@ try {
   Copy-Item (Join-Path $repository 'packaging/node-agent/install.sh') $stage
   Copy-Item (Join-Path $repository 'packaging/node-agent/uninstall.sh') $stage
   Copy-Item (Join-Path $repository 'packaging/node-agent/README.txt') $stage
+  $docsStage = Join-Path $stage 'docs'
+  New-Item -ItemType Directory -Path $docsStage -Force | Out-Null
+  foreach ($name in @('llamacpp-node-setup.md', 'connect-gpu-nodes-to-lb.md', 'ollama-multi-profile.md')) {
+    Copy-Item (Join-Path $repository "docs/$name") $docsStage
+  }
   Copy-Item (Join-Path $repository 'deploy/vram-governor-node-agent.service') $stage
+  $profileStage = Join-Path $stage 'runtime-profile'
+  New-Item -ItemType Directory -Path $profileStage -Force | Out-Null
+  Copy-Item (Join-Path $repository 'deploy/ollama/switch-runtime-profile.sh') $profileStage
+  Copy-Item (Join-Path $repository 'deploy/ollama/vram-runtime-profile-switch@.service') $profileStage
+  Copy-Item (Join-Path $repository 'deploy/ollama/90-vram-runtime-profile-switch.rules') $profileStage
+  Copy-Item (Join-Path $repository 'deploy/ollama/ctx-8k.env.example') $profileStage
+  Copy-Item (Join-Path $repository 'deploy/ollama/ctx-32k.env.example') $profileStage
 
   tar.exe -czf $archive -C $stageRoot $packageName
   if ($LASTEXITCODE -ne 0) { throw 'tar archive creation failed' }
