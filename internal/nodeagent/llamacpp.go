@@ -135,7 +135,10 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 		CapabilitiesVerified bool     `json:"capabilities_verified"`
 		RuntimeArgs          []string `json:"runtime_args"`
 		MeasurementSchema    string   `json:"measurement_schema"`
-	}{models, hex.EncodeToString(modelHash[:]), contextLimit, slots, capacitySource, verified, cfg.RuntimeArgs, "runtime-envelope-v1"})
+	}{models, hex.EncodeToString(modelHash[:]), contextLimit, slots, "", false, cfg.RuntimeArgs, "runtime-envelope-v2"})
+	// Capacity provenance (configured fallback vs runtime /slots) changes
+	// whenever a router loads or unloads a model; it is measurement metadata,
+	// not runtime identity, so it is excluded from the capability version.
 	capabilityHash := sha256.Sum256(capabilityMaterial)
 	runtimeProfiles := make([]wsproto.RuntimeProfileAdvertisement, 0, len(cfg.RuntimeProfiles))
 	activeRuntimeProfile := ""

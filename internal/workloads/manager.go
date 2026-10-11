@@ -1561,6 +1561,29 @@ func (m *Manager) RegisterTarget(target Target) {
 // endpoint, provider, pricing, auth, queue, and custom-node facts. Only the
 // controller's transient Active/circuit telemetry is excluded. Authorization
 // is included in the hash but never emitted/logged.
+// lifecycleRouteFingerprint identifies the physical route a lifecycle
+// operation acted on. It deliberately omits facts the operation itself is
+// expected to change (resident models, queue depth, capacity provenance) so
+// a successful load/unload/reclaim does not invalidate its own result.
+func lifecycleRouteFingerprint(target Target) string {
+	models := append([]string(nil), target.Models...)
+	sort.Strings(models)
+	material, _ := json.Marshal(struct {
+		ID, NodeID, Adapter, RuntimeProtocol, Endpoint, AcceleratorID, ModelFingerprint string
+		Cloud, Enabled                                                               bool
+		Models                                                                       []string
+	}{target.ID, target.NodeID, target.Adapter, target.RuntimeProtocol, target.Endpoint, target.AcceleratorID, target.ModelFingerprint, target.Cloud, target.Enabled, models})
+	digest := sha256.Sum256(material)
+	return hex.EncodeToString(digest[:])
+}
+
+// lifecycleRouteStable reports whether the registered target is still the
+// same physical route as the snapshot a lifecycle operation was issued for.
+func (m *Manager) lifecycleRouteStable(expected Target) bool {
+	current := m.targetByID(expected.ID)
+	return current.ID != "" && lifecycleRouteFingerprint(current) == lifecycleRouteFingerprint(expected)
+}
+
 func targetExecutionFingerprint(target Target) string {
 	snapshot := target
 	snapshot.Active = 0

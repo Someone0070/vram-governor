@@ -1772,7 +1772,7 @@ func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleA
 			}
 		}
 	}
-	if err == nil && !m.targetFenceMatches(target, targetGeneration) {
+	if err == nil && !m.targetFenceMatches(target, targetGeneration) && !m.lifecycleRouteStable(target) {
 		// The runtime result is now stale. Preserve only a durable reconciling
 		// transition; never apply its tier or bytes to a replacement target.
 		transition.Status = domain.ResidencyTransitionRunning
@@ -2061,7 +2061,7 @@ func (m *Manager) transitionRuntimeCache(ctx context.Context, reclaimer Accelera
 			observation, err = observer.ReclaimAcceleratorObserved(transitionCtx, target, transition.FencingToken)
 		}
 	}
-	if err == nil && !m.targetFenceMatches(target, targetGeneration) {
+	if err == nil && !m.targetFenceMatches(target, targetGeneration) && !m.lifecycleRouteStable(target) {
 		transition.Status = domain.ResidencyTransitionRunning
 		transition.Error = "reconciling: transition target changed during external operation"
 		m.persistResidencyTransition(context.Background(), transition)
