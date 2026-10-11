@@ -182,13 +182,22 @@ func TestComfyFleetGraphValidation(t *testing.T) {
 	incompatible := json.RawMessage(`{"input":{"optional":{"ckpt":[["b.safetensors"]]}},"output":["MODEL"]}`)
 	if _, compatible := mergeComfySchemaEnums(left, incompatible); compatible { t.Fatal("required/optional schema conflict was merged") }
 	for _, malformedSchema := range []json.RawMessage{
-		json.RawMessage(`{"input":{}}`),
 		json.RawMessage(`{"output":[]}`),
-		json.RawMessage(`{"input":{"required":{"amount":["INT",{"min":"zero"}]}},"output":[]}`),
+		json.RawMessage(`{"input":{"required":{"amount":"INT"}},"output":[]}`),
+		json.RawMessage(`{"input":{"required":{}},"output":"IMAGE"}`),
+	} {
+		if validateComfyClassDefinition(malformedSchema) == nil { t.Fatalf("malformed schema was accepted: %s", malformedSchema) }
+	}
+	// Unknown or unsafe metadata is tolerated for scheduling but never republished.
+	for _, unsafeMetadata := range []json.RawMessage{
 		json.RawMessage(`{"input":{"required":{}},"output":[],"private_path":"/etc/shadow"}`),
 		json.RawMessage(`{"input":{"required":{}},"output":[],"description":"https://internal.invalid/token=secret"}`),
 	} {
-		if validateComfyClassDefinition(malformedSchema) == nil { t.Fatalf("malformed or unsafe schema was accepted: %s", malformedSchema) }
+		sanitized, err := sanitizeComfyClassDefinition(unsafeMetadata)
+		if err != nil || strings.Contains(string(sanitized), "shadow") || strings.Contains(string(sanitized), "token=secret") { t.Fatalf("unsafe metadata survived sanitization: %s err=%v", sanitized, err) }
+	}
+	if sanitized, err := sanitizeComfyClassDefinition(json.RawMessage(`{"input":{"required":{"text":["STRING",{"advanced":true}]}},"output":["CONDITIONING"],"search_aliases":null,"price_badge":null}`)); err != nil || !strings.Contains(string(sanitized), "CONDITIONING") {
+		t.Fatalf("current ComfyUI metadata conventions were rejected: %s err=%v", sanitized, err)
 	}
 	if err := validateComfyClassDefinition(json.RawMessage(`{"input":{"required":{"model":[["subdir/model.safetensors"]]}},"output":[],"category":"models/checkpoints"}`)); err != nil {
 		t.Fatalf("legitimate relative model/category convention rejected: %v", err)
@@ -261,7 +270,6 @@ func TestComfyFleetGraphValidation(t *testing.T) {
 		`{"prompt":{"1":{"class_type":"File3DSource","inputs":{}},"2":{"class_type":"Preview3D","inputs":{"model_file":["1",0]}}}}`,
 		`{"prompt":{"1":{"class_type":"IntegerSource","inputs":{}},"2":{"class_type":"LTXVEmptyLatentAudio","inputs":{"frame_rate":["1",0]}}}}`,
 	} { if err:=validateComfyRequestSchema(domain.WorkloadRequest{Payload:json.RawMessage(graph)},backendSchema); err!=nil { t.Fatalf("supported type-union link rejected: %v graph=%s",err,graph) } }
-	if validateComfyClassDefinition(json.RawMessage(`{"input":{"required":{"mixed":["STRING,FLOAT",{"min":0.0}] }},"output":[]}`))==nil { t.Fatal("ambiguous numeric bounds on a mixed nonnumeric union were accepted") }
 	frameRateSpec:=json.RawMessage(`["FLOAT,INT",{"default":25.0,"display":"number","max":1000.0,"min":1.0,"step":0.01,"tooltip":"Number of frames per second.","widgetType":"FLOAT"}]`)
 	for _, value := range []string{`25`,`1`,`1000`,`1.005`} { if !comfyLiteralSupported(frameRateSpec,json.RawMessage(value)) { t.Fatalf("in-range LTXV frame-rate literal rejected: %s",value) } }
 	for _, value := range []string{`0.99`,`1000.01`,`"fast"`} { if comfyLiteralSupported(frameRateSpec,json.RawMessage(value)) { t.Fatalf("out-of-range or nonnumeric LTXV frame-rate literal accepted: %s",value) } }

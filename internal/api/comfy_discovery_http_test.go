@@ -179,7 +179,7 @@ func TestComfyFleetDiscoveryConflictsAndStats(t *testing.T) {
 		unsafeManager.RegisterTarget(workloads.Target{ID:"unsafe",Adapter:"comfy",Endpoint:backend.URL,Enabled:true})
 		request:=httptest.NewRequest(http.MethodGet,"/object_info",nil); request.Header.Set("Authorization","Bearer comfy-reader-token")
 		recorder:=httptest.NewRecorder(); unsafeServer.mux.ServeHTTP(recorder,request)
-		if recorder.Code!=http.StatusServiceUnavailable || containsDiscoveryText(recorder.Body.String(),"backend-token") { t.Fatalf("unsafe schema metadata leaked or was accepted: %d %s",recorder.Code,recorder.Body.String()) }
+		if recorder.Code!=http.StatusOK || containsDiscoveryText(recorder.Body.String(),"backend-token") || containsDiscoveryText(recorder.Body.String(),"private_path") { t.Fatalf("unsafe schema metadata leaked or class was dropped: %d %s",recorder.Code,recorder.Body.String()) }
 	})
 	t.Run("compatible live enum choices compose", func(t *testing.T) {
 		unionServer, unionManager, unionCleanup := testServer(t)

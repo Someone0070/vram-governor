@@ -270,7 +270,11 @@ func (m *Manager) ComfyFleetDiscovery(ctx context.Context, egress string) (Comfy
 				result.err = errComfyDiscoveryUnavailable
 			}
 			if result.err == nil {
-				for name, class := range result.info { if !safeComfyClassName(name) || validateComfyClassDefinition(class) != nil { result.err = errComfyDiscoveryUnavailable; break } }
+				for name, class := range result.info {
+					sanitized, err := sanitizeComfyClassDefinition(class)
+					if !safeComfyClassName(name) || err != nil { delete(result.info, name); continue }
+					result.info[name] = sanitized
+				}
 			}
 			if result.err == nil && !m.ComfyTargetStillCurrent(target) { result.err = errComfyDiscoveryUnavailable }
 			results[i] = result
@@ -444,10 +448,17 @@ func (m *Manager) ComfySchema(ctx context.Context, expected Target, generation u
 	if err != nil { return comfySchemaProof{}, err }
 	var schema map[string]json.RawMessage
 	if json.Unmarshal(body, &schema) != nil || schema == nil || len(schema) > 4096 { return comfySchemaProof{}, errComfyDiscoveryUnavailable }
+	// ComfyUI adds node metadata fields release by release. A class this
+	// controller cannot fully validate is left out of the usable catalog
+	// rather than poisoning every other class; a graph that references it
+	// is then rejected as "not installed".
+	usable := make(map[string]json.RawMessage, len(schema))
 	for className, classDefinition := range schema {
-		if !safeComfyClassName(className) || validateComfyClassDefinition(classDefinition) != nil { return comfySchemaProof{}, errComfyDiscoveryUnavailable }
+		if safeComfyClassName(className) && validateComfyClassDefinition(classDefinition) == nil {
+			usable[className] = classDefinition
+		}
 	}
-	if err := validateComfyRequestSchema(request, schema); err != nil { return comfySchemaProof{}, err }
+	if err := validateComfyRequestSchema(request, usable); err != nil { return comfySchemaProof{}, err }
 	m.mu.RLock()
 	current, ok := m.targets[expected.ID]
 	currentGeneration := m.targetGenerations[expected.ID]
@@ -507,28 +518,27 @@ type comfyClass struct {
 }
 
 func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]json.RawMessage) error {
-	if len(graph) == 0 || len(graph) > 10000 { return errComfyDiscoveryUnavailable }
+	if len(graph) == 0 || len(graph) > 10000 { return fmt.Errorf("%w: graph has %d nodes", errComfyDiscoveryUnavailable, len(graph)) }
 	nodes := make(map[string]comfyNode, len(graph))
 	classes := make(map[string]comfyClass, len(graph))
 	for id, raw := range graph {
-		if len(id) == 0 || len(id) > 256 || len(raw) > 1<<20 || !boundedComfyJSONDepth(raw, 16) { return errComfyDiscoveryUnavailable }
+		if len(id) == 0 || len(id) > 256 || len(raw) > 1<<20 || !boundedComfyJSONDepth(raw, 16) { return comfyGraphError(1, id) }
 		var node comfyNode
-		if json.Unmarshal(raw, &node) != nil || !safeComfyClassName(node.Class) || node.Inputs == nil || len(node.Inputs) > 2048 { return errComfyDiscoveryUnavailable }
+		if json.Unmarshal(raw, &node) != nil || !safeComfyClassName(node.Class) || node.Inputs == nil || len(node.Inputs) > 2048 { return comfyGraphError(2, id) }
 		classRaw, ok := schemas[node.Class]
-		if !ok { return errComfyDiscoveryUnavailable }
+		if !ok { return comfyGraphError(3, id) }
 		var class comfyClass
-		if json.Unmarshal(classRaw, &class) != nil || class.Input == nil { return errComfyDiscoveryUnavailable }
-		if err := validateComfyClassDefinition(classRaw); err != nil { return err }
+		if json.Unmarshal(classRaw, &class) != nil || class.Input == nil { return comfyGraphError(4, id) }
 		nodes[id], classes[id] = node, class
 	}
-	if len(nodes) == 0 { return errComfyDiscoveryUnavailable }
+	if len(nodes) == 0 { return fmt.Errorf("%w: graph has no nodes", errComfyDiscoveryUnavailable) }
 	edges := make(map[string][]string, len(nodes))
 	for id, node := range nodes {
 		class := classes[id]
 		required, optional := class.Input["required"], class.Input["optional"]
 		allowedInputs := make(map[string]json.RawMessage, len(required)+len(optional))
 		dynamicInputOwner := make(map[string]string)
-		for name, spec := range required { allowedInputs[name] = spec; if _, exists := node.Inputs[name]; !exists { return errComfyDiscoveryUnavailable } }
+		for name, spec := range required { allowedInputs[name] = spec; if _, exists := node.Inputs[name]; !exists { return comfyGraphError(5, id+"."+name) } }
 		for name, spec := range optional { allowedInputs[name] = spec }
 		// Expand selected conditional schemas to a bounded fixed point. Iteration order
 		// is deliberately irrelevant: every selected dynamic input is revisited until
@@ -540,27 +550,30 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 				if !exists { continue }
 				childRequired, childOptional, dynamic, selected := comfyDynamicChildInputsExact(spec, value)
 				if !dynamic { continue }
-				if !selected { return errComfyDiscoveryUnavailable }
+				if !selected { return comfyGraphError(6, id+"."+name) }
 				for childName, childSpec := range childRequired {
-					if old, exists := allowedInputs[childName]; exists {
-						if dynamicInputOwner[childName] != name || !bytes.Equal(old, childSpec) { return errComfyDiscoveryUnavailable }
-					} else { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
-					if _, exists := node.Inputs[childName]; !exists { return errComfyDiscoveryUnavailable }
+					// A selected dynamic option refines a same-named static input
+					// (ComfyUI V3 keeps a static fallback, e.g. SaveVideo.codec); only
+					// two different dynamic owners of one child are a conflict.
+					if old, exists := allowedInputs[childName]; exists && dynamicInputOwner[childName] != "" {
+						if dynamicInputOwner[childName] != name || !bytes.Equal(old, childSpec) { return comfyGraphError(7, id+"."+childName) }
+					} else if !exists || dynamicInputOwner[childName] == "" && !bytes.Equal(old, childSpec) { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
+					if _, exists := node.Inputs[childName]; !exists { return comfyGraphError(8, id+"."+childName) }
 				}
 				for childName, childSpec := range childOptional {
-					if old, exists := allowedInputs[childName]; exists {
-						if dynamicInputOwner[childName] != name || !bytes.Equal(old, childSpec) { return errComfyDiscoveryUnavailable }
-					} else { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
+					if old, exists := allowedInputs[childName]; exists && dynamicInputOwner[childName] != "" {
+						if dynamicInputOwner[childName] != name || !bytes.Equal(old, childSpec) { return comfyGraphError(9, id+"."+childName) }
+					} else if !exists || dynamicInputOwner[childName] == "" && !bytes.Equal(old, childSpec) { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
 				}
 			}
 			if !changed { break }
-			if round == len(node.Inputs) { return errComfyDiscoveryUnavailable }
+			if round == len(node.Inputs) { return comfyGraphError(10, id) }
 		}
 		for name, value := range node.Inputs {
 			spec, exists := allowedInputs[name]
-			if !exists { return errComfyDiscoveryUnavailable }
+			if !exists { return comfyGraphError(11, id+"."+name) }
 			if comfySchemaMultiselect(spec) {
-				if !comfyLiteralSupported(spec, value) { return errComfyDiscoveryUnavailable }
+				if !comfyLiteralSupported(spec, value) { return comfyGraphError(12, id+"."+name) }
 				continue
 			}
 			var link []json.RawMessage
@@ -570,20 +583,20 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 				if linkLike {
 					var outputNumber json.Number
 					if len(link) != 2 || producerID == "" || json.Unmarshal(link[1], &outputNumber) != nil || outputNumber == "" {
-						return errComfyDiscoveryUnavailable
+						return comfyGraphError(13, id+"."+name)
 					}
 					outputIndex64, parseErr := strconv.ParseInt(string(outputNumber), 10, 32)
-					if parseErr != nil || outputIndex64 < 0 { return errComfyDiscoveryUnavailable }
+					if parseErr != nil || outputIndex64 < 0 { return comfyGraphError(14, id+"."+name) }
 					outputIndex := int(outputIndex64)
 					producerClass, ok := classes[producerID]
-					if !ok || outputIndex >= len(producerClass.Output) || !comfyInputAccepts(spec, producerClass.Output[outputIndex]) { return errComfyDiscoveryUnavailable }
+					if !ok || outputIndex >= len(producerClass.Output) || !comfyInputAccepts(spec, producerClass.Output[outputIndex]) { return comfyGraphError(15, id+"."+name) }
 					edges[producerID] = append(edges[producerID], id)
 					continue
 				}
-				if len(link) == 2 { return errComfyDiscoveryUnavailable }
+				if len(link) == 2 { return comfyGraphError(16, id+"."+name) }
 			}
-			if comfyForceInput(spec) { return errComfyDiscoveryUnavailable }
-			if !comfyLiteralSupported(spec, value) { return errComfyDiscoveryUnavailable }
+			if comfyForceInput(spec) { return comfyGraphError(17, id+"."+name) }
+			if !comfyLiteralSupported(spec, value) { return comfyGraphError(18, id+"."+name) }
 		}
 	}
 	visiting, visited := make(map[string]bool), make(map[string]bool)
@@ -596,7 +609,7 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 		delete(visiting, id); visited[id] = true
 		return true
 	}
-	for id := range nodes { if !visit(id) { return errComfyDiscoveryUnavailable } }
+	for id := range nodes { if !visit(id) { return fmt.Errorf("%w: graph contains a cycle at node %s", errComfyDiscoveryUnavailable, id) } }
 	return nil
 }
 
@@ -609,95 +622,53 @@ func comfyForceInput(raw json.RawMessage) bool {
 	return force
 }
 
-func validateComfyClassDefinition(raw json.RawMessage) error {
+// sanitizeComfyClassDefinition validates a class leniently and re-encodes only
+// the fields clients and the scheduler use, so backend-specific or unknown
+// metadata (paths, tokens in free text, future fields) is never republished.
+func sanitizeComfyClassDefinition(raw json.RawMessage) (json.RawMessage, error) {
+	if err := validateComfyClassDefinition(raw); err != nil { return nil, err }
 	var fields map[string]json.RawMessage
-	if len(raw) > 1<<20 || !boundedComfyJSONDepth(raw, 32) || json.Unmarshal(raw, &fields) != nil || fields == nil || len(fields) > 64 { return errComfyDiscoveryUnavailable }
-	allowed := map[string]bool{"input":true,"input_order":true,"output":true,"output_is_list":true,"output_name":true,"name":true,"display_name":true,"description":true,"category":true,"output_node":true,"deprecated":true,"experimental":true,"search_aliases":true,"python_module":true,"input_is_list":true,"output_tooltips":true,"is_input_list":true,"has_intermediate_output":true,"essentials_category":true,"api_node":true,"dev_only":true,"output_matchtypes":true,"price_badge":true}
-	inputRaw, inputPresent := fields["input"]
-	outputRaw, outputPresent := fields["output"]
-	if !inputPresent || !outputPresent { return errComfyDiscoveryUnavailable }
-	var completeInput map[string]map[string]json.RawMessage
-	if json.Unmarshal(inputRaw, &completeInput) != nil || completeInput == nil { return errComfyDiscoveryUnavailable }
-	var completeOutput []string
-	if json.Unmarshal(outputRaw, &completeOutput) != nil || completeOutput == nil || len(completeOutput) > 256 { return errComfyDiscoveryUnavailable }
-	for name, value := range fields {
-		if !allowed[name] || len(value) > 1<<20 { return errComfyDiscoveryUnavailable }
-		switch name {
-		case "input":
-			var inputs map[string]map[string]json.RawMessage
-			if json.Unmarshal(value, &inputs) != nil || inputs == nil || len(inputs) > 3 { return errComfyDiscoveryUnavailable }
-			for group, definitions := range inputs {
-				if (group != "required" && group != "optional" && group != "hidden") || definitions == nil || len(definitions) > 2048 { return errComfyDiscoveryUnavailable }
-				for _, spec := range definitions { if !validComfyInputDefinitionFor(spec, group == "hidden", 0) { return errComfyDiscoveryUnavailable } }
-			}
-		case "input_order":
-			var order map[string][]string
-			if json.Unmarshal(value, &order) != nil || order == nil { return errComfyDiscoveryUnavailable }
-			for key, names := range order {
-				if key != "required" && key != "optional" && key != "hidden" { return errComfyDiscoveryUnavailable }
-				if len(names) > 512 { return errComfyDiscoveryUnavailable }
-				for _, name := range names { if !safeComfyClassName(name) { return errComfyDiscoveryUnavailable } }
-			}
-		case "output", "output_name":
-			var values []string
-			if json.Unmarshal(value, &values) != nil || values == nil { return errComfyDiscoveryUnavailable }
-			for _, text := range values { if !safeComfyDisplayText(text) { return errComfyDiscoveryUnavailable } }
-		case "output_tooltips":
-			var values []json.RawMessage
-			if json.Unmarshal(value, &values) != nil || values == nil { return errComfyDiscoveryUnavailable }
-			for _, rawText := range values { if string(bytes.TrimSpace(rawText)) != "null" { var text string; if json.Unmarshal(rawText,&text) != nil || !safeComfyDisplayText(text) { return errComfyDiscoveryUnavailable } } }
-		case "name", "display_name", "description", "category", "python_module", "essentials_category":
-			if string(bytes.TrimSpace(value)) == "null" && (name == "display_name" || name == "description" || name == "essentials_category") { break }
-			var text string
-			if json.Unmarshal(value, &text) != nil { return errComfyDiscoveryUnavailable }
-			if name == "description" || name == "display_name" { if !safeComfyDisplayText(text) { return errComfyDiscoveryUnavailable } } else if !safeComfyMetadataText(text, name == "category" || name == "essentials_category") { return errComfyDiscoveryUnavailable }
-		case "output_is_list":
-			var values []bool
-			if json.Unmarshal(value, &values) != nil || values == nil { return errComfyDiscoveryUnavailable }
-		case "output_node", "deprecated", "experimental", "input_is_list", "is_input_list", "has_intermediate_output", "api_node", "dev_only":
-			var flag bool
-			if json.Unmarshal(value, &flag) != nil { return errComfyDiscoveryUnavailable }
-		case "search_aliases":
-			var aliases []string
-			if json.Unmarshal(value, &aliases) != nil || aliases == nil { return errComfyDiscoveryUnavailable }
-			for _, alias := range aliases { if !safeComfyDisplayText(alias) { return errComfyDiscoveryUnavailable } }
-		case "output_matchtypes":
-			var values []any
-			if string(bytes.TrimSpace(value)) == "null" { break }
-			if json.Unmarshal(value, &values) != nil || values == nil || len(values) != len(completeOutput) { return errComfyDiscoveryUnavailable }
-			for _, item := range values { if !safeComfySchemaMetadata(item, 0) { return errComfyDiscoveryUnavailable } }
-		case "price_badge":
-			var badge any
-			if json.Unmarshal(value, &badge) != nil || !safeComfySchemaMetadata(badge, 0) { return errComfyDiscoveryUnavailable }
+	if json.Unmarshal(raw, &fields) != nil { return nil, errComfyDiscoveryUnavailable }
+	projected := make(map[string]json.RawMessage, 10)
+	for _, key := range []string{"input", "input_order", "output", "output_is_list", "output_name", "output_node", "name", "display_name", "category"} {
+		if value, ok := fields[key]; ok && string(bytes.TrimSpace(value)) != "null" { projected[key] = value }
+	}
+	var description string
+	if json.Unmarshal(fields["description"], &description) == nil && safeComfyDisplayText(description) { projected["description"] = fields["description"] }
+	encoded, err := json.Marshal(projected)
+	if err != nil { return nil, errComfyDiscoveryUnavailable }
+	return encoded, nil
+}
+
+func validateComfyClassDefinition(raw json.RawMessage) error {
+	// Only the fields scheduling relies on are validated: input groups and
+	// output types. Display metadata (names, tooltips, badges, aliases...)
+	// changes with every ComfyUI release and is deliberately ignored, while
+	// size and depth bounds still apply to the whole definition.
+	var fields map[string]json.RawMessage
+	if len(raw) > 1<<20 || !boundedComfyJSONDepth(raw, 32) || json.Unmarshal(raw, &fields) != nil || fields == nil || len(fields) > 128 { return errComfyDiscoveryUnavailable }
+	var inputs map[string]map[string]json.RawMessage
+	if json.Unmarshal(fields["input"], &inputs) != nil || inputs == nil { return errComfyDiscoveryUnavailable }
+	for group, definitions := range inputs {
+		if group != "required" && group != "optional" && group != "hidden" { continue }
+		if len(definitions) > 2048 { return errComfyDiscoveryUnavailable }
+		for name, spec := range definitions {
+			if len(name) == 0 || len(name) > 256 || len(spec) > 1<<16 { return errComfyDiscoveryUnavailable }
+			if group == "hidden" { continue }
+			var parts []json.RawMessage
+			if json.Unmarshal(spec, &parts) != nil || len(parts) == 0 || len(parts) > 2 { return errComfyDiscoveryUnavailable }
+			var typeName string
+			var choices []any
+			if json.Unmarshal(parts[0], &typeName) != nil && (json.Unmarshal(parts[0], &choices) != nil || len(choices) > 1<<14) { return errComfyDiscoveryUnavailable }
 		}
 	}
-	for _, outputType := range completeOutput { if !safeComfyClassName(outputType) && outputType != "*" { return errComfyDiscoveryUnavailable } }
-	for _, paired := range []struct { key string; present bool }{
-		{"output_name", fields["output_name"] != nil},
-		{"output_tooltips", fields["output_tooltips"] != nil},
-		{"output_is_list", fields["output_is_list"] != nil},
-	} {
-		if !paired.present { continue }
-		var count int
-		switch paired.key {
-		case "output_name":
-			var values []string
-			if json.Unmarshal(fields[paired.key], &values) != nil { return errComfyDiscoveryUnavailable }
-			count = len(values)
-		case "output_tooltips":
-			var values []json.RawMessage
-			if json.Unmarshal(fields[paired.key], &values) != nil { return errComfyDiscoveryUnavailable }
-			count = len(values)
-		case "output_is_list":
-			var values []bool
-			if json.Unmarshal(fields[paired.key], &values) != nil { return errComfyDiscoveryUnavailable }
-			count = len(values)
-		}
-		if count != len(completeOutput) { return errComfyDiscoveryUnavailable }
+	var outputs []string
+	if json.Unmarshal(fields["output"], &outputs) != nil || outputs == nil || len(outputs) > 256 { return errComfyDiscoveryUnavailable }
+	for _, outputType := range outputs {
+		if len(outputType) == 0 || len(outputType) > 256 { return errComfyDiscoveryUnavailable }
 	}
 	return nil
 }
-
 func boundedComfyJSONDepth(raw []byte, maximum int) bool {
 	depth := 0
 	inString, escaped := false, false
@@ -1215,4 +1186,24 @@ func safeComfyDisplayText(value string) bool {
 	for _, marker := range []string{"authorization:", "bearer ", "password=", "token=", "secret=", "api_key="} { if strings.Contains(lower, marker) { return false } }
 	for _, r := range value { if (r < 0x20 && r != '\n' && r != '\r' && r != '\t') || r == 0x7f { return false } }
 	return true
+}
+
+// comfyGraphError names the failed check so blockers and logs say why a graph
+// was rejected; it still wraps errComfyDiscoveryUnavailable for callers.
+func comfyGraphError(check int, nodeID string) error {
+	reason := map[int]string{
+		1: "node is malformed or exceeds bounds", 2: "node class name or inputs are invalid",
+		3: "node class is not installed on the target", 4: "node class schema is malformed",
+		5: "required input is missing", 6: "dynamic input has no selected option",
+		7: "dynamic child input conflicts with another input", 8: "dynamic child input is missing",
+		9: "dynamic optional input conflicts with another input", 10: "dynamic inputs did not converge",
+		11: "input is not defined by the node class", 12: "multiselect value is not supported",
+		13: "link is malformed", 14: "link output index is invalid",
+		15: "link source output type is incompatible", 16: "two-element literal is ambiguous with a link",
+		17: "input must be connected, not a literal", 18: "literal value is not accepted by the input",
+	}[check]
+	if reason == "" {
+		reason = "graph check " + strconv.Itoa(check) + " failed"
+	}
+	return fmt.Errorf("%w: %s: %s", errComfyDiscoveryUnavailable, nodeID, reason)
 }
