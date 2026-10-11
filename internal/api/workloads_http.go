@@ -470,6 +470,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			InterruptionConsent bool `json:"interruption_consent"`
 			Recoverable         bool `json:"recoverable"`
 			PreemptionBudget    int  `json:"preemption_budget"`
+			// Scheduling controls. Zero values fall back to the credential's
+			// defaults, then to priority 0 / fail_fast.
+			Priority       *int   `json:"priority"`
+			QueuePolicy    string `json:"queue_policy"`
+			MaxWaitSeconds int    `json:"max_wait_seconds"`
 		} `json:"governor"`
 	}
 	_ = json.Unmarshal(body, &envelope)
@@ -500,7 +505,11 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if disruption == domain.DisruptionCheckpointable {
 		queuePolicy = domain.QueueWait
 	}
-	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: "llm.chat", Payload: body, QoS: domain.QoSInteractive, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
+	priority, requestedQueue, maxWait := openAISchedulingControls(r, p, envelope.Governor.Priority, envelope.Governor.QueuePolicy, envelope.Governor.MaxWaitSeconds)
+	if requestedQueue == domain.QueueWait {
+		queuePolicy = domain.QueueWait
+	}
+	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: "llm.chat", Payload: body, QoS: domain.QoSInteractive, Priority: priority, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
 	if err := s.prepareRequest(r, p, &req); err != nil {
 		writeJSON(w, 403, map[string]string{"error": err.Error()})
 		return
@@ -509,6 +518,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, 400, map[string]string{"error": err.Error()})
 		return
+	}
+	if (row.Status == domain.WorkloadWaiting || row.Status == domain.WorkloadQueued) && queuePolicy == domain.QueueWait && disruption != domain.DisruptionCheckpointable {
+		// Hold the HTTP request in the priority queue until admitted, the
+		// client disconnects, or the wait bound expires (then it is withdrawn
+		// and the client gets the usual busy response with Retry-After).
+		if admitted, waitErr := s.waitForOpenAIAdmission(r.Context(), row.Request.ID, maxWait); waitErr == nil {
+			row = admitted
+		} else {
+			_ = s.workloads.Cancel(context.Background(), row.Request.ID, row.Request.OwnerID, false)
+			row.Status = domain.WorkloadWaiting
+		}
 	}
 	if row.Status == domain.WorkloadWaiting || row.Status == domain.WorkloadRejected {
 		retrySeconds := 1
@@ -1379,4 +1399,74 @@ func decodeJSONLimit(r *http.Request, out any, limit int64) error {
 		return fmt.Errorf("invalid request: %w", err)
 	}
 	return nil
+}
+
+// openAISchedulingControls resolves priority, queue policy and wait bound for
+// an OpenAI-compatible request: governor body fields, then X-VRAM-* headers,
+// then the credential defaults. Priority is clamped later by prepareRequest.
+func openAISchedulingControls(r *http.Request, p Principal, bodyPriority *int, bodyQueue string, bodyWait int) (int, domain.QueuePolicy, time.Duration) {
+	priority := p.DefaultPriority
+	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Priority")); header != "" {
+		if value, err := strconv.Atoi(header); err == nil {
+			priority = value
+		}
+	}
+	if bodyPriority != nil {
+		priority = *bodyPriority
+	}
+	queue := strings.TrimSpace(p.DefaultQueuePolicy)
+	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Queue-Policy")); header != "" {
+		queue = header
+	}
+	if strings.TrimSpace(bodyQueue) != "" {
+		queue = strings.TrimSpace(bodyQueue)
+	}
+	waitSeconds := p.MaxQueueWaitSeconds
+	if header := strings.TrimSpace(r.Header.Get("X-VRAM-Max-Wait-Seconds")); header != "" {
+		if value, err := strconv.Atoi(header); err == nil {
+			waitSeconds = value
+		}
+	}
+	if bodyWait > 0 {
+		waitSeconds = bodyWait
+	}
+	if waitSeconds <= 0 {
+		waitSeconds = 120
+	}
+	if limit := p.MaxQueueWaitSeconds; limit > 0 && waitSeconds > limit {
+		waitSeconds = limit
+	}
+	if waitSeconds > 900 {
+		waitSeconds = 900
+	}
+	policy := domain.QueueFailFast
+	if strings.EqualFold(queue, string(domain.QueueWait)) {
+		policy = domain.QueueWait
+	}
+	return priority, policy, time.Duration(waitSeconds) * time.Second
+}
+
+// waitForOpenAIAdmission polls a queued workload until the scheduler admits
+// it (any non-waiting state), the request context ends, or maxWait elapses.
+func (s *Server) waitForOpenAIAdmission(ctx context.Context, id string, maxWait time.Duration) (*domain.Workload, error) {
+	deadline := time.NewTimer(maxWait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			return nil, fmt.Errorf("queue wait exceeded %s", maxWait)
+		case <-ticker.C:
+		}
+		row, err := s.workloads.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if row.Status != domain.WorkloadWaiting && row.Status != domain.WorkloadQueued {
+			return row, nil
+		}
+	}
 }

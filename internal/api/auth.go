@@ -30,6 +30,9 @@ type Principal struct {
 	ConcurrencyLimit    int
 	BudgetCents         int64
 	PreemptionBudget    int
+	DefaultPriority     int
+	DefaultQueuePolicy  string
+	MaxQueueWaitSeconds int
 }
 
 type storedCredential struct {
@@ -78,7 +81,7 @@ func (s *Server) buildCredentials() {
 		if egress == "" {
 			egress = "local_only"
 		}
-		p := Principal{ID: configured.ID, Plane: configured.Plane, OwnerID: configured.OwnerID, NodeID: configured.NodeID, MaxPriority: configured.MaxPriority, MaxIncidentSeverity: configured.MaxIncidentSeverity, EgressPolicy: egress, ConcurrencyLimit: configured.ConcurrencyLimit, BudgetCents: configured.BudgetCents, PreemptionBudget: configured.PreemptionBudget, Scopes: map[string]struct{}{}, Adapters: map[string]struct{}{}}
+		p := Principal{ID: configured.ID, Plane: configured.Plane, OwnerID: configured.OwnerID, NodeID: configured.NodeID, MaxPriority: configured.MaxPriority, MaxIncidentSeverity: configured.MaxIncidentSeverity, EgressPolicy: egress, ConcurrencyLimit: configured.ConcurrencyLimit, BudgetCents: configured.BudgetCents, PreemptionBudget: configured.PreemptionBudget, DefaultPriority: configured.DefaultPriority, DefaultQueuePolicy: configured.DefaultQueuePolicy, MaxQueueWaitSeconds: configured.MaxQueueWaitSeconds, Scopes: map[string]struct{}{}, Adapters: map[string]struct{}{}}
 		for _, scope := range configured.Scopes {
 			p.Scopes[scope] = struct{}{}
 		}

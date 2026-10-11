@@ -554,6 +554,11 @@ type CredentialConfig struct {
 	ConcurrencyLimit    int      `yaml:"concurrency_limit"`
 	BudgetCents         int64    `yaml:"budget_cents"`
 	PreemptionBudget    int      `yaml:"preemption_budget"`
+	// Defaults applied to OpenAI-compatible requests from this credential, so
+	// an application's API key alone can carry its priority class.
+	DefaultPriority     int    `yaml:"default_priority"`
+	DefaultQueuePolicy  string `yaml:"default_queue_policy"`
+	MaxQueueWaitSeconds int    `yaml:"max_queue_wait_seconds"`
 }
 
 type WorkloadTargetConfig struct {
