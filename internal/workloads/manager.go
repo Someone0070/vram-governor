@@ -1651,8 +1651,15 @@ func targetExecutionGenerationEqual(a, b Target) bool {
 // narrow helper is used only immediately after the transition whose mutation
 // the admission path owns, before rebinding the reservation to the new fence.
 func targetExecutionFactsEqual(a, b Target) bool {
-	a.ResidentModels = nil
-	b.ResidentModels = nil
+	// Ignore the observations a model transition itself changes: residency,
+	// queue depth and capacity provenance (configured fallback vs runtime
+	// /slots flips when a router loads or unloads its only model).
+	for _, t := range []*Target{&a, &b} {
+		t.ResidentModels = nil
+		t.QueueRunning, t.QueuePending = 0, 0
+		t.CapacitySource, t.CapacityVerified = "", false
+		t.StandaloneVRAMMB, t.StandaloneVRAMSource, t.StandaloneVRAMVerified = 0, "", false
+	}
 	return targetExecutionFingerprint(a) == targetExecutionFingerprint(b)
 }
 
@@ -1797,7 +1804,11 @@ func (m *Manager) handoffAdmissionOwnedPlacementGeneration(
 		}
 		cursorGeneration++
 	}
-	if !loadedRequestedModel || cursorGeneration != afterGeneration || !targetExecutionFactsEqual(before, after) || !sameStringSet(cursor.ResidentModels, after.ResidentModels) {
+	// The node re-advertises after a load (and a single-model router evicts
+	// its previous model by itself), so the live target may have advanced by
+	// more generations than the owned receipts, but never fewer, and must
+	// now hold the requested model.
+	if !loadedRequestedModel || cursorGeneration > afterGeneration || !targetExecutionFactsEqual(before, after) || !hasExact(after.ResidentModels, model) {
 		return fmt.Errorf("admission-owned transition receipts do not reconstruct the current target")
 	}
 	// Receipt reads may span a store round trip. Reconfirm the lease after that
