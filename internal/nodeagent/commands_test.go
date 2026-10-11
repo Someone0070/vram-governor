@@ -832,13 +832,14 @@ func TestRecoveryEpochPreservesFenceAndCompletedResult(t *testing.T) {
 	if q.fences[fenceKey("node-1-router", "model")] != 41 || q.results["done"].ID != "done" {
 		t.Fatalf("durable fence/result high-water was lost: fences=%v results=%v", q.fences, q.results)
 	}
+	issuedBeforeRecovery := time.Now().UTC().Add(-time.Second)
 	if err := q.RecoverCommandState("epoch-after-failure"); err != nil {
 		t.Fatalf("explicit epoch recovery failed: %v", err)
 	}
 	if q.stateBlocked || q.fences[fenceKey("node-1-router", "model")] != 41 || q.results["done"].ID != "done" {
 		t.Fatalf("recovery discarded trusted state: blocked=%v fences=%v results=%v", q.stateBlocked, q.fences, q.results)
 	}
-	oldCommand := wsproto.CommandPayload{ID: "old-after-recovery", IdempotencyKey: "old-after-recovery", NodeID: cfg.NodeID, Command: "refresh_capabilities", Args: map[string]any{}, IssuedAt: time.Now().UTC(), ExpiresAt: time.Now().UTC().Add(time.Minute)}
+	oldCommand := wsproto.CommandPayload{ID: "old-after-recovery", IdempotencyKey: "old-after-recovery", NodeID: cfg.NodeID, Command: "refresh_capabilities", Args: map[string]any{}, IssuedAt: issuedBeforeRecovery, ExpiresAt: time.Now().UTC().Add(time.Minute)}
 	oldCommand.Signature, _ = wsproto.SignCommand(oldCommand, []byte(cfg.CommandSigningSecret))
 	if result := q.Handle(context.Background(), oldCommand); !strings.Contains(result.Error, "recovery epoch") {
 		t.Fatalf("old signed command was accepted after recovery: %+v", result)
@@ -4152,5 +4153,28 @@ func TestOwnedStopReceiptRequiresRootSignatureAndExactIntentJoin(t *testing.T) {
 	forged[len(forged)-3] ^= 1
 	if err := verifyOwnedStopReceipt(forged, public, wire, string(secret)); err == nil {
 		t.Fatal("receipt modified after signing was accepted")
+	}
+}
+
+func TestRecoveredProcessorAcceptsOnlyCommandsIssuedAfterRecovery(t *testing.T) {
+	committed := time.Now().UTC().Add(-time.Minute)
+	p := &commandProcessor{cfg: &Config{NodeID: "node-1", CommandSigningSecret: "0123456789abcdef0123456789abcdef"}, recoveryEpoch: "epoch-a",
+		recoveryMarker: &recoveryMarkerState{Phase: recoveryMarkerPhaseRecoveryCommitted, Timestamp: committed}}
+	sign := func(issued time.Time, args map[string]any) wsproto.CommandPayload {
+		command := wsproto.CommandPayload{ID: "c-" + issued.Format("150405.000"), IdempotencyKey: "k", NodeID: "node-1", Command: "load_model", Args: args, IssuedAt: issued, ExpiresAt: time.Now().UTC().Add(time.Hour)}
+		command.Signature, _ = wsproto.SignCommand(command, []byte(p.cfg.CommandSigningSecret))
+		return command
+	}
+	if err := p.authenticateCommand(sign(time.Now().UTC(), map[string]any{"model": "m"})); err != nil {
+		t.Fatalf("post-recovery command without epoch was rejected: %v", err)
+	}
+	if err := p.authenticateCommand(sign(committed.Add(-time.Second), map[string]any{"model": "m"})); err == nil {
+		t.Fatal("pre-recovery command was accepted")
+	}
+	if err := p.authenticateCommand(sign(time.Now().UTC(), map[string]any{"recovery_epoch": "epoch-old"})); err == nil {
+		t.Fatal("command naming a stale epoch was accepted")
+	}
+	if err := p.authenticateCommand(sign(time.Now().UTC(), map[string]any{"recovery_epoch": "epoch-a"})); err != nil {
+		t.Fatalf("command naming the current epoch was rejected: %v", err)
 	}
 }

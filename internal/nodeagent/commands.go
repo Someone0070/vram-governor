@@ -3551,6 +3551,15 @@ func sanitizeCommandError(message string) string {
 	return message
 }
 
+// recoveryCommittedAt is the durable time the current recovery epoch took
+// effect, or zero when no committed recovery is recorded.
+func (p *commandProcessor) recoveryCommittedAt() time.Time {
+	if p.recoveryMarker == nil || p.recoveryMarker.Phase != recoveryMarkerPhaseRecoveryCommitted {
+		return time.Time{}
+	}
+	return p.recoveryMarker.Timestamp
+}
+
 func (p *commandProcessor) authenticateCommand(command wsproto.CommandPayload) error {
 	if len(p.cfg.CommandSigningSecret) < 16 {
 		return errors.New("node command signing is not configured")
@@ -3565,9 +3574,16 @@ func (p *commandProcessor) authenticateCommand(command wsproto.CommandPayload) e
 		return errors.New("invalid command signature")
 	}
 	if p.recoveryEpoch != "" {
-		epoch, ok := command.Args["recovery_epoch"].(string)
-		if !ok || strings.TrimSpace(epoch) == "" || epoch != p.recoveryEpoch {
-			return errors.New("command recovery epoch is stale")
+		// Recovery cleared result history, so a pre-recovery command must not
+		// be replayed. Commands that name an epoch must match it exactly;
+		// ordinary commands (the controller does not know local epochs) are
+		// accepted only when signed after the recovery was committed.
+		if epoch, ok := command.Args["recovery_epoch"].(string); ok && strings.TrimSpace(epoch) != "" {
+			if epoch != p.recoveryEpoch {
+				return errors.New("command recovery epoch is stale")
+			}
+		} else if cutoff := p.recoveryCommittedAt(); cutoff.IsZero() || !command.IssuedAt.After(cutoff) {
+			return errors.New("command was issued before the current recovery epoch")
 		}
 	}
 	now := time.Now().UTC()
@@ -5412,6 +5428,7 @@ func (p *commandProcessor) recoverCommandState(newEpoch string, generation uint6
 	p.stateBlocked, p.stateBlockReason = false, ""
 	marker := *p.recoveryMarker
 	marker.Phase, marker.RecoveryEpoch, marker.RecoveryEpochHash = recoveryMarkerPhaseRecoveryCommitted, newEpoch, hash
+	marker.Timestamp = time.Now().UTC()
 	marker.RecoveryGeneration, marker.RecoveryAnchorHash, marker.TargetStateChecksum = generation, newAnchor, targetChecksum
 	p.recoveryMarker = &marker
 	return nil
