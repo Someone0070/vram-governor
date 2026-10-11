@@ -5987,15 +5987,20 @@ func (p *commandProcessor) ReconcilePending(ctx context.Context) error {
 			if state == llamaStateTransitional {
 				return errors.New("pending transition remains indeterminate while runtime is transitional")
 			}
-			if (state == llamaStateLoaded) != desiredResident {
-				return errors.New("pending transition remains uncertain")
-			}
+			observedResident := state == llamaStateLoaded
 			tier := "cold_disk"
-			if desiredResident {
+			if observedResident {
 				tier = "hot_vram"
 			}
-			canonical := p.reconciledResidencyResult(intent, discovery, tier, desiredResident, nil, nil)
-			if err := p.recordReconciledResult(intent, canonical, ""); err != nil {
+			// The agent is the only executor and nothing is in flight after a
+			// restart, so a settled runtime state that differs from the intent
+			// is a definite outcome: the transition did not take effect.
+			message := ""
+			if observedResident != desiredResident {
+				message = "pending transition did not take effect; runtime is " + tier
+			}
+			canonical := p.reconciledResidencyResult(intent, discovery, tier, observedResident, nil, nil)
+			if err := p.recordReconciledResult(intent, canonical, message); err != nil {
 				return errors.New("pending lifecycle result could not be journaled")
 			}
 		}
