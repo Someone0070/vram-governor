@@ -63,6 +63,17 @@ curl https://<lb-host>:8443/v1/chat/completions   -H "Authorization: Bearer $TOK
   429/503 with `Retry-After` immediately.
 - Clients that cannot add body fields can send `X-VRAM-Priority`,
   `X-VRAM-Queue-Policy` and `X-VRAM-Max-Wait-Seconds` headers instead.
+  Precedence: body > header > credential default > controller default
+  `workloads.openai_default_queue_policy` (`fail_fast`) and
+  `workloads.openai_default_max_wait_seconds` (120, max 900).
+- A busy answer carries `error.code`: `capacity`, `transition_busy`,
+  `pinned_resident` or `locked_workload` return 429 (retry later);
+  `node_offline` or `runtime_unsupported` return 503 (no route until something
+  changes). `retry_after_seconds` mirrors `Retry-After`; `admission.eta` is set
+  only for a history-backed estimate. A still-queued workload returns
+  `notification_id` (its workload ID): follow it on `GET /api/v1/events` for
+  `workload.admitted`. Creator Studio workloads expose the same
+  `blocker_code`, `estimated_start`, `retry_after_seconds` and `alternatives`.
 - Simplest: give each application its own credential and set its class there,
   so unmodified OpenAI clients get the right priority from the key alone:
 
@@ -92,9 +103,10 @@ polls, and outputs are fetched from `/api/v1/artifacts/{ref}/content`. See
   sufficient context profile; same model on several nodes is load-balanced.
 - Loads models on demand (router-managed llama.cpp or Ollama), evicts the least
   protected idle model when a card is full, and unloads models idle for
-  `idle_unload_seconds` (default 900). A model is never evicted within
-  `min_residency_seconds` of loading, so rapid model switching waits instead
-  of thrashing.
+  `idle_unload_seconds` (default 900). Demand never evicts a model within
+  `min_residency_seconds` of loading unless the request has priority 8 or
+  higher, so rapid model switching waits (`transition_busy`, with an ETA at
+  the window's end) instead of thrashing.
 - Models whose runtime cannot report per-model VRAM (plain llama.cpp) run with
   exclusive use of their card rather than being packed by byte accounting.
 - Drops an idle GPU to its lowest memory clock (P8-class power) with models
