@@ -4636,7 +4636,7 @@ func (m *Manager) reconcileRunningNodeLoss(ctx context.Context, rows []*domain.W
 			continue
 		}
 		target := m.targetByID(workload.Plan.TargetID)
-		if target.ID == "" || target.Cloud || m.targetNodeAvailable(ctx, target) {
+		if target.ID == "" || target.Cloud || m.targetNodeConnected(ctx, target) {
 			continue
 		}
 		m.mu.RLock()
@@ -4708,6 +4708,25 @@ func (m *Manager) reconcileRunningNodeLoss(ctx context.Context, rows []*domain.W
 		delete(m.cancelling, workload.Request.ID)
 		m.mu.Unlock()
 	}
+}
+
+// targetNodeConnected reports whether the node owning target's accelerator is
+// still connected. Unlike targetNodeAvailable it ignores the agent's Ready
+// flag, which only means "idle for new commands" and is false while the
+// agent executes one (for example the load that preceded this execution).
+func (m *Manager) targetNodeConnected(ctx context.Context, target Target) bool {
+	nodes, err := m.nodes.ListNodes(ctx)
+	if err != nil {
+		return true // a store read failure is not evidence of node loss
+	}
+	for _, node := range nodes {
+		for _, accelerator := range node.Accelerators {
+			if accelerator.ID == target.AcceleratorID {
+				return node.Observed.Connectivity != domain.ConnectivityLost
+			}
+		}
+	}
+	return false
 }
 
 func (m *Manager) targetNodeAvailable(ctx context.Context, target Target) bool {
