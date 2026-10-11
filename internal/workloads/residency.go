@@ -981,7 +981,10 @@ func (m *Manager) ensureMeasuredCapacity(ctx context.Context, target Target, mod
 	}
 	observer, ok := lifecycle.(ModelCapacityObserver)
 	if !ok {
-		return fmt.Errorf("authoritative per-model capacity observation unavailable for target %s model %s", target.ID, model)
+		// The runtime cannot report per-model bytes (e.g. a llama.cpp router).
+		// Leave the model unmeasured: checkResidentCapacity then admits it only
+		// with exclusive use of the accelerator, never via byte accounting.
+		return nil
 	}
 	capacity, err := observer.ObserveModelCapacity(ctx, target, model)
 	if err != nil {
