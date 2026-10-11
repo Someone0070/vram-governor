@@ -9031,7 +9031,7 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 	// transition fence for a refresh that arrives during Start/Resume.
 	currentTarget, validationErr := m.validateExecutionFacts(ctx, target, reservation.targetGeneration, requirements, id)
 	if validationErr != nil {
-		m.failAfterReservation(ctx, w, reservation, validationErr.Error())
+		m.requeueAfterPreDispatchDrift(ctx, w, reservation, validationErr.Error())
 		return
 	}
 	target = currentTarget
@@ -9047,7 +9047,7 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 	// cannot cold-start through a stale admission snapshot.
 	currentTarget, validationErr = m.validateExecutionFacts(ctx, target, reservation.targetGeneration, requirements, id)
 	if validationErr != nil {
-		m.failAfterReservation(ctx, w, reservation, validationErr.Error())
+		m.requeueAfterPreDispatchDrift(ctx, w, reservation, validationErr.Error())
 		return
 	}
 	target = currentTarget
@@ -9715,6 +9715,51 @@ func (m *Manager) fail(ctx context.Context, w *domain.Workload, message string) 
 func (m *Manager) failAfterReservation(ctx context.Context, w *domain.Workload, reservation *targetReservation, message string) {
 	if releaseErr := m.releaseBeforeTerminal(ctx, w, reservation, "failure", message); releaseErr != nil {
 		return
+	}
+	m.fail(ctx, w, message)
+}
+
+// requeueAfterPreDispatchDrift handles a target refresh that lands between
+// admission and the first backend command. Nothing was dispatched, so the
+// workload returns to the queue for fresh placement instead of failing; the
+// reservation is released through the same confirmed-intent path as provider
+// fallback, and repeated drift is bounded by the execution attempt cap.
+func (m *Manager) requeueAfterPreDispatchDrift(ctx context.Context, w *domain.Workload, reservation *targetReservation, message string) {
+	intent, prepareErr := m.prepareTerminalLeaseIntent(ctx, w, reservation, "failure", message)
+	if prepareErr != nil {
+		return
+	}
+	if releaseErr := m.releaseTargetWithIntent(ctx, reservation, intent); releaseErr != nil {
+		return
+	}
+	intent.ReleaseConfirmed = true
+	if _, phaseErr := m.store.RecordAcceleratorLeaseCleanupIntent(ctx, intent); phaseErr != nil {
+		scheduleLeaseCleanupRetry(intent, phaseErr)
+		recordCtx, recordCancel := leaseCleanupContext(ctx)
+		_, _ = m.store.RecordAcceleratorLeaseCleanupIntent(recordCtx, intent)
+		recordCancel()
+		return
+	}
+	deleteCtx, deleteCancel := leaseCleanupContext(ctx)
+	_ = m.deleteLeaseCleanupIntent(deleteCtx, intent)
+	deleteCancel()
+	latest, err := m.store.GetWorkload(ctx, w.Request.ID)
+	if err == nil && latest.Status != domain.WorkloadCancelled && latest.ExecutionAttempts < 4 {
+		latest.Status = domain.WorkloadQueued
+		latest.Decision = domain.AdmissionDecision{Admitted: false, Blocker: "target changed before dispatch; re-placing", Confidence: .8, Alternatives: []string{message}}
+		latest.Plan = nil
+		latest.Execution = nil
+		latest.Error = message
+		latest.UpdatedAt = time.Now().UTC()
+		latest.FinishedAt = nil
+		if _, casErr := m.replaceWorkloadCAS(ctx, latest, workloadStatuses(domain.WorkloadRunning, domain.WorkloadWaiting, domain.WorkloadQueued), ""); casErr == nil {
+			if releaseErr := m.releaseBudgetClaimAfterWorkloadCAS(ctx, latest.Request.ID, latest.BudgetReservationToken, latest.BudgetReservationAttempt); releaseErr != nil {
+				m.log.Warn("pre-dispatch requeue paused until budget cleanup succeeds", "workload_id", latest.Request.ID, "error", releaseErr)
+			}
+			m.audit(ctx, latest.Request.OwnerID, latest.Request.ID, "workload.requeued_before_dispatch", "info", map[string]any{"attempt": latest.ExecutionAttempts, "reason": message})
+			m.signal()
+			return
+		}
 	}
 	m.fail(ctx, w, message)
 }

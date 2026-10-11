@@ -4262,20 +4262,26 @@ func TestRequestVRAMAccountingCountsActiveAllocationsWithoutHotResidency(t *test
 	}
 }
 
-func TestRequestVRAMAccountingUnknownPhysicalRequestWithoutBudgetFailsClosed(t *testing.T) {
+func TestRequestVRAMAccountingUnmeasuredPhysicalRequestRequiresExclusiveAccelerator(t *testing.T) {
 	ctx := context.Background()
 	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
 	defer mgr.Close()
 	target := Target{ID: "request-vram-no-budget", Adapter: "mock", AcceleratorID: "request-vram-no-budget-gpu", Slots: 1, Enabled: true}
+	other := Target{ID: "request-vram-no-budget-other", Adapter: "mock", AcceleratorID: "request-vram-no-budget-gpu", Slots: 1, Enabled: true}
 	mgr.RegisterAdapter(NewMockAdapter())
 	mgr.RegisterTarget(target)
+	mgr.RegisterTarget(other)
 	registered := mgr.targetByID(target.ID)
 	workload := &domain.Workload{Request: domain.WorkloadRequest{ID: "physical-no-budget"}}
 	if _, acquired, reason, err := mgr.reserveTarget(ctx, registered, workload, Requirements{Model: "unmeasured-model", ContextTokens: 128}); err != nil || !acquired {
 		t.Fatalf("reservation fixture failed: acquired=%v reason=%q err=%v", acquired, reason, err)
 	}
-	if err := mgr.checkResidentCapacityForWorkload(ctx, registered, "unmeasured-model", workload.Request.ID); err == nil || !strings.Contains(err.Error(), "no enforceable measured capacity budget") {
-		t.Fatalf("unknown physical model request bypassed the no-budget fence: %v", err)
+	if err := mgr.checkResidentCapacityForWorkload(ctx, registered, "unmeasured-model", workload.Request.ID); err != nil {
+		t.Fatalf("unmeasured model on an otherwise idle accelerator was rejected: %v", err)
+	}
+	otherRegistered := mgr.targetByID(other.ID)
+	if err := mgr.checkResidentCapacityForWorkload(ctx, otherRegistered, "other-unmeasured-model", "physical-no-budget-other"); err == nil || !strings.Contains(err.Error(), "unmeasured model cannot share accelerator") {
+		t.Fatalf("unmeasured model was co-placed with another target's active work: %v", err)
 	}
 }
 

@@ -1096,6 +1096,20 @@ func (m *Manager) checkResidentCapacityForWorkload(ctx context.Context, target T
 	return m.checkResidentCapacityExcluding(ctx, target, requested, workloadID)
 }
 
+func (m *Manager) checkExclusiveUnmeasuredPlacement(target Target, excludeWorkloadID string) error {
+	m.placementMu.Lock()
+	defer m.placementMu.Unlock()
+	for _, placement := range m.activePlacements {
+		if placement.workloadID == excludeWorkloadID || placement.targetID == target.ID {
+			continue
+		}
+		if placement.acceleratorID == target.AcceleratorID {
+			return fmt.Errorf("unmeasured model cannot share accelerator %s with active target %s", target.AcceleratorID, placement.targetID)
+		}
+	}
+	return nil
+}
+
 func (m *Manager) checkResidentCapacityExcluding(ctx context.Context, target Target, requested, excludeWorkloadID string) error {
 	total, reserve, hardCap, capacityErr := targetCapacityBytes(target)
 	if capacityErr != nil {
@@ -1128,6 +1142,20 @@ func (m *Manager) checkResidentCapacityExcluding(ctx context.Context, target Tar
 	hasVRAMBudget := total > 0 || hardCap > 0
 	hasRAMBudget := target.Capacity.RAMTotalBytes > 0 || target.Capacity.RAMHardCapBytes > 0
 	requestedCapacity, requestedErr := m.capacityForModel(ctx, target, requested)
+	if errors.Is(requestedErr, store.ErrNotFound) && !target.Cloud && target.AcceleratorID != "" && requested != "" {
+		// Runtimes such as plain llama.cpp do not report per-model bytes. A
+		// never-measured model may still run, bounded by the slot cap above,
+		// but only while no other target holds work on the same accelerator:
+		// it can never be co-placed through byte accounting it cannot satisfy.
+		// A model measured under another profile is drift, not "unmeasured".
+		prior, err := m.store.ListModelCapacities(ctx, target.ID, requested)
+		if err != nil {
+			return fmt.Errorf("read model capacity history: %w", err)
+		}
+		if len(prior) == 0 {
+			return m.checkExclusiveUnmeasuredPlacement(target, excludeWorkloadID)
+		}
+	}
 	enforceVRAM := hasVRAMBudget
 	if !hasVRAMBudget && !hasRAMBudget {
 		// Preserve the legacy no-budget path for cloud/nonphysical and

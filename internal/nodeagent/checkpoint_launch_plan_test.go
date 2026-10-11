@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,9 @@ func TestCheckpointLaunchPlanPathSyntaxRejectsTraversalAndControls(t *testing.T)
 }
 
 func TestCheckpointLaunchPlanRuntimeOptionsSchema(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("plan parsing checks Unix execute bits; the fixed launcher runs only on Linux")
+	}
 	base := checkpointRuntimeOptionsPlanJSON(t, checkpointLaunchPlanVersion2, nil)
 	if _, err := ParseCheckpointLaunchPlan(base); err != nil {
 		t.Fatalf("v2 plan without optional runtime_options rejected: %v", err)

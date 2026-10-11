@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -17,7 +18,9 @@ func TestProductionCheckpointProofRequiresEveryBoundary(t *testing.T) {
 	complete.ReusedTokens = 1
 	complete.SnapshotBytes = 1
 	complete.SnapshotDigest = "sha256:snapshot"
-	complete.Nonce = "nonce"
+	complete.Nonce = "00000000000000000001-e00000000000000000001-0123456789abcdef0123456789abcdef"
+	complete.ModelAlias = "model-alias"
+	complete.LocalCheckpointBinding = "sha256:" + strings.Repeat("ab", 32)
 	complete.ExpiresAt = time.Now().Add(time.Hour)
 	complete.Digest = "proof"
 	proof := complete.Proof()
