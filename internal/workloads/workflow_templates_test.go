@@ -31,26 +31,40 @@ func TestRepoWorkflowTemplatesMatchComfySchema(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tpl := range registry.All() {
-		params := map[string]any{}
+		base := map[string]any{}
 		for _, p := range tpl.Params {
 			if p.Required {
-				params[p.Name] = "art-test-" + p.Name
+				base[p.Name] = "art-test-" + p.Name
 			}
 		}
-		compiled, err := tpl.Compile(params)
-		if err != nil {
-			t.Errorf("%s: %v", tpl.Ref(), err)
-			continue
+		// Defaults, then every value of every enum (styles, precisions), so
+		// each mapped model or LoRA file is checked against the live schema.
+		variants := []map[string]any{base}
+		for _, p := range tpl.Params {
+			for _, value := range p.Values {
+				variant := map[string]any{p.Name: value}
+				for k, v := range base {
+					variant[k] = v
+				}
+				variants = append(variants, variant)
+			}
 		}
-		body, _ := json.Marshal(compiled.Graph)
-		var graph map[string]json.RawMessage
-		_ = json.Unmarshal(body, &graph)
-		uploads := map[string]bool{}
-		for _, ref := range compiled.ArtifactRefs {
-			uploads[ref] = true
-		}
-		if err := validateComfyGraphWithUploads(graph, schemas, uploads); err != nil {
-			t.Errorf("%s: %v", tpl.Ref(), err)
+		for _, params := range variants {
+			compiled, err := tpl.Compile(params)
+			if err != nil {
+				t.Errorf("%s: %v", tpl.Ref(), err)
+				continue
+			}
+			body, _ := json.Marshal(compiled.Graph)
+			var graph map[string]json.RawMessage
+			_ = json.Unmarshal(body, &graph)
+			uploads := map[string]bool{}
+			for _, ref := range compiled.ArtifactRefs {
+				uploads[ref] = true
+			}
+			if err := validateComfyGraphWithUploads(graph, schemas, uploads); err != nil {
+				t.Errorf("%s %v: %v", tpl.Ref(), params, err)
+			}
 		}
 	}
 }

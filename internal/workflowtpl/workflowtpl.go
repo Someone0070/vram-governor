@@ -40,25 +40,80 @@ const (
 const maxSeed = int64(1)<<53 - 1
 
 // Binding writes a parameter's value into one node input. Format, for string
-// parameters only, wraps the value: "l3n0v0, {value}".
+// parameters only, wraps the value: "l3n0v0, {value}"; "{tokens:style}"
+// inserts the Tokens entry of enum parameter "style" for its chosen value.
+// Map, for enum parameters only, writes Map[value] instead of the value (e.g.
+// a style name to a LoRA file).
 type Binding struct {
-	Node   string `json:"node"`
-	Input  string `json:"input"`
-	Format string `json:"format,omitempty"`
+	Node   string         `json:"node"`
+	Input  string         `json:"input"`
+	Format string         `json:"format,omitempty"`
+	Map    map[string]any `json:"map,omitempty"`
+}
+
+// Bypass removes Node from the graph when an enum parameter takes one of the
+// When values, rewiring every consumer of the node's output N to the link in
+// its input Outputs[N] (e.g. a LoRA loader's MODEL output to its "model"
+// input), so "none" loads nothing instead of a zero-strength LoRA.
+type Bypass struct {
+	Node    string            `json:"node"`
+	When    []string          `json:"when"`
+	Outputs map[string]string `json:"outputs"`
 }
 
 type Param struct {
-	Name        string    `json:"name"`
-	Type        string    `json:"type"`
-	Description string    `json:"description,omitempty"`
-	Required    bool      `json:"required,omitempty"`
-	Default     any       `json:"default,omitempty"`
-	Min         *float64  `json:"min,omitempty"`
-	Max         *float64  `json:"max,omitempty"`
-	MultipleOf  int64     `json:"multiple_of,omitempty"`
-	MaxLength   int       `json:"max_length,omitempty"`
-	Values      []string  `json:"values,omitempty"`
-	Bind        []Binding `json:"bind"`
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Description string   `json:"description,omitempty"`
+	Required    bool     `json:"required,omitempty"`
+	Default     any      `json:"default,omitempty"`
+	Min         *float64 `json:"min,omitempty"`
+	Max         *float64 `json:"max,omitempty"`
+	MultipleOf  int64    `json:"multiple_of,omitempty"`
+	MaxLength   int      `json:"max_length,omitempty"`
+	Values      []string `json:"values,omitempty"`
+	// Tokens are prompt fragments per enum value, inserted by "{tokens:name}"
+	// in a string binding's Format (e.g. a LoRA's trigger word).
+	Tokens map[string]string `json:"tokens,omitempty"`
+	Bypass []Bypass          `json:"bypass,omitempty"`
+	Bind   []Binding         `json:"bind"`
+}
+
+var tokenRefPattern = regexp.MustCompile(`\{tokens:([a-z][a-z0-9_]*)\}`)
+
+func formatTokenRefs(format string) []string {
+	var refs []string
+	for _, match := range tokenRefPattern.FindAllStringSubmatch(format, -1) {
+		refs = append(refs, match[1])
+	}
+	return refs
+}
+
+func (t *Template) param(name string) *Param {
+	for i := range t.Params {
+		if t.Params[i].Name == name {
+			return &t.Params[i]
+		}
+	}
+	return nil
+}
+
+func (p *Param) bypasses(node, value string) bool {
+	for _, bypass := range p.Bypass {
+		if bypass.Node == node && containsValue(bypass.When, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsValue(values []string, value string) bool {
+	for _, v := range values {
+		if v == value {
+			return true
+		}
+	}
+	return false
 }
 
 // Template is one workflow file.
@@ -146,6 +201,35 @@ func (t *Template) Validate() error {
 			if b.Format != "" && (p.Type != TypeString || !strings.Contains(b.Format, "{value}")) {
 				return fmt.Errorf("template %s: parameter %s format needs a string parameter and {value}", t.ID, p.Name)
 			}
+			if b.Map != nil {
+				if p.Type != TypeEnum {
+					return fmt.Errorf("template %s: parameter %s map needs an enum parameter", t.ID, p.Name)
+				}
+				for _, value := range p.Values {
+					if _, mapped := b.Map[value]; !mapped && !p.bypasses(b.Node, value) {
+						return fmt.Errorf("template %s: parameter %s map lacks value %q", t.ID, p.Name, value)
+					}
+				}
+			}
+		}
+		if (len(p.Tokens) > 0 || len(p.Bypass) > 0) && p.Type != TypeEnum {
+			return fmt.Errorf("template %s: parameter %s tokens/bypass need an enum parameter", t.ID, p.Name)
+		}
+		for _, bypass := range p.Bypass {
+			n, ok := nodes[bypass.Node]
+			if !ok || len(bypass.When) == 0 || len(bypass.Outputs) == 0 {
+				return fmt.Errorf("template %s: parameter %s bypass is incomplete", t.ID, p.Name)
+			}
+			for _, value := range bypass.When {
+				if !containsValue(p.Values, value) {
+					return fmt.Errorf("template %s: parameter %s bypass names unknown value %q", t.ID, p.Name, value)
+				}
+			}
+			for _, input := range bypass.Outputs {
+				if link, isLink := n.Inputs[input].([]any); !isLink || len(link) != 2 {
+					return fmt.Errorf("template %s: parameter %s bypass input %s.%s is not a link", t.ID, p.Name, bypass.Node, input)
+				}
+			}
 		}
 		if p.Required && p.Default != nil {
 			return fmt.Errorf("template %s: required parameter %s may not have a default", t.ID, p.Name)
@@ -159,6 +243,16 @@ func (t *Template) Validate() error {
 		if p.Default != nil {
 			if _, err := p.coerce(p.Default); err != nil {
 				return fmt.Errorf("template %s: default for %s: %w", t.ID, p.Name, err)
+			}
+		}
+	}
+	for _, p := range t.Params {
+		for _, b := range p.Bind {
+			for _, ref := range formatTokenRefs(b.Format) {
+				target := t.param(ref)
+				if target == nil || target.Type != TypeEnum || len(target.Tokens) == 0 {
+					return fmt.Errorf("template %s: parameter %s format references {tokens:%s}, which is not an enum with tokens", t.ID, p.Name, ref)
+				}
 			}
 		}
 	}
@@ -348,16 +442,50 @@ func (t *Template) Compile(params map[string]any) (*Compiled, error) {
 		if p.Type == TypeImage || p.Type == TypeVideo {
 			out.ArtifactRefs = append(out.ArtifactRefs, value.(string))
 		}
+	}
+	if len(problems) > 0 {
+		return nil, &ParamError{Workflow: t.Ref(), Problems: problems}
+	}
+	// Write values only after every parameter is known: a Format may insert
+	// another enum parameter's tokens.
+	bypassed := map[string]map[string]string{}
+	for i := range t.Params {
+		p := &t.Params[i]
+		value := out.Params[p.Name]
+		if chosen, isEnum := value.(string); isEnum && p.Type == TypeEnum {
+			for _, bypass := range p.Bypass {
+				if containsValue(bypass.When, chosen) {
+					bypassed[bypass.Node] = bypass.Outputs
+				}
+			}
+		}
 		for _, b := range p.Bind {
 			written := value
+			if b.Map != nil {
+				written = b.Map[value.(string)]
+			}
 			if b.Format != "" {
-				written = strings.ReplaceAll(b.Format, "{value}", value.(string))
+				text := strings.ReplaceAll(b.Format, "{value}", value.(string))
+				written = tokenRefPattern.ReplaceAllStringFunc(text, func(ref string) string {
+					name := tokenRefPattern.FindStringSubmatch(ref)[1]
+					chosen, _ := out.Params[name].(string)
+					return t.param(name).Tokens[chosen]
+				})
 			}
 			graph[b.Node].(map[string]any)["inputs"].(map[string]any)[b.Input] = written
 		}
 	}
-	if len(problems) > 0 {
-		return nil, &ParamError{Workflow: t.Ref(), Problems: problems}
+	for removedID, outputs := range bypassed {
+		removed := graph[removedID].(map[string]any)["inputs"].(map[string]any)
+		delete(graph, removedID)
+		for _, other := range graph {
+			inputs := other.(map[string]any)["inputs"].(map[string]any)
+			for name, input := range inputs {
+				if link, isLink := input.([]any); isLink && len(link) == 2 && link[0] == removedID {
+					inputs[name] = removed[outputs[fmt.Sprint(link[1])]]
+				}
+			}
+		}
 	}
 	return out, nil
 }

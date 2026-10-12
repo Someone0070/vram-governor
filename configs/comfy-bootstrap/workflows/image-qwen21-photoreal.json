@@ -119,6 +119,26 @@
           "input": "strength_model"
         }
       ]
+    },
+    {
+      "name": "precision",
+      "type": "enum",
+      "default": "int8",
+      "values": [
+        "int8",
+        "bf16"
+      ],
+      "description": "Model weights. int8 is tuned for this card; bf16 is full precision: slightly finer detail, but it does not fit in 10 GB VRAM and runs several times slower.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "unet_name",
+          "map": {
+            "int8": "qwen_image_2.1_int8_convrot.safetensors",
+            "bf16": "qwen_image_2.1_bf16.safetensors"
+          }
+        }
+      ]
     }
   ],
   "graph": {

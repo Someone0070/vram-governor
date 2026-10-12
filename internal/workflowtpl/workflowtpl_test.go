@@ -170,3 +170,79 @@ func TestRegistryResolvesLatestAndExactVersions(t *testing.T) {
 		t.Fatal("unknown template field accepted")
 	}
 }
+
+const styleTemplate = `{
+  "id": "image-style", "version": 1, "title": "Style", "operation": "image.generate", "profile": "image-test@1",
+  "params": [
+    {"name": "prompt", "type": "string", "required": true, "bind": [{"node": "13", "input": "text", "format": "{tokens:style}{value}"}]},
+    {"name": "style", "type": "enum", "default": "none", "values": ["none", "realism", "snapshot"],
+     "tokens": {"realism": "r3alism, "},
+     "bypass": [{"node": "20", "when": ["none"], "outputs": {"0": "model"}}],
+     "bind": [{"node": "20", "input": "lora_name", "map": {"realism": "Krea2-realism-V2.safetensors", "snapshot": "RealisticSnapshotKrea2V2.safetensors"}}]},
+    {"name": "style_strength", "type": "number", "default": 0.8, "min": 0, "max": 1.5, "bind": [{"node": "20", "input": "strength_model"}]},
+    {"name": "precision", "type": "enum", "default": "int8", "values": ["int8", "bf16"], "bind": [{"node": "11", "input": "unet_name", "map": {"int8": "krea2_turbo_int8_convrot.safetensors", "bf16": "krea2_bf16.safetensors"}}]}
+  ],
+  "graph": {
+    "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "krea2_turbo_int8_convrot.safetensors", "weight_dtype": "default"}},
+    "20": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["11", 0], "lora_name": "Krea2-realism-V2.safetensors", "strength_model": 0.8}},
+    "13": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+    "17": {"class_type": "KSampler", "inputs": {"model": ["20", 0], "seed": 1}}
+  }
+}`
+
+func TestEnumMapsBypassAndTokens(t *testing.T) {
+	tpl := load(t, styleTemplate)
+	plain, err := tpl.Compile(map[string]any{"prompt": "a fox"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, present := plain.Graph["20"]; present {
+		t.Fatal("style none must remove the LoRA node")
+	}
+	if link := inputs(plain, "17")["model"].([]any); link[0] != "11" || link[1] != float64(0) {
+		t.Fatalf("sampler not rewired to the UNET: %v", link)
+	}
+	if inputs(plain, "13")["text"] != "a fox" || inputs(plain, "11")["unet_name"] != "krea2_turbo_int8_convrot.safetensors" {
+		t.Fatalf("defaults wrote %v / %v", inputs(plain, "13")["text"], inputs(plain, "11")["unet_name"])
+	}
+	styled, err := tpl.Compile(map[string]any{"prompt": "a fox", "style": "realism", "style_strength": 1.1, "precision": "bf16"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lora := inputs(styled, "20")
+	if lora["lora_name"] != "Krea2-realism-V2.safetensors" || lora["strength_model"] != 1.1 {
+		t.Fatalf("lora inputs = %v", lora)
+	}
+	if inputs(styled, "13")["text"] != "r3alism, a fox" || inputs(styled, "11")["unet_name"] != "krea2_bf16.safetensors" {
+		t.Fatalf("tokens/map not applied: %v / %v", inputs(styled, "13")["text"], inputs(styled, "11")["unet_name"])
+	}
+	if link := inputs(styled, "17")["model"].([]any); link[0] != "20" {
+		t.Fatalf("styled sampler must use the LoRA: %v", link)
+	}
+	snapshot, _ := tpl.Compile(map[string]any{"prompt": "a fox", "style": "snapshot"})
+	if inputs(snapshot, "13")["text"] != "a fox" || inputs(snapshot, "20")["lora_name"] != "RealisticSnapshotKrea2V2.safetensors" {
+		t.Fatal("a style without tokens must leave the prompt unchanged")
+	}
+	if _, err := tpl.Compile(map[string]any{"prompt": "a fox", "style": "anime"}); err == nil {
+		t.Fatal("unknown style accepted")
+	}
+}
+
+func TestValidateRejectsBrokenMapsBypassAndTokens(t *testing.T) {
+	cases := map[string]func(string) string{
+		"map misses a value":   func(s string) string { return strings.Replace(s, `"snapshot": "RealisticSnapshotKrea2V2.safetensors"`, `"other": "x"`, 1) },
+		"bypass unknown value": func(s string) string { return strings.Replace(s, `"when": ["none"]`, `"when": ["off"]`, 1) },
+		"bypass non-link":      func(s string) string { return strings.Replace(s, `"outputs": {"0": "model"}`, `"outputs": {"0": "lora_name"}`, 1) },
+		"unknown token param":  func(s string) string { return strings.Replace(s, `{tokens:style}`, `{tokens:mood}`, 1) },
+		"map on a number":      func(s string) string { return strings.Replace(s, `"input": "strength_model"}`, `"input": "strength_model", "map": {"a": 1}}`, 1) },
+	}
+	for name, mutate := range cases {
+		tpl := &Template{}
+		if err := json.Unmarshal([]byte(mutate(styleTemplate)), tpl); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if err := tpl.Validate(); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

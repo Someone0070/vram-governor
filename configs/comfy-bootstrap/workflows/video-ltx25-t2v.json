@@ -112,6 +112,26 @@
           "input": "value"
         }
       ]
+    },
+    {
+      "name": "precision",
+      "type": "enum",
+      "default": "int8",
+      "values": [
+        "int8",
+        "bf16"
+      ],
+      "description": "Model weights. int8 is tuned for this card; bf16 is full precision: streams from RAM on a 10 GB card and is much slower; meant for the larger card.",
+      "bind": [
+        {
+          "node": "s384",
+          "input": "unet_name",
+          "map": {
+            "int8": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors",
+            "bf16": "ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+          }
+        }
+      ]
     }
   ],
   "graph": {

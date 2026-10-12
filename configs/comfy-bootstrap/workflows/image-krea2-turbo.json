@@ -19,7 +19,8 @@
       "bind": [
         {
           "node": "13",
-          "input": "text"
+          "input": "text",
+          "format": "{tokens:style}{value}"
         }
       ]
     },
@@ -75,6 +76,58 @@
         {
           "node": "17",
           "input": "steps"
+        }
+      ]
+    },
+    {
+      "name": "style",
+      "type": "enum",
+      "default": "none",
+      "values": [
+        "none",
+        "realism",
+        "snapshot",
+        "lenovo"
+      ],
+      "tokens": {
+        "realism": "r3alism, ",
+        "lenovo": "l3n0v0, "
+      },
+      "bypass": [
+        {
+          "node": "20",
+          "when": [
+            "none"
+          ],
+          "outputs": {
+            "0": "model"
+          }
+        }
+      ],
+      "description": "Optional look LoRA: realism (photographic), snapshot (candid realistic snapshot), lenovo (raw phone photo). Trigger words are added for you.",
+      "bind": [
+        {
+          "node": "20",
+          "input": "lora_name",
+          "map": {
+            "realism": "Krea2-realism-V2.safetensors",
+            "snapshot": "RealisticSnapshotKrea2V2.safetensors",
+            "lenovo": "lenovo_krea2.safetensors"
+          }
+        }
+      ]
+    },
+    {
+      "name": "style_strength",
+      "type": "number",
+      "default": 0.8,
+      "min": 0.0,
+      "max": 1.5,
+      "description": "Strength of the chosen style LoRA.",
+      "bind": [
+        {
+          "node": "20",
+          "input": "strength_model"
         }
       ]
     }
@@ -150,7 +203,7 @@
       "class_type": "KSampler",
       "inputs": {
         "model": [
-          "11",
+          "20",
           0
         ],
         "positive": [
@@ -203,6 +256,17 @@
       },
       "_meta": {
         "title": "Krea 2 Turbo result"
+      }
+    },
+    "20": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": [
+          "11",
+          0
+        ],
+        "lora_name": "Krea2-realism-V2.safetensors",
+        "strength_model": 0.8
       }
     }
   }

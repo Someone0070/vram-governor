@@ -83,6 +83,26 @@
           "input": "value"
         }
       ]
+    },
+    {
+      "name": "precision",
+      "type": "enum",
+      "default": "int8",
+      "values": [
+        "int8",
+        "bf16"
+      ],
+      "description": "Model weights. int8 is tuned for this card; bf16 is full precision: streams from RAM on a 10 GB card and is much slower; meant for the larger card.",
+      "bind": [
+        {
+          "node": "s6",
+          "input": "unet_name",
+          "map": {
+            "int8": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+            "bf16": "minimax_h3_fl2va_pruned_bf16.safetensors"
+          }
+        }
+      ]
     }
   ],
   "graph": {
