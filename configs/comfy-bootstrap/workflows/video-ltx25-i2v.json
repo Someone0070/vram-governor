@@ -718,11 +718,20 @@
           0
         ],
         "audio": [
-          "s358",
+          "s9370",
           0
         ],
         "fps": [
           "s359",
+          0
+        ]
+      }
+    },
+    "s9370": {
+      "class_type": "VGSanitizeAudio",
+      "inputs": {
+        "audio": [
+          "s358",
           0
         ]
       }

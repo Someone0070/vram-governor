@@ -206,8 +206,8 @@
           0
         ],
         "audio": [
-          "s74",
-          1
+          "s975",
+          0
         ],
         "fps": [
           "s74",
@@ -281,6 +281,15 @@
       "class_type": "PrimitiveBoolean",
       "inputs": {
         "value": true
+      }
+    },
+    "s975": {
+      "class_type": "VGSanitizeAudio",
+      "inputs": {
+        "audio": [
+          "s74",
+          1
+        ]
       }
     }
   }

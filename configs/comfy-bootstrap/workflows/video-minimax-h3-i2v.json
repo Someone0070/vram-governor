@@ -240,7 +240,7 @@
           0
         ],
         "audio": [
-          "s23",
+          "s991",
           0
         ]
       }
@@ -346,6 +346,15 @@
       "class_type": "PrimitiveBoolean",
       "inputs": {
         "value": true
+      }
+    },
+    "s991": {
+      "class_type": "VGSanitizeAudio",
+      "inputs": {
+        "audio": [
+          "s23",
+          0
+        ]
       }
     }
   }

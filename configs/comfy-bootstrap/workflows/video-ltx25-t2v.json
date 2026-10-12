@@ -164,7 +164,7 @@
           0
         ],
         "audio": [
-          "s358",
+          "s9370",
           0
         ],
         "fps": [
@@ -631,6 +631,15 @@
       "class_type": "PrimitiveBoolean",
       "inputs": {
         "value": false
+      }
+    },
+    "s9370": {
+      "class_type": "VGSanitizeAudio",
+      "inputs": {
+        "audio": [
+          "s358",
+          0
+        ]
       }
     }
   }

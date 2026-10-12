@@ -14,9 +14,10 @@ import logging
 
 log = logging.getLogger(__name__)
 
+import torch
+
 try:
     import comfy_kitchen
-    import torch
 except Exception:  # pragma: no cover - ComfyUI without comfy_kitchen
     comfy_kitchen = None
 
@@ -49,5 +50,30 @@ if comfy_kitchen is not None and hasattr(comfy_kitchen, "flash_attention_decode_
 
     comfy_kitchen.flash_attention_decode_is_available = flash_attention_decode_is_available
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
+class VGSanitizeAudio:
+    """Replace NaN/Inf samples and clamp to [-1, 1].
+
+    LTX-2.5 occasionally decodes audio containing NaN, and the AAC encoder in
+    SaveVideo/CreateVideo then fails the whole render ("Input contains (near)
+    NaN/+-Inf"). Silence in place of the bad samples keeps the video.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"audio": ("AUDIO",)}}
+
+    RETURN_TYPES = ("AUDIO",)
+    FUNCTION = "run"
+    CATEGORY = "vram-governor/audio"
+
+    def run(self, audio):
+        waveform = audio["waveform"]
+        bad = int((~torch.isfinite(waveform)).sum())
+        if bad:
+            log.warning("VGSanitizeAudio replaced %d non-finite samples", bad)
+        cleaned = torch.nan_to_num(waveform, nan=0.0, posinf=1.0, neginf=-1.0).clamp(-1.0, 1.0)
+        return ({**audio, "waveform": cleaned},)
+
+
+NODE_CLASS_MAPPINGS = {"VGSanitizeAudio": VGSanitizeAudio}
+NODE_DISPLAY_NAME_MAPPINGS = {"VGSanitizeAudio": "Sanitize audio (NaN/Inf)"}

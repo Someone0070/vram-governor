@@ -5,7 +5,10 @@ set -euo pipefail
 SRC_DIR=/etc/vram-governor/llama-models
 CACHE=/var/lib/vram-governor/model-cache
 install -d -m 0755 "$CACHE"
-for link in "$SRC_DIR"/*.gguf; do
+# Top-level presets and multimodal model folders (model + mmproj-*.gguf, the
+# folder name being the model id) are both supported.
+for link in "$SRC_DIR"/*.gguf "$SRC_DIR"/*/*.gguf; do
+  [ -L "$link" ] || continue
   name=$(basename "$link")
   target=$(readlink "$link")
   case "$target" in "$CACHE"/*) echo "already local: $name"; continue ;; esac
