@@ -1,0 +1,269 @@
+{
+  "id": "image-qwen21-photoreal",
+  "version": 1,
+  "title": "Photoreal image (Qwen-Image 2.1)",
+  "description": "Candid phone-photo realism: real skin texture, natural light. Best for people and everyday scenes. Describe the photo plainly (subject, place, light, camera); the realism LoRA trigger is added for you.",
+  "operation": "image.generate",
+  "profile": "image-qwen21@1",
+  "outputs": [
+    "image/png"
+  ],
+  "typical_seconds": 150,
+  "params": [
+    {
+      "name": "prompt",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "The photo, e.g. 'candid iPhone photo of ...'.",
+      "bind": [
+        {
+          "node": "5",
+          "input": "prompt",
+          "format": "l3n0v0, {value}"
+        }
+      ]
+    },
+    {
+      "name": "negative_prompt",
+      "type": "string",
+      "default": "",
+      "max_length": 2000,
+      "description": "What to avoid.",
+      "bind": [
+        {
+          "node": "5",
+          "input": "negative_prompt"
+        }
+      ]
+    },
+    {
+      "name": "width",
+      "type": "integer",
+      "default": 1024,
+      "min": 512,
+      "max": 1536,
+      "multiple_of": 16,
+      "description": "Image width in pixels.",
+      "bind": [
+        {
+          "node": "7",
+          "input": "width"
+        }
+      ]
+    },
+    {
+      "name": "height",
+      "type": "integer",
+      "default": 1024,
+      "min": 512,
+      "max": 1536,
+      "multiple_of": 16,
+      "description": "Image height in pixels.",
+      "bind": [
+        {
+          "node": "7",
+          "input": "height"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "8",
+          "input": "seed"
+        }
+      ]
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 20,
+      "min": 8,
+      "max": 40,
+      "description": "More steps give more detail, slower.",
+      "bind": [
+        {
+          "node": "8",
+          "input": "steps"
+        }
+      ]
+    },
+    {
+      "name": "cfg",
+      "type": "number",
+      "default": 3.0,
+      "min": 1.0,
+      "max": 6.0,
+      "description": "Prompt adherence.",
+      "bind": [
+        {
+          "node": "8",
+          "input": "cfg"
+        }
+      ]
+    },
+    {
+      "name": "realism",
+      "type": "number",
+      "default": 0.7,
+      "min": 0.0,
+      "max": 1.2,
+      "description": "Strength of the photo-realism LoRA.",
+      "bind": [
+        {
+          "node": "2",
+          "input": "strength_model"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      },
+      "_meta": {
+        "title": "Qwen-Image 2.1 (int8)"
+      }
+    },
+    "2": {
+      "class_type": "LoraLoaderModelOnly",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "lora_name": "lenovo_qwen21.safetensors",
+        "strength_model": 0.7
+      },
+      "_meta": {
+        "title": "Realism LoRA: Lenovo UltraReal"
+      }
+    },
+    "3": {
+      "class_type": "QwenImage21Cache",
+      "inputs": {
+        "model": [
+          "2",
+          0
+        ],
+        "device": "auto",
+        "dtype": "default"
+      },
+      "_meta": {
+        "title": "Qwen 2.1 cache"
+      }
+    },
+    "4": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+        "type": "qwen_image",
+        "device": "default"
+      },
+      "_meta": {
+        "title": "Text encoder (Qwen3-VL 8B int8)"
+      }
+    },
+    "5": {
+      "class_type": "TextEncodeQwenImage21",
+      "inputs": {
+        "clip": [
+          "4",
+          0
+        ],
+        "prompt": "",
+        "negative_prompt": "",
+        "resolution": 1024
+      },
+      "_meta": {
+        "title": "Prompt"
+      }
+    },
+    "6": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "texture_fix_vae_for_qwen_image_2.1_bf16.safetensors"
+      },
+      "_meta": {
+        "title": "Texture-fix VAE"
+      }
+    },
+    "7": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      },
+      "_meta": {
+        "title": "Size"
+      }
+    },
+    "8": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "3",
+          0
+        ],
+        "positive": [
+          "5",
+          0
+        ],
+        "negative": [
+          "5",
+          1
+        ],
+        "latent_image": [
+          "7",
+          0
+        ],
+        "seed": 1234,
+        "steps": 20,
+        "cfg": 3.0,
+        "sampler_name": "res_2s",
+        "scheduler": "beta",
+        "denoise": 1.0
+      },
+      "_meta": {
+        "title": "Sampler (res_2s / beta, CFG 3)"
+      }
+    },
+    "9": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "8",
+          0
+        ],
+        "vae": [
+          "6",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Decode"
+      }
+    },
+    "10": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "9",
+          0
+        ],
+        "filename_prefix": "lb/qwen21-photoreal"
+      },
+      "_meta": {
+        "title": "1 - Qwen + UltraReal"
+      }
+    }
+  }
+}

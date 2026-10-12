@@ -1,0 +1,209 @@
+{
+  "id": "image-krea2-turbo",
+  "version": 1,
+  "title": "Stylized image (Krea 2 Turbo)",
+  "description": "Fast stylized, illustrated, 3D, claymation, cartoon and painterly images (about 20 s). The pick for anything not photoreal. No negative prompt (turbo model).",
+  "operation": "image.generate",
+  "profile": "image-krea2@1",
+  "outputs": [
+    "image/png"
+  ],
+  "typical_seconds": 20,
+  "params": [
+    {
+      "name": "prompt",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "What to generate.",
+      "bind": [
+        {
+          "node": "13",
+          "input": "text"
+        }
+      ]
+    },
+    {
+      "name": "width",
+      "type": "integer",
+      "default": 1024,
+      "min": 512,
+      "max": 1536,
+      "multiple_of": 16,
+      "description": "Image width in pixels.",
+      "bind": [
+        {
+          "node": "16",
+          "input": "width"
+        }
+      ]
+    },
+    {
+      "name": "height",
+      "type": "integer",
+      "default": 1024,
+      "min": 512,
+      "max": 1536,
+      "multiple_of": 16,
+      "description": "Image height in pixels.",
+      "bind": [
+        {
+          "node": "16",
+          "input": "height"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "17",
+          "input": "seed"
+        }
+      ]
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 8,
+      "min": 4,
+      "max": 16,
+      "description": "Turbo model; 8 is tuned.",
+      "bind": [
+        {
+          "node": "17",
+          "input": "steps"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "11": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "unet_name": "krea2_turbo_int8_convrot.safetensors",
+        "weight_dtype": "default"
+      },
+      "_meta": {
+        "title": "Krea 2 Turbo (int8)"
+      }
+    },
+    "12": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+        "type": "krea2",
+        "device": "default"
+      },
+      "_meta": {
+        "title": "Text encoder (Qwen3-VL 4B)"
+      }
+    },
+    "13": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "12",
+          0
+        ],
+        "text": ""
+      },
+      "_meta": {
+        "title": "Prompt"
+      }
+    },
+    "14": {
+      "class_type": "ConditioningZeroOut",
+      "inputs": {
+        "conditioning": [
+          "13",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Empty negative"
+      }
+    },
+    "15": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "qwen_image_vae.safetensors"
+      },
+      "_meta": {
+        "title": "Krea 2 VAE"
+      }
+    },
+    "16": {
+      "class_type": "EmptyLatentImage",
+      "inputs": {
+        "width": 1024,
+        "height": 1024,
+        "batch_size": 1
+      },
+      "_meta": {
+        "title": "Size"
+      }
+    },
+    "17": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "11",
+          0
+        ],
+        "positive": [
+          "13",
+          0
+        ],
+        "negative": [
+          "14",
+          0
+        ],
+        "latent_image": [
+          "16",
+          0
+        ],
+        "seed": 101,
+        "steps": 8,
+        "cfg": 1.0,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1.0
+      },
+      "_meta": {
+        "title": "Sampler (template: 8 steps, CFG 1)"
+      }
+    },
+    "18": {
+      "class_type": "VAEDecode",
+      "inputs": {
+        "samples": [
+          "17",
+          0
+        ],
+        "vae": [
+          "15",
+          0
+        ]
+      },
+      "_meta": {
+        "title": "Decode"
+      }
+    },
+    "19": {
+      "class_type": "SaveImage",
+      "inputs": {
+        "images": [
+          "18",
+          0
+        ],
+        "filename_prefix": "lb/krea2"
+      },
+      "_meta": {
+        "title": "Krea 2 Turbo result"
+      }
+    }
+  }
+}

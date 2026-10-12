@@ -1,0 +1,617 @@
+{
+  "id": "video-ltx25-t2v",
+  "version": 1,
+  "title": "Text-to-video (LTX-2.5, two-stage + audio)",
+  "description": "LTX-2.5 two-stage render (half-res pass, 2x latent upscale, refine) with generated audio. Great for 3D and stylized shots; weak on flat 2D cartoons.",
+  "operation": "video.generate_sequence",
+  "profile": "video-ltx25-t2v@1",
+  "outputs": [
+    "video/mp4"
+  ],
+  "typical_seconds": 150,
+  "params": [
+    {
+      "name": "prompt",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "Describe the shot: subject, action, camera and sound. Generated audio follows the prompt.",
+      "bind": [
+        {
+          "node": "s376",
+          "input": "value"
+        }
+      ]
+    },
+    {
+      "name": "negative_prompt",
+      "type": "string",
+      "default": "pc game, console game, video game, cartoon, childish, ugly",
+      "max_length": 2000,
+      "description": "What to avoid.",
+      "bind": [
+        {
+          "node": "s373",
+          "input": "text"
+        }
+      ]
+    },
+    {
+      "name": "seconds",
+      "type": "integer",
+      "default": 5,
+      "min": 1,
+      "max": 10,
+      "description": "Clip length (24 fps).",
+      "bind": [
+        {
+          "node": "s362",
+          "input": "value"
+        }
+      ]
+    },
+    {
+      "name": "aspect_ratio",
+      "type": "enum",
+      "default": "16:9 (Widescreen)",
+      "values": [
+        "1:1 (Square)",
+        "2:3 (Portrait Photo)",
+        "3:2 (Photo)",
+        "3:4 (Portrait Standard)",
+        "4:3 (Standard)",
+        "9:16 (Portrait Widescreen)",
+        "16:9 (Widescreen)",
+        "21:9 (Ultrawide)"
+      ],
+      "description": "Frame shape.",
+      "bind": [
+        {
+          "node": "409",
+          "input": "aspect_ratio"
+        }
+      ]
+    },
+    {
+      "name": "megapixels",
+      "type": "number",
+      "default": 0.9,
+      "min": 0.1,
+      "max": 0.9,
+      "description": "Output size: 0.25 is about 672x384 at 16:9, 0.9 about 1280x704.",
+      "bind": [
+        {
+          "node": "409",
+          "input": "megapixels"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "s338",
+          "input": "noise_seed"
+        },
+        {
+          "node": "s339",
+          "input": "noise_seed"
+        }
+      ]
+    },
+    {
+      "name": "enhance_prompt",
+      "type": "boolean",
+      "default": false,
+      "description": "Let the built-in Gemma model rewrite the prompt into a detailed shot description (slower).",
+      "bind": [
+        {
+          "node": "s383",
+          "input": "value"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "75": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "filename_prefix": "lb/ltx25-t2v",
+        "video": [
+          "s370",
+          0
+        ],
+        "format": "mp4",
+        "codec": "h264"
+      }
+    },
+    "409": {
+      "class_type": "ResolutionSelector",
+      "inputs": {
+        "aspect_ratio": "16:9 (Widescreen)",
+        "megapixels": 0.9,
+        "multiple": 32
+      }
+    },
+    "s370": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "bit_depth": 8,
+        "images": [
+          "s374",
+          0
+        ],
+        "audio": [
+          "s358",
+          0
+        ],
+        "fps": [
+          "s359",
+          0
+        ]
+      }
+    },
+    "s340": {
+      "class_type": "LTXVConcatAVLatent",
+      "inputs": {
+        "video_latent": [
+          "s348",
+          0
+        ],
+        "audio_latent": [
+          "s367",
+          1
+        ]
+      }
+    },
+    "s395": {
+      "class_type": "ManualSigmas",
+      "inputs": {
+        "sigmas": "0.85, 0.7250, 0.4219, 0.0"
+      }
+    },
+    "s348": {
+      "class_type": "LTXVLatentUpsampler",
+      "inputs": {
+        "samples": [
+          "s367",
+          0
+        ],
+        "upscale_model": [
+          "s371",
+          0
+        ],
+        "vae": [
+          "s385",
+          0
+        ]
+      }
+    },
+    "s358": {
+      "class_type": "LTXVAudioVAEDecode",
+      "inputs": {
+        "samples": [
+          "s369",
+          1
+        ],
+        "audio_vae": [
+          "s386",
+          0
+        ]
+      }
+    },
+    "s341": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler_ancestral"
+      }
+    },
+    "s391": {
+      "class_type": "LTXVDualCFGGuider",
+      "inputs": {
+        "video_cfg": 1,
+        "audio_cfg": 1,
+        "model": [
+          "s384",
+          0
+        ],
+        "positive": [
+          "s365",
+          0
+        ],
+        "negative": [
+          "s365",
+          1
+        ]
+      }
+    },
+    "s368": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "s338",
+          0
+        ],
+        "guider": [
+          "s391",
+          0
+        ],
+        "sampler": [
+          "s341",
+          0
+        ],
+        "sigmas": [
+          "s395",
+          0
+        ],
+        "latent_image": [
+          "s340",
+          0
+        ]
+      }
+    },
+    "s338": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": 42
+      }
+    },
+    "s367": {
+      "class_type": "LTXVSeparateAVLatent",
+      "inputs": {
+        "av_latent": [
+          "s344",
+          0
+        ]
+      }
+    },
+    "s369": {
+      "class_type": "LTXVSeparateAVLatent",
+      "inputs": {
+        "av_latent": [
+          "s368",
+          0
+        ]
+      }
+    },
+    "s374": {
+      "class_type": "VAEDecodeTiled",
+      "inputs": {
+        "tile_size": 512,
+        "overlap": 64,
+        "temporal_size": 64,
+        "temporal_overlap": 16,
+        "samples": [
+          "s369",
+          0
+        ],
+        "vae": [
+          "s385",
+          0
+        ]
+      }
+    },
+    "s344": {
+      "class_type": "SamplerCustomAdvanced",
+      "inputs": {
+        "noise": [
+          "s339",
+          0
+        ],
+        "guider": [
+          "s388",
+          0
+        ],
+        "sampler": [
+          "s352",
+          0
+        ],
+        "sigmas": [
+          "s404",
+          0
+        ],
+        "latent_image": [
+          "s377",
+          0
+        ]
+      }
+    },
+    "s404": {
+      "class_type": "ManualSigmas",
+      "inputs": {
+        "sigmas": "1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0"
+      }
+    },
+    "s388": {
+      "class_type": "LTXVDualCFGGuider",
+      "inputs": {
+        "video_cfg": 1,
+        "audio_cfg": 1,
+        "model": [
+          "s384",
+          0
+        ],
+        "positive": [
+          "s365",
+          0
+        ],
+        "negative": [
+          "s365",
+          1
+        ]
+      }
+    },
+    "s352": {
+      "class_type": "KSamplerSelect",
+      "inputs": {
+        "sampler_name": "euler_ancestral"
+      }
+    },
+    "s339": {
+      "class_type": "RandomNoise",
+      "inputs": {
+        "noise_seed": 558811532553686
+      }
+    },
+    "s365": {
+      "class_type": "LTXVConditioning",
+      "inputs": {
+        "positive": [
+          "s364",
+          0
+        ],
+        "negative": [
+          "s373",
+          0
+        ],
+        "frame_rate": [
+          "s359",
+          0
+        ]
+      }
+    },
+    "s377": {
+      "class_type": "LTXVConcatAVLatent",
+      "inputs": {
+        "video_latent": [
+          "s356",
+          0
+        ],
+        "audio_latent": [
+          "s366",
+          0
+        ]
+      }
+    },
+    "s364": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "clip": [
+          "s387",
+          0
+        ],
+        "text": [
+          "s382",
+          0
+        ]
+      }
+    },
+    "s373": {
+      "class_type": "CLIPTextEncode",
+      "inputs": {
+        "text": "pc game, console game, video game, cartoon, childish, ugly",
+        "clip": [
+          "s387",
+          0
+        ]
+      }
+    },
+    "s356": {
+      "class_type": "EmptyLTXVLatentVideo",
+      "inputs": {
+        "batch_size": 1,
+        "width": [
+          "s353",
+          1
+        ],
+        "height": [
+          "s355",
+          1
+        ],
+        "length": [
+          "s378",
+          1
+        ]
+      }
+    },
+    "s366": {
+      "class_type": "LTXVEmptyLatentAudio",
+      "inputs": {
+        "batch_size": 1,
+        "audio_vae": [
+          "s386",
+          0
+        ],
+        "frames_number": [
+          "s378",
+          1
+        ],
+        "frame_rate": [
+          "s359",
+          1
+        ]
+      }
+    },
+    "s382": {
+      "class_type": "ComfySwitchNode",
+      "inputs": {
+        "on_false": [
+          "s376",
+          0
+        ],
+        "on_true": [
+          "s380",
+          0
+        ],
+        "switch": [
+          "s383",
+          0
+        ]
+      }
+    },
+    "s371": {
+      "class_type": "LatentUpscaleModelLoader",
+      "inputs": {
+        "model_name": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+      }
+    },
+    "s384": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "weight_dtype": "default",
+        "unet_name": "ltx-2.5-22b-distilled-transformer-comfy-int8-convrot.safetensors"
+      }
+    },
+    "s385": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "ltx-2.5-video-vae-bf16.safetensors"
+      }
+    },
+    "s386": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "ltx-2.5-audio-vae-bf16.safetensors"
+      }
+    },
+    "s387": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "type": "ltxv",
+        "device": "default",
+        "clip_name": "gemma4-12b-with-proj-ltx-2.5-comfy-int8-convrot.safetensors"
+      }
+    },
+    "s380": {
+      "class_type": "TextGenerateLTX2Prompt",
+      "inputs": {
+        "max_length": 600,
+        "clip": [
+          "s393",
+          0
+        ],
+        "prompt": [
+          "s376",
+          0
+        ],
+        "sampling_mode": "on",
+        "sampling_mode.temperature": 0.7,
+        "sampling_mode.top_k": 64,
+        "sampling_mode.top_p": 0.95,
+        "sampling_mode.min_p": 0.05,
+        "sampling_mode.repetition_penalty": 1.15,
+        "sampling_mode.seed": 0,
+        "sampling_mode.presence_penalty": 0.0,
+        "thinking": false,
+        "use_default_template": true,
+        "mtp": "auto"
+      }
+    },
+    "s378": {
+      "class_type": "ComfyMathExpression",
+      "inputs": {
+        "expression": "a * b + 1",
+        "values.a": [
+          "s362",
+          0
+        ],
+        "values.b": [
+          "s361",
+          0
+        ]
+      }
+    },
+    "s353": {
+      "class_type": "ComfyMathExpression",
+      "inputs": {
+        "expression": "a/2",
+        "values.a": [
+          "s372",
+          0
+        ]
+      }
+    },
+    "s355": {
+      "class_type": "ComfyMathExpression",
+      "inputs": {
+        "expression": "a/2",
+        "values.a": [
+          "s360",
+          0
+        ]
+      }
+    },
+    "s359": {
+      "class_type": "ComfyMathExpression",
+      "inputs": {
+        "expression": "a",
+        "values.a": [
+          "s361",
+          0
+        ]
+      }
+    },
+    "s360": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": [
+          "409",
+          1
+        ]
+      }
+    },
+    "s361": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": 24
+      }
+    },
+    "s362": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": 5
+      }
+    },
+    "s372": {
+      "class_type": "PrimitiveInt",
+      "inputs": {
+        "value": [
+          "409",
+          0
+        ]
+      }
+    },
+    "s376": {
+      "class_type": "PrimitiveStringMultiline",
+      "inputs": {
+        "value": ""
+      }
+    },
+    "s393": {
+      "class_type": "CLIPLoader",
+      "inputs": {
+        "type": "ltxv",
+        "device": "default",
+        "clip_name": "gemma4_e2b_it_int8_convrot.safetensors"
+      }
+    },
+    "s383": {
+      "class_type": "PrimitiveBoolean",
+      "inputs": {
+        "value": false
+      }
+    }
+  }
+}

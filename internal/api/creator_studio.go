@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"vram-governor/internal/domain"
 	"vram-governor/internal/store"
+	"vram-governor/internal/workflowtpl"
 	"vram-governor/internal/workloads"
 )
 
@@ -46,6 +48,10 @@ type creatorStudioRequest struct {
 	Egress             domain.EgressPolicy            `json:"egress"`
 	Notifications      domain.NotificationPreferences `json:"notifications"`
 	ArtifactRefs       []string                       `json:"artifact_refs"`
+	// Workflow names a parameterized template (GET /api/v1/workflows); the
+	// controller compiles Params into the graph payload.
+	Workflow string         `json:"workflow"`
+	Params   map[string]any `json:"params"`
 }
 
 type creatorBatchRequest struct {
@@ -96,12 +102,20 @@ type creatorWorkloadResponse struct {
 	Outputs             []creatorArtifactOutput `json:"outputs,omitempty"`
 	ContinuationRef     string                  `json:"continuation_ref,omitempty"`
 	InfrastructureError string                  `json:"infrastructure_error,omitempty"`
+	// Workflow echoes the template and the effective params (defaults and
+	// the chosen seed filled in) so a result can be reproduced exactly.
+	Workflow *creatorWorkflowEcho `json:"workflow,omitempty"`
 	// Machine-readable admission detail for queued/blocked rows. Reason stays
 	// the Creator Studio enum; these mirror the scheduler decision.
 	BlockerCode       domain.AdmissionBlocker `json:"blocker_code,omitempty"`
 	EstimatedStart    *time.Time              `json:"estimated_start,omitempty"`
 	RetryAfterSeconds int                     `json:"retry_after_seconds,omitempty"`
 	Alternatives      []string                `json:"alternatives,omitempty"`
+}
+
+type creatorWorkflowEcho struct {
+	Ref    string         `json:"ref"`
+	Params map[string]any `json:"params"`
 }
 
 type creatorBlockedResponse struct {
@@ -287,6 +301,52 @@ func canonicalProfileGroups(preferences domain.ProfilePreferences, resolved []do
 	return canonical
 }
 
+// compileCreatorWorkflow turns workflow+params into the graph payload a
+// hand-written request would carry. The template supplies the operation and
+// profile; explicit values must agree with it.
+func (s *Server) compileCreatorWorkflow(body *creatorStudioRequest) error {
+	if len(body.Payload) > 0 || len(body.Inputs) > 0 {
+		return fmt.Errorf("a workflow request takes params, not payload or inputs")
+	}
+	var registry *workflowtpl.Registry
+	if s.cfg != nil {
+		registry = s.cfg.WorkflowTemplates
+	}
+	template, err := registry.Get(body.Workflow)
+	if err != nil {
+		return err
+	}
+	if body.Operation == "" {
+		body.Operation = template.Operation
+	} else if body.Operation != template.Operation {
+		return fmt.Errorf("workflow %s runs operation %s, not %s", template.Ref(), template.Operation, body.Operation)
+	}
+	prefs := body.ProfilePreferences
+	if len(prefs.Preferred) == 0 && len(prefs.Acceptable) == 0 {
+		body.ProfilePreferences = domain.ProfilePreferences{Preferred: []string{template.Profile}, FallbackPolicy: "explicit"}
+	} else if !slices.Contains(prefs.Preferred, template.Profile) && !slices.Contains(prefs.Acceptable, template.Profile) {
+		return fmt.Errorf("workflow %s runs under profile %s, which profile_preferences exclude", template.Ref(), template.Profile)
+	}
+	compiled, err := template.Compile(body.Params)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"managed_chunks": []any{map[string]any{"id": body.WorkloadID, "prompt": compiled.Graph}},
+		"workflow":       creatorWorkflowEcho{Ref: template.Ref(), Params: compiled.Params},
+	})
+	if err != nil {
+		return err
+	}
+	body.Payload = payload
+	for _, ref := range compiled.ArtifactRefs {
+		if !slices.Contains(body.ArtifactRefs, ref) {
+			body.ArtifactRefs = append(body.ArtifactRefs, ref)
+		}
+	}
+	return nil
+}
+
 func (s *Server) buildCreatorWorkload(r *http.Request, principal Principal, body creatorStudioRequest) (domain.WorkloadRequest, *creatorBlockedResponse, error) {
 	if body.WorkloadID == "" && body.IdempotencyKey == "" {
 		return domain.WorkloadRequest{}, nil, fmt.Errorf("workload_id or idempotency_key is required")
@@ -296,6 +356,13 @@ func (s *Server) buildCreatorWorkload(r *http.Request, principal Principal, body
 	}
 	if body.IdempotencyKey == "" {
 		body.IdempotencyKey = "creator-studio:" + body.WorkloadID
+	}
+	if body.Workflow != "" {
+		if err := s.compileCreatorWorkflow(&body); err != nil {
+			return domain.WorkloadRequest{}, nil, err
+		}
+	} else if body.Params != nil {
+		return domain.WorkloadRequest{}, nil, fmt.Errorf("params require a workflow")
 	}
 	if body.Operation == "" {
 		return domain.WorkloadRequest{}, nil, fmt.Errorf("operation is required")
@@ -365,6 +432,12 @@ func (s *Server) buildCreatorWorkload(r *http.Request, principal Principal, body
 
 func (s *Server) creatorResponse(ctx *http.Request, row *domain.Workload) creatorWorkloadResponse {
 	response := creatorWorkloadResponse{WorkloadID: row.Request.ID, Operation: row.Request.Operation, BatchID: row.Request.BatchID, AffinityKey: row.Request.AffinityKey, Progress: row.Progress, ProgressStage: row.ProgressStage, ProgressCurrent: row.ProgressCurrent, ProgressTotal: row.ProgressTotal}
+	var compiled struct {
+		Workflow *creatorWorkflowEcho `json:"workflow"`
+	}
+	if json.Unmarshal(row.Request.Payload, &compiled) == nil && compiled.Workflow != nil && compiled.Workflow.Ref != "" {
+		response.Workflow = compiled.Workflow
+	}
 	switch row.Status {
 	case domain.WorkloadQueued:
 		response.Status = "queued"
@@ -504,7 +577,77 @@ func (s *Server) handleCreatorCapabilities(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles})
+	workflows := []workflowSummary{}
+	for _, t := range s.workflowRegistry().All() {
+		workflows = append(workflows, summarizeWorkflow(t))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"profiles": profiles, "workflows": workflows})
+}
+
+type workflowSummary struct {
+	Ref            string              `json:"ref"`
+	ID             string              `json:"id"`
+	Version        int                 `json:"version"`
+	Title          string              `json:"title"`
+	Description    string              `json:"description,omitempty"`
+	Operation      string              `json:"operation"`
+	Profile        string              `json:"profile"`
+	Outputs        []string            `json:"outputs,omitempty"`
+	TypicalSeconds int                 `json:"typical_seconds,omitempty"`
+	Params         []workflowParamInfo `json:"params"`
+}
+
+// workflowParamInfo is the public view of a parameter: node bindings are
+// controller-private.
+type workflowParamInfo struct {
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Description string   `json:"description,omitempty"`
+	Required    bool     `json:"required,omitempty"`
+	Default     any      `json:"default,omitempty"`
+	Min         *float64 `json:"min,omitempty"`
+	Max         *float64 `json:"max,omitempty"`
+	MultipleOf  int64    `json:"multiple_of,omitempty"`
+	MaxLength   int      `json:"max_length,omitempty"`
+	Values      []string `json:"values,omitempty"`
+}
+
+func summarizeWorkflow(t *workflowtpl.Template) workflowSummary {
+	out := workflowSummary{Ref: t.Ref(), ID: t.ID, Version: t.Version, Title: t.Title, Description: t.Description, Operation: t.Operation, Profile: t.Profile, Outputs: t.Outputs, TypicalSeconds: t.TypicalSeconds, Params: []workflowParamInfo{}}
+	for _, p := range t.Params {
+		out.Params = append(out.Params, workflowParamInfo{Name: p.Name, Type: p.Type, Description: p.Description, Required: p.Required, Default: p.Default, Min: p.Min, Max: p.Max, MultipleOf: p.MultipleOf, MaxLength: p.MaxLength, Values: p.Values})
+	}
+	return out
+}
+
+func (s *Server) workflowRegistry() *workflowtpl.Registry {
+	if s.cfg == nil {
+		return nil
+	}
+	return s.cfg.WorkflowTemplates
+}
+
+func (s *Server) handleListWorkflows(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requirePrincipal(w, r, "workloads:read"); !ok {
+		return
+	}
+	list := []workflowSummary{}
+	for _, t := range s.workflowRegistry().All() {
+		list = append(list, summarizeWorkflow(t))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"workflows": list})
+}
+
+func (s *Server) handleGetWorkflow(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.requirePrincipal(w, r, "workloads:read"); !ok {
+		return
+	}
+	t, err := s.workflowRegistry().Get(r.PathValue("ref"))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, summarizeWorkflow(t))
 }
 
 func (s *Server) handleCreatorBatch(w http.ResponseWriter, r *http.Request) {

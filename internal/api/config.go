@@ -7,12 +7,14 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"vram-governor/internal/domain"
+	"vram-governor/internal/workflowtpl"
 )
 
 // Config is the controller's configuration file shape (configs/controller.yaml).
@@ -51,6 +53,9 @@ type Config struct {
 		Checkpoint                     CheckpointConfig             `yaml:"checkpoint"`
 		Residency                      ResidencyConfig              `yaml:"residency"`
 		Targets                        []WorkloadTargetConfig       `yaml:"targets"`
+		// WorkflowTemplatesDir holds parameterized Comfy workflow templates
+		// (internal/workflowtpl). Each must name a configured profile.
+		WorkflowTemplatesDir string `yaml:"workflow_templates_dir"`
 		// OpenAI queueing fallbacks below body, X-VRAM-* headers and the
 		// credential. fail_fast stays the default so existing clients keep
 		// their immediate 429/503 behaviour.
@@ -58,6 +63,9 @@ type Config struct {
 		OpenAIDefaultMaxWaitSeconds int    `yaml:"openai_default_max_wait_seconds"`
 	} `yaml:"workloads"`
 	SmartPlugs []SmartPlugConfig `yaml:"smart_plugs"`
+
+	// WorkflowTemplates is loaded from Workloads.WorkflowTemplatesDir.
+	WorkflowTemplates *workflowtpl.Registry `yaml:"-"`
 
 	Notifications NotificationConfig `yaml:"notifications"`
 	Agents        AgentConfig        `yaml:"agents"`
@@ -494,7 +502,39 @@ func LoadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("production notifications require signing_secret_env")
 		}
 	}
+	if c.Workloads.WorkflowTemplatesDir != "" {
+		registry, err := workflowtpl.LoadDir(c.Workloads.WorkflowTemplatesDir)
+		if err != nil {
+			return nil, fmt.Errorf("workflow templates: %w", err)
+		}
+		if err := validateWorkflowTemplates(registry, c.Workloads.Targets); err != nil {
+			return nil, err
+		}
+		c.WorkflowTemplates = registry
+	}
 	return &c, nil
+}
+
+// validateWorkflowTemplates requires every template to run under a configured
+// profile that offers its operation, so a typo fails -check-config instead of
+// every request.
+func validateWorkflowTemplates(registry *workflowtpl.Registry, targets []WorkloadTargetConfig) error {
+	profiles := map[string]domain.RuntimeProfile{}
+	for _, target := range targets {
+		for _, profile := range target.Profiles {
+			profiles[profile.Ref()] = profile
+		}
+	}
+	for _, template := range registry.All() {
+		profile, ok := profiles[template.Profile]
+		if !ok {
+			return fmt.Errorf("workflow %s names unknown profile %s", template.Ref(), template.Profile)
+		}
+		if !slices.Contains(profile.Operations, template.Operation) {
+			return fmt.Errorf("workflow %s operation %s is not offered by profile %s", template.Ref(), template.Operation, template.Profile)
+		}
+	}
+	return nil
 }
 
 func isPrivateAdminCIDR(raw string) bool {

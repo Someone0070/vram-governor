@@ -41,6 +41,8 @@ func (s *Server) routes(dashboardFS http.FileSystem) {
 
 	// Unified workload surface plus OpenAI- and Comfy-compatible gateways.
 	s.mux.HandleFunc("GET /api/v1/capabilities", s.handleCreatorCapabilities)
+	s.mux.HandleFunc("GET /api/v1/workflows", s.handleListWorkflows)
+	s.mux.HandleFunc("GET /api/v1/workflows/{ref}", s.handleGetWorkflow)
 	s.mux.HandleFunc("POST /api/v1/workloads", s.handleSubmitWorkload)
 	s.mux.HandleFunc("POST /api/v1/workloads/batch", s.handleCreatorBatch)
 	s.mux.HandleFunc("GET /api/v1/batches/{batch_id}", s.handleCreatorBatchStatus)

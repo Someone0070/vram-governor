@@ -114,10 +114,11 @@ func (s *Server) handleSubmitWorkload(w http.ResponseWriter, r *http.Request) {
 	}
 	var marker struct {
 		Operation string `json:"operation"`
+		Workflow  string `json:"workflow"`
 	}
 	_ = json.Unmarshal(raw, &marker)
 	var req domain.WorkloadRequest
-	creatorRequest := marker.Operation != ""
+	creatorRequest := marker.Operation != "" || marker.Workflow != ""
 	if creatorRequest {
 		var body creatorStudioRequest
 		if err := decodeStrictCreator(raw, &body); err != nil {

@@ -1,0 +1,287 @@
+{
+  "id": "video-seedvr2-upscale",
+  "version": 1,
+  "title": "Video upscale (SeedVR2 7B)",
+  "description": "Restores and upscales a video: crisper detail without the waxy look. Slow on the current card (about 8.5 min for 5 s at 1.5x). Feed it the artifact id of an earlier video job.",
+  "operation": "video.upscale",
+  "profile": "video-seedvr2@1",
+  "outputs": [
+    "video/mp4"
+  ],
+  "typical_seconds": 510,
+  "params": [
+    {
+      "name": "video",
+      "type": "video",
+      "required": true,
+      "description": "Video to upscale (artifact id).",
+      "bind": [
+        {
+          "node": "73",
+          "input": "file"
+        }
+      ]
+    },
+    {
+      "name": "scale",
+      "type": "number",
+      "default": 1.5,
+      "min": 1.0,
+      "max": 2.0,
+      "description": "Output size multiplier.",
+      "bind": [
+        {
+          "node": "s57",
+          "input": "resize_type.multiplier"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "s54",
+          "input": "seed"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "73": {
+      "class_type": "LoadVideo",
+      "inputs": {
+        "file": ""
+      }
+    },
+    "76": {
+      "class_type": "SaveVideo",
+      "inputs": {
+        "filename_prefix": "lb/seedvr2",
+        "video": [
+          "s75",
+          0
+        ],
+        "format": "mp4",
+        "codec": "h264"
+      }
+    },
+    "s48": {
+      "class_type": "VAEEncodeTiled",
+      "inputs": {
+        "tile_size": 512,
+        "overlap": 128,
+        "temporal_size": 64,
+        "temporal_overlap": 8,
+        "pixels": [
+          "s58",
+          0
+        ],
+        "vae": [
+          "s51",
+          0
+        ]
+      }
+    },
+    "s51": {
+      "class_type": "VAELoader",
+      "inputs": {
+        "vae_name": "seedvr2_ema_vae_fp16.safetensors"
+      }
+    },
+    "s52": {
+      "class_type": "UNETLoader",
+      "inputs": {
+        "weight_dtype": "default",
+        "unet_name": "seedvr2_ema_7b_bf16.safetensors"
+      }
+    },
+    "s54": {
+      "class_type": "KSampler",
+      "inputs": {
+        "steps": 1,
+        "cfg": 1,
+        "model": [
+          "s52",
+          0
+        ],
+        "positive": [
+          "s61",
+          0
+        ],
+        "negative": [
+          "s61",
+          1
+        ],
+        "latent_image": [
+          "s102",
+          0
+        ],
+        "seed": 42,
+        "sampler_name": "euler",
+        "scheduler": "simple",
+        "denoise": 1.0
+      }
+    },
+    "s55": {
+      "class_type": "VAEDecodeTiled",
+      "inputs": {
+        "tile_size": 512,
+        "overlap": 128,
+        "temporal_size": 64,
+        "temporal_overlap": 8,
+        "samples": [
+          "s103",
+          0
+        ],
+        "vae": [
+          "s51",
+          0
+        ]
+      }
+    },
+    "s57": {
+      "class_type": "ResizeImageMaskNode",
+      "inputs": {
+        "scale_method": "lanczos",
+        "input": [
+          "s74",
+          0
+        ],
+        "resize_type.multiplier": 1.5,
+        "resize_type": "scale by multiplier"
+      }
+    },
+    "s58": {
+      "class_type": "SeedVR2Preprocess",
+      "inputs": {
+        "resized_images": [
+          "s57",
+          0
+        ]
+      }
+    },
+    "s59": {
+      "class_type": "SeedVR2PostProcessing",
+      "inputs": {
+        "images": [
+          "s55",
+          0
+        ],
+        "original_resized_images": [
+          "s57",
+          0
+        ],
+        "color_correction_method": "lab"
+      }
+    },
+    "s61": {
+      "class_type": "SeedVR2Conditioning",
+      "inputs": {
+        "model": [
+          "s52",
+          0
+        ],
+        "vae_conditioning": [
+          "s102",
+          0
+        ]
+      }
+    },
+    "s74": {
+      "class_type": "GetVideoComponents",
+      "inputs": {
+        "video": [
+          "73",
+          0
+        ]
+      }
+    },
+    "s75": {
+      "class_type": "CreateVideo",
+      "inputs": {
+        "images": [
+          "s59",
+          0
+        ],
+        "audio": [
+          "s74",
+          1
+        ],
+        "fps": [
+          "s74",
+          2
+        ],
+        "bit_depth": [
+          "s74",
+          3
+        ]
+      }
+    },
+    "s99": {
+      "class_type": "SeedVR2TemporalChunk",
+      "inputs": {
+        "latent": [
+          "s48",
+          0
+        ],
+        "temporal_overlap": 2,
+        "chunking_mode": "auto"
+      }
+    },
+    "s100": {
+      "class_type": "SeedVR2TemporalMerge",
+      "inputs": {
+        "latents": [
+          "s54",
+          0
+        ],
+        "temporal_overlap": [
+          "s99",
+          1
+        ]
+      }
+    },
+    "s102": {
+      "class_type": "ComfySwitchNode",
+      "inputs": {
+        "on_false": [
+          "s48",
+          0
+        ],
+        "on_true": [
+          "s99",
+          0
+        ],
+        "switch": [
+          "s105",
+          0
+        ]
+      }
+    },
+    "s103": {
+      "class_type": "ComfySwitchNode",
+      "inputs": {
+        "on_false": [
+          "s54",
+          0
+        ],
+        "on_true": [
+          "s100",
+          0
+        ],
+        "switch": [
+          "s105",
+          0
+        ]
+      }
+    },
+    "s105": {
+      "class_type": "PrimitiveBoolean",
+      "inputs": {
+        "value": true
+      }
+    }
+  }
+}
