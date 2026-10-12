@@ -28,6 +28,14 @@ IMAGE_INPUT_PROFILES = {
     "video-minimax-h3-i2v": (["video.first_last_frame", "video.image_to_video"], ["video-minimax-h3-i2v.json", "video-minimax-h3-flf2v.json"], {"INPUT_IMAGE", "REPLACE_POSITIVE_PROMPT"}),
 }
 IMAGE_TYPES = ["application/json", "image/jpeg", "image/png", "image/webp"]
+# Profiles that only parameterized workflow templates (workflows/*.json) run;
+# their digest is the controller-computed one recorded at registration.
+WORKFLOW_PROFILES = {
+    "image-qwen21": ("IMAGE", ["image.generate"], ["application/json"], {"application/json", "image/png"}),
+    "image-krea2": ("IMAGE", ["image.generate"], ["application/json"], {"application/json", "image/png"}),
+    "video-ltx25-t2v": ("VIDEO", ["video.generate_sequence"], ["application/json"], {"application/json", "video/mp4"}),
+    "video-seedvr2": ("VIDEO", ["video.upscale"], ["application/json", "video/mp4"], {"application/json", "video/mp4"}),
+}
 
 
 def read_json(name):
@@ -75,7 +83,7 @@ def profile_digest(workflow, manifest, model_ids):
 def validate_profiles(profiles, graphs, manifest, metadata):
     require(profiles.get("target_id") == "cmp170-video-managed" and profiles.get("adapter") == "comfy" and profiles.get("runtime_protocol") == "managed_comfy_v1", "profile target binding drift")
     rows = {row.get("profile_id"): row for row in profiles.get("profiles", [])}
-    require(set(rows) == set(PROFILE_EXPECTATIONS) | set(IMAGE_INPUT_PROFILES), "profile ids differ from the declared contract")
+    require(set(rows) == set(PROFILE_EXPECTATIONS) | set(IMAGE_INPUT_PROFILES) | set(WORKFLOW_PROFILES), "profile ids differ from the declared contract")
     require(metadata.get("schema_version") == 1 and metadata.get("target_id") == profiles["target_id"], "workflow metadata binding drift")
     manifest_rows = {row["id"]: row for row in manifest["models"]}
     require(set(metadata.get("profiles", {})) == {"image-sdxl-base@1", "video-wan22-5b@1"} | {pid + "@1" for pid in IMAGE_INPUT_PROFILES}, "workflow metadata profile ids drift")
@@ -114,6 +122,31 @@ def validate_profiles(profiles, graphs, manifest, metadata):
             require(workflow in graphs, "profile references missing graph: " + workflow)
             text = (PACKAGE / workflow).read_text(encoding="utf-8")
             require(all(token in text for token in placeholders), "graph lacks client placeholders: " + workflow)
+    for profile_id, (modality, operations, accepted, produced) in WORKFLOW_PROFILES.items():
+        row = rows[profile_id]
+        require(row.get("version") == "1" and row.get("operations") == operations and row.get("modality") == modality, "workflow profile drift: " + profile_id)
+        require(row.get("execution_locality") == "LB_MANAGED" and row.get("adapter") == "comfy", "workflow profile locality drift: " + profile_id)
+        require(re.fullmatch(r"[0-9a-f]{64}", row.get("digest", "")) is not None, "workflow profile digest missing: " + profile_id)
+        require(row.get("accepted_artifact_types") == accepted and set(row.get("produced_artifact_types", [])) == produced, "workflow profile artifact contract drift: " + profile_id)
+        require(row.get("input_schema") == rows["video-wan22-5b"].get("input_schema"), "workflow profile must use the managed_chunks graph schema")
+        require((PACKAGE / row.get("workflow", "")).is_file(), "workflow profile names a missing template: " + profile_id)
+    return True
+
+
+def validate_templates(profiles):
+    """Every template must run under a declared profile offering its operation."""
+    rows = {row["profile_id"] + "@" + row["version"]: row for row in profiles["profiles"]}
+    seen = set()
+    for path in sorted((PACKAGE / "workflows").glob("*.json")):
+        template = json.loads(path.read_text(encoding="utf-8"))
+        ref = "%s@%s" % (template.get("id"), template.get("version"))
+        require(path.stem == template.get("id") and ref not in seen, "template id must match its file name: " + path.name)
+        seen.add(ref)
+        profile = rows.get(template.get("profile"))
+        require(profile is not None, "template names an undeclared profile: " + path.name)
+        require(template.get("operation") in profile["operations"], "template operation not offered by its profile: " + path.name)
+        validate_graph(template.get("graph"), set())
+    require(len(seen) >= 10, "workflow templates missing")
     return True
 
 
@@ -150,6 +183,7 @@ def main():
     validate_manifest(manifest)
     profiles = read_json("profiles.json")
     validate_profiles(profiles, graphs, manifest, read_json("workflow-metadata.json"))
+    validate_templates(profiles)
 
     # Negative controls ensure link and profile-claim failures are detected.
     broken_graph = copy.deepcopy(graphs["image-sdxl-smoke.json"])
@@ -176,6 +210,15 @@ def main():
         pass
     else:
         raise AssertionError("negative control: image-input profile without image types was accepted")
+
+    broken_profiles = copy.deepcopy(profiles)
+    next(row for row in broken_profiles["profiles"] if row["profile_id"] == "image-krea2")["operations"] = ["video.upscale"]
+    try:
+        validate_templates(broken_profiles)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("negative control: template under a profile lacking its operation was accepted")
 
     installer = (ROOT / "scripts" / "comfy-bootstrap" / "install_models.py").read_text(encoding="utf-8")
     require("--check" in installer and "--apply" in installer, "installer modes missing")

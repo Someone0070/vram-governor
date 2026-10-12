@@ -4,6 +4,43 @@ These are ComfyUI API prompt graphs. A caller that starts from the Creator Studi
 
 The profile descriptors in `profiles.json` use the controller's `RuntimeProfile` fields and bind version 1 of `image-sdxl-base` (`image.generate`) and `video-wan22-5b` (`video.generate_sequence`) to `cmp170-video-managed`. Each immutable profile digest binds its production graph to the pinned model revisions and hashes. `workflow-metadata.json` records smoke graph names and transport media types. The service may also return an `application/json` result manifest; the generated media artifact is PNG or MP4 as listed by each profile.
 
+## Workflows (recommended)
+
+The easiest way in: pick a workflow and pass a few settings. The LB fills them into a tuned graph, so callers never build node graphs.
+
+```sh
+GET  /api/v1/workflows              # every workflow with its params, limits and defaults
+GET  /api/v1/workflows/{id}         # one workflow ({id}@{version} pins a version)
+POST /api/v1/workloads              # {"workflow": "...", "params": {...}}
+```
+
+```text
+{
+  "workload_id": "fox-001",
+  "workflow": "image-qwen21-photoreal",
+  "params": {"prompt": "candid iPhone photo of ...", "negative_prompt": "plastic skin", "width": 1024, "height": 1344}
+}
+```
+
+| Workflow | What it is for | Params (* required) | Typical |
+| --- | --- | --- | --- |
+| `image-krea2-turbo` | Stylized, 3D, clay, cartoon, painterly | prompt*, width, height, seed, steps | ~20 s |
+| `image-qwen21-photoreal` | Candid phone-photo realism | prompt*, negative_prompt, width, height, seed, steps, cfg, realism | ~2.5 min |
+| `image-qwen21` | General images, text inside the image | prompt*, negative_prompt, width, height, seed, steps, cfg | ~50 s |
+| `image-sdxl` | Classic SDXL 1.0 | prompt*, negative_prompt, width, height, seed, steps, cfg | ~25 s |
+| `video-ltx25-t2v-fast` | Cheap text-to-video drafts with audio | prompt*, negative_prompt, seconds, aspect_ratio, megapixels, seed, enhance_prompt | ~25 s |
+| `video-ltx25-t2v` | Two-stage text-to-video with audio | same as above | ~2.5 min |
+| `video-ltx25-i2v` | Animate a 3D/stylized image (LTX) | image*, prompt*, negative_prompt, seconds, aspect_ratio, megapixels, seed, enhance_prompt | ~2.5 min |
+| `video-minimax-h3-i2v` | Animate 2D/cartoon art on-model (H3) | image*, prompt*, seconds, seed, turbo | ~3 min |
+| `video-minimax-h3-flf` | Motion between a start and end frame | image*, last_image*, prompt*, seconds, seed, turbo | ~3 min |
+| `video-seedvr2-upscale` | Restore and upscale a video | video*, scale, seed | ~8.5 min |
+
+- `image`, `last_image` and `video` take an artifact id: upload with `POST /upload/image` (the response `name`), or pass the `artifact_ref` of an earlier job's output to chain jobs (e.g. Krea image → H3 video → SeedVR2 upscale).
+- Omitted params use the workflow's defaults; `seed` is random when omitted. The response's `workflow.params` echoes every effective value, including the seed, so a result can be reproduced.
+- Invalid or unknown params are all reported in one `400` response.
+- `operation` and `profile_preferences` are optional; when given they must match the workflow.
+- Templates live in `workflows/` and are installed to the directory named by `workloads.workflow_templates_dir` (`/etc/vram-governor/workflows` on the LB). Each binds every param to exact node inputs; `-check-config` rejects a template whose profile or operation is not configured. To add one, copy a template, keep the `id` equal to the file name, and bump `version` for any change to an existing one.
+
 ## Submitting a compiled graph
 
 For the Creator Studio workload API, select the immutable profile version through `profile_preferences.preferred` as `profile-id@version`, and put the compiled Comfy prompt graph in `payload.managed_chunks[0].prompt`. The workflow graph is the JSON object keyed by node id, in the native Comfy API format:
