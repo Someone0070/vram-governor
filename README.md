@@ -184,6 +184,9 @@ results; external-boundary status is tracked in the audit linked above.
 - OpenAI-compatible `POST /v1/chat/completions`, including native SSE proxy
   streaming, client-disconnect cancellation, lease renewal for long streams,
   and structured terminal fail-fast capacity errors.
+- OpenAI-compatible `POST /v1/embeddings` for router embedding models, with the
+  same admission, model loading and queueing as chat (router presets must run
+  those models with `embeddings = 1`, see `--models-preset`)
 - Comfy-compatible central submission, queue/history, cancellation, WebSocket
   progress, remote input staging, central output collection, uploads, and
   artifact reads. Public prompt IDs remain pinned to the selected backend
@@ -311,7 +314,7 @@ Generate a credential digest, for example:
 |---|---|
 | Common async | `/api/v1/workloads`, status, approval, reprioritization, cancellation, artifacts, events, notifications |
 | Creator Studio | `/api/v1/capabilities`, capability-oriented `/api/v1/workloads`, `/api/v1/workloads/batch`, `/api/v1/batches/{id}`, session working-set hints |
-| OpenAI | `/v1/chat/completions`, `/v1/models`, human chat at `/chat/` |
+| OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, human chat at `/chat/` |
 | ComfyUI | `/prompt`, `/ws`, `/history`, `/history/{id}`, `/queue`, `/upload/image`, `/view` |
 | Node | `/ws/node`, node engine/profile reporting |
 | System agent | `/api/agent/v1/incidents/*`, escalation/proposals, `/api/agent/v1/events` |
