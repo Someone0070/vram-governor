@@ -10,7 +10,9 @@ local disk and atomically re-points the preset symlinks. After that:
 
 - a model unloaded from VRAM is reloaded from the Linux page cache (host RAM)
   while memory allows, otherwise from local NVMe — this is the practical
-  "offload to RAM" tier: VRAM is freed, the bytes stay in RAM;
+  "offload to RAM" tier: VRAM is freed, the bytes stay in RAM (pinned there by
+  [`vram-warm-keeper`](../warm-keeper/README.md), otherwise only until other
+  reads push them out);
 - nothing in the controller or agent changes; model IDs are the preset names.
 
 Install to `/usr/local/sbin/vram-model-cache-sync` and run once (re-run after

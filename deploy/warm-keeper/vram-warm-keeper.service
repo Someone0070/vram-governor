@@ -1,0 +1,37 @@
+[Unit]
+Description=VRAM Governor warm-RAM keeper (pins recently used model files in RAM)
+After=llama-server.service
+Wants=llama-server.service
+
+[Service]
+Type=simple
+User=vram-governor
+Group=vram-governor
+Environment=WARM_KEEPER_BUDGET=44GiB WARM_KEEPER_MIN_AVAILABLE=16GiB WARM_KEEPER_ALWAYS=
+EnvironmentFile=-/etc/vram-governor/warm-keeper.env
+ExecStart=/usr/local/bin/vram-warm-keeper -budget ${WARM_KEEPER_BUDGET} -min-available ${WARM_KEEPER_MIN_AVAILABLE} -always "${WARM_KEEPER_ALWAYS}"
+Restart=always
+RestartSec=5
+StateDirectory=vram-warm-keeper
+RuntimeDirectory=vram-warm-keeper
+RuntimeDirectoryMode=0755
+# mlock beyond RLIMIT_MEMLOCK needs CAP_IPC_LOCK; it is the only capability.
+AmbientCapabilities=CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_IPC_LOCK
+LimitMEMLOCK=infinity
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# Under memory pressure the kernel must kill something else first: the keeper
+# holds no state worth keeping and releases its pins when it exits.
+OOMScoreAdjust=500
+
+[Install]
+WantedBy=multi-user.target
