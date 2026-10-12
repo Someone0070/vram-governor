@@ -306,3 +306,64 @@ func TestPowerProfileIdleFailureQueuesBoundedReconciliation(t *testing.T) {
 		t.Fatal("idle power did not recover after retry")
 	}
 }
+
+func TestPowerProfileIdleIsNotResentToAnIdleGPU(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	if _, err := backing.UpsertNode(ctx, &domain.Node{ID: "node", Accelerators: []domain.Accelerator{{ID: "node-gpu0", NodeID: "node"}}}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(quietLogger(), backing, time.Second)
+	m.SetNodeStore(backing)
+	m.SetNodeControl(func(context.Context, string, string, map[string]any, string) (map[string]any, error) { return nil, nil })
+	m.SetManagedGPUPerformance("node", []int{0})
+	var sent []string
+	fail := false
+	m.SetGPUPerformanceControl(func(_ context.Context, _, _ string, args map[string]any, _ string) (map[string]any, error) {
+		sent = append(sent, args["profile"].(string))
+		if fail {
+			return nil, errors.New("node unreachable")
+		}
+		return map[string]any{"managed": true, "accelerator_id": "node-gpu0"}, nil
+	})
+	step := func(profile string) {
+		t.Helper()
+		if err := m.setGPUPerformanceProfile(ctx, "node-gpu0", profile, newID("k")); err != nil && !fail {
+			t.Fatal(err)
+		}
+	}
+	// Admission retries release their reservation repeatedly; only the first
+	// idle reaches the node, every active does.
+	step("idle")
+	step("idle")
+	step("idle")
+	step("active")
+	step("active")
+	step("idle")
+	step("idle")
+	want := []string{"idle", "active", "active", "idle"}
+	if len(sent) != len(want) {
+		t.Fatalf("sent %v, want %v", sent, want)
+	}
+	for i := range want {
+		if sent[i] != want[i] {
+			t.Fatalf("sent %v, want %v", sent, want)
+		}
+	}
+	// A failed command leaves the state unknown, so the next idle is sent.
+	step("active")
+	fail = true
+	step("idle")
+	fail = false
+	step("idle")
+	if got := sent[len(sent)-2:]; got[0] != "idle" || got[1] != "idle" {
+		t.Fatalf("after a failure the idle retry was suppressed: %v", sent)
+	}
+	// Re-advertisement (node reconnect) forgets the confirmed profile.
+	before := len(sent)
+	m.SetManagedGPUPerformance("node", []int{0})
+	step("idle")
+	if len(sent) != before+1 {
+		t.Fatalf("idle after re-advertisement was suppressed: %v", sent)
+	}
+}

@@ -45,6 +45,7 @@ func (m *Manager) SetManagedGPUPerformance(nodeID string, indices []int) {
 	for acceleratorID := range m.managedGPUPerformance {
 		if strings.HasPrefix(acceleratorID, nodeID+"-gpu") {
 			delete(m.managedGPUPerformance, acceleratorID)
+			delete(m.gpuAppliedProfile, acceleratorID)
 		}
 	}
 	for _, index := range indices {
@@ -132,6 +133,9 @@ func (m *Manager) ReconcileGPUIdleAfterTelemetry(nodeID string) {
 	go func() {
 		allSucceeded := true
 		for _, acceleratorID := range accelerators {
+			m.mu.Lock()
+			delete(m.gpuAppliedProfile, acceleratorID)
+			m.mu.Unlock()
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			err := m.setGPUPerformanceProfile(ctx, acceleratorID, "idle", "gpu-power:initial-idle:"+nodeID+":"+acceleratorID+":"+newID("reconcile"))
 			cancel()
@@ -195,6 +199,14 @@ func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, p
 		}
 	}
 	m.mu.Lock()
+	if profile == "idle" && m.gpuAppliedProfile[acceleratorID] == "idle" {
+		// Every released admission reservation asks for idle. Resending it to
+		// an idle GPU made the node briefly not-ready on each retry, which
+		// failed the next admission attempt and released again: a waiting
+		// request livelocked until its deadline. Active is always sent.
+		m.mu.Unlock()
+		return nil
+	}
 	// The node keeps its fence high-water across controller restarts, so an
 	// in-memory counter starting at 1 was rejected as stale after every
 	// restart. Wall-clock milliseconds keep fences above any prior run.
@@ -233,6 +245,13 @@ func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, p
 	if err == nil && !m.acceleratorTargetFencesMatch(targetFences) {
 		err = fmt.Errorf("GPU performance result target facts changed during command")
 	}
+	m.mu.Lock()
+	if err != nil {
+		delete(m.gpuAppliedProfile, acceleratorID)
+	} else {
+		m.gpuAppliedProfile[acceleratorID] = profile
+	}
+	m.mu.Unlock()
 	if err != nil {
 		if profile == "idle" {
 			m.mu.Lock()

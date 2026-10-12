@@ -110,6 +110,9 @@ type Manager struct {
 	gpuIdleRetryAfter              map[string]time.Time
 	gpuPowerGeneration             map[string]uint64
 	gpuCommandFences               map[string]uint64
+	// gpuAppliedProfile is the last profile a node confirmed per accelerator;
+	// absent means unknown. It lets idle skip a redundant node command.
+	gpuAppliedProfile              map[string]string
 	artifacts                      artifacts.Store
 	defaultMaxAcceleratorsPerModel int
 	modelCapacityPolicies          map[string]int
@@ -242,6 +245,7 @@ func NewManager(log *slog.Logger, backing store.WorkloadStore, leaseTTL time.Dur
 		gpuIdleRetryAfter:        make(map[string]time.Time),
 		gpuPowerGeneration:       make(map[string]uint64),
 		gpuCommandFences:         make(map[string]uint64),
+		gpuAppliedProfile:        make(map[string]string),
 		residency:                DefaultResidencyOptions(), residencyObservationLocks: make(map[string]*sync.Mutex), residencyAdmissionLocks: make(map[string]*sync.RWMutex), residencyTransitions: make(map[string]struct{}), recoveryTransitions: make(map[string]struct{}), pendingResidencyObservations: make(map[string]pendingResidencyObservation),
 		pendingLeaseFinalizations: make(map[string]pendingLeaseFinalization),
 		notifications:             DefaultNotificationOptions(),
