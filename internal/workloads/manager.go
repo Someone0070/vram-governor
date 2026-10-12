@@ -5121,10 +5121,14 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			continue
 		}
 		if needsModelLoad {
-			if reason, failed := m.modelLoadFailed(target, req.Model); failed {
+			if reason, failures, fenced := m.modelLoadFenced(target, req.Model); fenced {
 				unlockAdmission()
-				loadFailures++
-				blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": "+reason))
+				code := domain.BlockerTransitionBusy
+				if failures >= modelLoadFailFastAfter {
+					code = domain.BlockerRuntimeUnsupported
+					loadFailures++
+				}
+				blockers = append(blockers, coded(code, target.ID+": "+reason))
 				continue
 			}
 		}
@@ -5404,7 +5408,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 						return cleanupResult
 					}
 					text := target.ID + ": model load failed: " + loadErr.Error()
-					if isRuntimeLoadFailure(loadErr) {
+					if isDefiniteLoadFailure(loadErr, req.Model) {
 						m.recordModelLoadFailure(target, req.Model, loadErr.Error())
 					}
 					if code, until := blockerFromError(loadErr); code != "" {
@@ -5415,6 +5419,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 					return admitCandidateNext
 				}
 				residencyTransitionIDs = append(residencyTransitionIDs, transitionIDs...)
+				m.clearModelLoadFailure(target.ID, req.Model)
 				m.residencyAdmissionMu.Lock()
 				targetLock.RLock()
 				currentTarget = m.targetByID(target.ID)

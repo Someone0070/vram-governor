@@ -2187,9 +2187,13 @@ func TestDemandLoadRetryAfterFailedAttemptUsesFreshTransitionKeys(t *testing.T) 
 
 // A model the runtime cannot load (live: llama.cpp "unknown model
 // architecture") must not be retried on every admission pass: each attempt
-// made the node briefly not-ready for all other work. After one definite
-// failure the model is fenced and the request fails with the reason.
-func TestRuntimeLoadFailureFencesModelAndFailsFast(t *testing.T) {
+// made the node briefly not-ready for all other work. Definite load failures
+// back off exponentially, and after three in a row the request fails with
+// the reason instead of waiting out its deadline.
+func TestModelLoadFailuresBackOffThenFailFast(t *testing.T) {
+	base, max := modelLoadBackoffBase, modelLoadBackoffMax
+	modelLoadBackoffBase, modelLoadBackoffMax = 40*time.Millisecond, time.Second
+	defer func() { modelLoadBackoffBase, modelLoadBackoffMax = base, max }()
 	backing := store.NewMemoryStore()
 	_, err := backing.UpsertNode(context.Background(), &domain.Node{ID: "node-1", SchedulingState: domain.SchedulingEnabled, Desired: domain.Desired{SchedulingEnabled: true}, Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true}, Accelerators: []domain.Accelerator{{ID: "gpu-1", VRAMTotalMB: 16_000, VRAMFreeMB: 16_000}}})
 	if err != nil {
@@ -2212,26 +2216,37 @@ func TestRuntimeLoadFailureFencesModelAndFailsFast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pass := func() *domain.Workload {
+		t.Helper()
+		row, _ := backing.GetWorkload(context.Background(), workload.Request.ID)
+		if row.Status == domain.WorkloadWaiting {
+			row.TargetRetryAfter = nil
+			mgr.tryAdmit(context.Background(), row)
+			row, _ = backing.GetWorkload(context.Background(), workload.Request.ID)
+		}
+		return row
+	}
 	first, _ := backing.GetWorkload(context.Background(), workload.Request.ID)
 	if loads != 1 || first.Status != domain.WorkloadWaiting || !strings.Contains(strings.Join(first.Decision.Alternatives, " "), "model failed to load in the runtime") {
 		t.Fatalf("first attempt: loads=%d status=%s alternatives=%v", loads, first.Status, first.Decision.Alternatives)
 	}
-	first.TargetRetryAfter = nil
-	mgr.tryAdmit(context.Background(), first)
-	second, _ := backing.GetWorkload(context.Background(), workload.Request.ID)
-	if loads != 1 {
-		t.Fatalf("fenced model was loaded again: loads=%d", loads)
+	if row := pass(); loads != 1 || row.Status != domain.WorkloadWaiting || row.Decision.BlockerCode != domain.BlockerTransitionBusy {
+		t.Fatalf("inside the backoff the load was retried or the request ended: loads=%d row=%+v", loads, row.Decision)
 	}
-	if second.Status != domain.WorkloadRejected || !strings.Contains(second.Error, "failed to load in the runtime") || second.Decision.BlockerCode != domain.BlockerRuntimeUnsupported {
-		t.Fatalf("fenced request did not fail fast with the reason: status=%s error=%q decision=%+v", second.Status, second.Error, second.Decision)
+	time.Sleep(50 * time.Millisecond)
+	pass() // second failure, backoff 80 ms
+	time.Sleep(90 * time.Millisecond)
+	pass() // third failure
+	final := pass()
+	if loads != 3 {
+		t.Fatalf("loads=%d, want 3 (one per expired backoff)", loads)
 	}
-	// A runtime change (e.g. upgraded llama.cpp) lifts the fence.
-	if _, failed := mgr.modelLoadFailed(target, "broken"); !failed {
-		t.Fatal("fence missing")
+	if final.Status != domain.WorkloadRejected || !strings.Contains(final.Error, "failed to load 3 time(s)") || final.Decision.BlockerCode != domain.BlockerRuntimeUnsupported {
+		t.Fatalf("request did not fail fast after 3 failures: status=%s error=%q decision=%+v", final.Status, final.Error, final.Decision)
 	}
 	upgraded := target
 	upgraded.CapabilityVersion = "runtime-v2"
-	if _, failed := mgr.modelLoadFailed(upgraded, "broken"); failed {
+	if _, _, fenced := mgr.modelLoadFenced(upgraded, "broken"); fenced {
 		t.Fatal("runtime change did not lift the fence")
 	}
 }

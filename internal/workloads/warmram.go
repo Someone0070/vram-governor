@@ -375,10 +375,10 @@ func (a *ControllerResidencyAdapter) transitionWithFrom(ctx context.Context, tar
 			code = ResidencyBlockerTransitionTimeout
 		}
 		message := "node command did not complete"
-		if callErr != nil && strings.HasPrefix(callErr.Error(), "node command failed: ") {
-			// The node ran the command and reported a definite failure; keep
-			// its reason (e.g. the runtime could not load the model).
-			message = callErr.Error()
+		if callErr != nil {
+			// Keep the node's reason (e.g. the runtime could not load the
+			// model) instead of reporting only that the command failed.
+			message += ": " + callErr.Error()
 		}
 		failure := adapterError(code, command, target, model, identity, fence, message, true, callErr)
 		if runCtx.Err() != nil || unresolved {
