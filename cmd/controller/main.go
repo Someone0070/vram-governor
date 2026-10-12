@@ -70,6 +70,18 @@ func main() {
 		modelPolicies[policy.Model] = policy.MaxAccelerators
 	}
 	workloadMgr.SetModelCapacityPolicies(cfg.Workloads.DefaultMaxAcceleratorsPerModel, modelPolicies)
+	idleLinger := 5 * time.Second
+	if cfg.Workloads.GPUIdleLingerSeconds != nil {
+		idleLinger = time.Duration(*cfg.Workloads.GPUIdleLingerSeconds) * time.Second
+	}
+	workloadMgr.SetGPUIdleLinger(idleLinger)
+	if export := cfg.Workloads.ResultExport; export.Dir != "" {
+		types := export.MediaTypes
+		if len(types) == 0 {
+			types = []string{"image/*", "video/*", "audio/*"}
+		}
+		workloadMgr.SetResultExport(workloads.ResultExport{Dir: export.Dir, MediaTypes: types})
+	}
 	residencyEnabled := true
 	if cfg.Workloads.Residency.Enabled != nil {
 		residencyEnabled = *cfg.Workloads.Residency.Enabled

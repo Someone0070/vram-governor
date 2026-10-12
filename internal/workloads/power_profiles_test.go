@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -365,5 +366,57 @@ func TestPowerProfileIdleIsNotResentToAnIdleGPU(t *testing.T) {
 	step("idle")
 	if len(sent) != before+1 {
 		t.Fatalf("idle after re-advertisement was suppressed: %v", sent)
+	}
+}
+
+// With an idle linger, a job that takes the GPU right after another keeps
+// active clocks: the first release's park finds the active placement and is
+// skipped, so only the last job parks.
+func TestPowerProfileIdleLingerKeepsBackToBackJobsActive(t *testing.T) {
+	run := func(linger time.Duration) []string {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		backing := store.NewMemoryStore()
+		node := &domain.Node{ID: "node", Name: "node", SchedulingState: domain.SchedulingEnabled, Desired: domain.Desired{SchedulingEnabled: true}, Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true, LastSeenAt: time.Now().UTC()}, Accelerators: []domain.Accelerator{{ID: "node-gpu0", NodeID: "node", VRAMTotalMB: 24000, VRAMFreeMB: 24000}}}
+		if _, err := backing.UpsertNode(ctx, node); err != nil {
+			t.Fatal(err)
+		}
+		manager := NewManager(quietLogger(), backing, time.Second)
+		manager.SetNodeStore(backing)
+		manager.SetManagedGPUPerformance("node", []int{0})
+		manager.SetGPUIdleLinger(linger)
+		var mu sync.Mutex
+		var sent []string
+		manager.SetNodeControl(func(context.Context, string, string, map[string]any, string) (map[string]any, error) {
+			return map[string]any{}, nil
+		})
+		manager.SetGPUPerformanceControl(func(_ context.Context, _, _ string, args map[string]any, _ string) (map[string]any, error) {
+			mu.Lock()
+			sent = append(sent, args["profile"].(string))
+			mu.Unlock()
+			return map[string]any{"managed": true, "accelerator_id": "node-gpu0"}, nil
+		})
+		manager.RegisterAdapter(NewMockAdapter())
+		manager.RegisterTarget(Target{ID: "node-mock", Adapter: "mock", AcceleratorID: "node-gpu0", Enabled: true})
+		manager.Start(ctx)
+		for i := 0; i < 2; i++ {
+			workload, _, err := manager.Submit(ctx, domain.WorkloadRequest{OwnerID: "owner", Adapter: "mock", Payload: json.RawMessage(`{"proof":true}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := manager.Wait(ctx, workload.Request.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(linger + 300*time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), sent...)
+	}
+	if got := strings.Join(run(0), ","); got != "active,idle,active,idle" {
+		t.Fatalf("without linger sent %s", got)
+	}
+	if got := strings.Join(run(time.Second), ","); got != "active,active,idle" {
+		t.Fatalf("with linger sent %s, want the GPU parked once after the last job", got)
 	}
 }

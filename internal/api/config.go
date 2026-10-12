@@ -56,6 +56,15 @@ type Config struct {
 		// WorkflowTemplatesDir holds parameterized Comfy workflow templates
 		// (internal/workflowtpl). Each must name a configured profile.
 		WorkflowTemplatesDir string `yaml:"workflow_templates_dir"`
+		// GPUIdleLingerSeconds delays parking a released GPU so queued and
+		// back-to-back jobs keep active clocks. Unset means 5; 0 parks at once.
+		GPUIdleLingerSeconds *int `yaml:"gpu_idle_linger_seconds"`
+		// ResultExport copies final media outputs (not intermediates) to a
+		// plain directory such as a NAS share, with a JSON sidecar each.
+		ResultExport struct {
+			Dir        string   `yaml:"dir"`
+			MediaTypes []string `yaml:"media_types"`
+		} `yaml:"result_export"`
 		// OpenAI queueing fallbacks below body, X-VRAM-* headers and the
 		// credential. fail_fast stays the default so existing clients keep
 		// their immediate 429/503 behaviour.

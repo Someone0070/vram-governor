@@ -113,6 +113,8 @@ type Manager struct {
 	// gpuAppliedProfile is the last profile a node confirmed per accelerator;
 	// absent means unknown. It lets idle skip a redundant node command.
 	gpuAppliedProfile              map[string]string
+	gpuIdleLinger                  time.Duration
+	resultExport                   ResultExport
 	artifacts                      artifacts.Store
 	defaultMaxAcceleratorsPerModel int
 	modelCapacityPolicies          map[string]int
@@ -4564,6 +4566,7 @@ func (m *Manager) reconcileRecoveredExecutionsForTarget(ctx context.Context, tar
 			m.syncPromptMapping(context.Background(), workload)
 			m.settleWorkloadBudget(context.Background(), workload)
 			m.audit(context.Background(), workload.Request.OwnerID, workload.Request.ID, "workload.restart_recovered_completed", "info", map[string]string{"target_id": targetID})
+			m.exportResults(workload)
 			continue
 		}
 		if observeErr == nil && observation.Status == domain.WorkloadFailed {
@@ -8250,12 +8253,35 @@ func (m *Manager) releaseTargetWithIntent(ctx context.Context, reservation *targ
 	if ctx == nil {
 		ctx = m.lifecycleContext()
 	}
-	idleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
 	idleKey := fmt.Sprintf("gpu-power:idle:%s:%s:%d", reservation.workloadID, reservation.lease.AcceleratorID, reservation.lease.FencingToken)
-	if err := m.setGPUPerformanceProfile(idleCtx, reservation.lease.AcceleratorID, "idle", idleKey); err != nil {
-		m.log.Warn("GPU idle performance transition failed", "accelerator_id", reservation.lease.AcceleratorID, "error", err)
+	acceleratorID := reservation.lease.AcceleratorID
+	park := func(base context.Context) {
+		idleCtx, cancel := context.WithTimeout(context.WithoutCancel(base), 10*time.Second)
+		defer cancel()
+		if err := m.setGPUPerformanceProfile(idleCtx, acceleratorID, "idle", idleKey); err != nil {
+			m.log.Warn("GPU idle performance transition failed", "accelerator_id", acceleratorID, "error", err)
+		}
 	}
+	m.mu.RLock()
+	linger := m.gpuIdleLinger
+	m.mu.RUnlock()
+	if linger <= 0 {
+		park(ctx)
+		return cleanupErr
+	}
+	// Park only after a short linger: a queued or back-to-back job that takes
+	// the accelerator meanwhile holds an active placement, which makes the
+	// idle request a no-op, so the GPU is not parked and unparked between jobs.
+	go func() {
+		timer := time.NewTimer(linger)
+		defer timer.Stop()
+		lifecycle := m.lifecycleContext()
+		select {
+		case <-timer.C:
+			park(lifecycle)
+		case <-lifecycle.Done():
+		}
+	}()
 	return cleanupErr
 }
 
@@ -8309,6 +8335,14 @@ func (m *Manager) finishReleasedReservationLocked(reservation *targetReservation
 // lifecycleContext returns the manager-owned cancellation context without
 // holding lifecycleMu during any store or backend operation. It is used by
 // compatibility paths that predate the explicit execution context.
+// SetGPUIdleLinger delays parking a released accelerator so queued and
+// back-to-back work keeps active clocks. Zero parks immediately.
+func (m *Manager) SetGPUIdleLinger(linger time.Duration) {
+	m.mu.Lock()
+	m.gpuIdleLinger = linger
+	m.mu.Unlock()
+}
+
 func (m *Manager) lifecycleContext() context.Context {
 	m.lifecycleMu.Lock()
 	ctx := m.managerCtx
@@ -9537,6 +9571,7 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 			m.syncPromptMapping(ctx, latest)
 			m.settleWorkloadBudget(ctx, latest)
 			m.audit(ctx, latest.Request.OwnerID, id, "workload.succeeded", "info", nil)
+			m.exportResults(latest)
 			if latest.Request.Notifications.OnFinish {
 				m.enqueueNotification(ctx, latest, "workload.succeeded")
 			}
