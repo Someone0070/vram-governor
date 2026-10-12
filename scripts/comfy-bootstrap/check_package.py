@@ -20,6 +20,14 @@ PROFILE_EXPECTATIONS = {
     "image-sdxl-base": ("image.generate", "IMAGE", "image-sdxl-base.json", "image-sdxl-smoke.json", "sdxl-base-1.0", ["sdxl-base-1.0"], {"application/json", "image/png"}),
     "video-wan22-5b": ("video.generate_sequence", "VIDEO", "video-wan22-5b.json", "video-wan22-5b-smoke.json", "wan22-ti2v-5b", ["wan22-ti2v-5b", "wan22-umt5-xxl-fp8", "wan22-vae"], {"application/json", "video/mp4"}),
 }
+# Image-input profiles run operator-installed models (not the pinned bootstrap
+# manifest); their digest is the controller-computed one recorded at
+# registration. Graphs carry placeholders the client replaces.
+IMAGE_INPUT_PROFILES = {
+    "video-ltx25-i2v": (["video.image_to_video"], ["video-ltx25-i2v.json"], {"INPUT_IMAGE", "REPLACE_POSITIVE_PROMPT"}),
+    "video-minimax-h3-i2v": (["video.first_last_frame", "video.image_to_video"], ["video-minimax-h3-i2v.json", "video-minimax-h3-flf2v.json"], {"INPUT_IMAGE", "REPLACE_POSITIVE_PROMPT"}),
+}
+IMAGE_TYPES = ["application/json", "image/jpeg", "image/png", "image/webp"]
 
 
 def read_json(name):
@@ -53,7 +61,8 @@ def validate_graph(graph, required_nodes):
 def profile_digest(workflow, manifest, model_ids):
     rows = {row["id"]: row for row in manifest["models"]}
     material = {
-        "graph_sha256": hashlib.sha256((PACKAGE / workflow).read_bytes()).hexdigest(),
+        # Hash the committed (LF) bytes so a CRLF checkout verifies the same.
+        "graph_sha256": hashlib.sha256((PACKAGE / workflow).read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
         "models": [
             {key: rows[model_id][key] for key in ("id", "revision", "bytes", "sha256")}
             for model_id in sorted(model_ids)
@@ -66,10 +75,10 @@ def profile_digest(workflow, manifest, model_ids):
 def validate_profiles(profiles, graphs, manifest, metadata):
     require(profiles.get("target_id") == "cmp170-video-managed" and profiles.get("adapter") == "comfy" and profiles.get("runtime_protocol") == "managed_comfy_v1", "profile target binding drift")
     rows = {row.get("profile_id"): row for row in profiles.get("profiles", [])}
-    require(set(rows) == set(PROFILE_EXPECTATIONS), "profile ids differ from the declared contract")
+    require(set(rows) == set(PROFILE_EXPECTATIONS) | set(IMAGE_INPUT_PROFILES), "profile ids differ from the declared contract")
     require(metadata.get("schema_version") == 1 and metadata.get("target_id") == profiles["target_id"], "workflow metadata binding drift")
     manifest_rows = {row["id"]: row for row in manifest["models"]}
-    require(set(metadata.get("profiles", {})) == {"image-sdxl-base@1", "video-wan22-5b@1"}, "workflow metadata profile ids drift")
+    require(set(metadata.get("profiles", {})) == {"image-sdxl-base@1", "video-wan22-5b@1"} | {pid + "@1" for pid in IMAGE_INPUT_PROFILES}, "workflow metadata profile ids drift")
     for profile_id, (operation, modality, workflow, smoke, model_id, pinned_ids, artifacts) in PROFILE_EXPECTATIONS.items():
         row = rows[profile_id]
         require(row.get("version") == "1" and row.get("operations") == [operation], "profile version or operation drift: " + profile_id)
@@ -91,6 +100,20 @@ def validate_profiles(profiles, graphs, manifest, metadata):
         require(meta.get("production_graph") == workflow and meta.get("smoke_graph") == smoke, "workflow graph metadata drift")
         require(meta.get("accepted_payload_types") == ["application/json"], "accepted transport payload types drift")
         require(meta.get("produced_media_types") == sorted(artifacts - {"application/json"}), "produced media metadata drift")
+    for profile_id, (operations, workflows, placeholders) in IMAGE_INPUT_PROFILES.items():
+        row = rows[profile_id]
+        require(row.get("version") == "1" and row.get("operations") == operations, "profile version or operation drift: " + profile_id)
+        require(row.get("modality") == "VIDEO" and row.get("execution_locality") == "LB_MANAGED" and row.get("adapter") == "comfy", "profile modality/locality drift: " + profile_id)
+        require(row.get("workflow") == workflows[0] and "input.image" in row.get("features", []), "image-input profile binding drift: " + profile_id)
+        require(re.fullmatch(r"[0-9a-f]{64}", row.get("digest", "")) is not None, "image-input profile digest missing: " + profile_id)
+        require(row.get("accepted_artifact_types") == IMAGE_TYPES and set(row.get("produced_artifact_types", [])) == {"application/json", "video/mp4"}, "image-input artifact contract drift: " + profile_id)
+        require(row.get("input_schema") == rows["video-wan22-5b"].get("input_schema"), "image-input profile must use the managed_chunks graph schema")
+        meta = metadata["profiles"][profile_id + "@1"]
+        require(meta.get("production_graph") == workflows[0] and meta.get("accepted_payload_types") == IMAGE_TYPES and meta.get("produced_media_types") == ["video/mp4"], "image-input workflow metadata drift: " + profile_id)
+        for workflow in workflows:
+            require(workflow in graphs, "profile references missing graph: " + workflow)
+            text = (PACKAGE / workflow).read_text(encoding="utf-8")
+            require(all(token in text for token in placeholders), "graph lacks client placeholders: " + workflow)
     return True
 
 
@@ -117,6 +140,9 @@ def validate_manifest(manifest):
 
 
 def main():
+    for _, workflows, _ in IMAGE_INPUT_PROFILES.values():
+        for workflow in workflows:
+            REQUIRED_NODES.setdefault(workflow, {"LoadImage", "CLIPLoader", "UNETLoader", "VAELoader", "SamplerCustomAdvanced", "CreateVideo", "SaveVideo"})
     graphs = {name: read_json(name) for name in REQUIRED_NODES}
     for name, required in REQUIRED_NODES.items():
         validate_graph(graphs[name], required)
@@ -142,6 +168,14 @@ def main():
         pass
     else:
         raise AssertionError("negative control: incomplete artifact contract was accepted")
+    broken_profiles = copy.deepcopy(profiles)
+    next(row for row in broken_profiles["profiles"] if row["profile_id"] == "video-ltx25-i2v")["accepted_artifact_types"] = ["application/json"]
+    try:
+        validate_profiles(broken_profiles, graphs, manifest, read_json("workflow-metadata.json"))
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("negative control: image-input profile without image types was accepted")
 
     installer = (ROOT / "scripts" / "comfy-bootstrap" / "install_models.py").read_text(encoding="utf-8")
     require("--check" in installer and "--apply" in installer, "installer modes missing")

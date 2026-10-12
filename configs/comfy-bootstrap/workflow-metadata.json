@@ -13,6 +13,40 @@
       "smoke_graph": "video-wan22-5b-smoke.json",
       "accepted_payload_types": ["application/json"],
       "produced_media_types": ["video/mp4"]
+    },
+    "video-ltx25-i2v@1": {
+      "production_graph": "video-ltx25-i2v.json",
+      "input_placeholders": {
+        "INPUT_IMAGE": "artifact id of the start image",
+        "REPLACE_POSITIVE_PROMPT": "motion and scene prompt"
+      },
+      "accepted_payload_types": [
+        "application/json",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ],
+      "produced_media_types": [
+        "video/mp4"
+      ]
+    },
+    "video-minimax-h3-i2v@1": {
+      "production_graph": "video-minimax-h3-i2v.json",
+      "first_last_frame_graph": "video-minimax-h3-flf2v.json",
+      "input_placeholders": {
+        "INPUT_IMAGE": "artifact id of the start image",
+        "INPUT_LAST_IMAGE": "artifact id of the end image (first_last_frame graph only)",
+        "REPLACE_POSITIVE_PROMPT": "motion and scene prompt"
+      },
+      "accepted_payload_types": [
+        "application/json",
+        "image/jpeg",
+        "image/png",
+        "image/webp"
+      ],
+      "produced_media_types": [
+        "video/mp4"
+      ]
     }
   }
 }

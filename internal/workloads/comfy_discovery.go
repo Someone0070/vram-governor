@@ -488,6 +488,11 @@ func comfySchemaProofMatches(admitted, current comfySchemaProof) bool {
 func validateComfyRequestSchema(request domain.WorkloadRequest, schema map[string]json.RawMessage) error {
 	var payload map[string]json.RawMessage
 	if len(request.Payload) > comfyObjectInfoLimit || !boundedComfyJSONDepth(request.Payload, 32) || json.Unmarshal(request.Payload, &payload) != nil || payload == nil { return errComfyDiscoveryUnavailable }
+	// Uploaded inputs are staged into the backend after admission, so an
+	// upload-capable input naming one of the request's own artifacts is valid
+	// even though the backend's file list cannot contain it yet.
+	uploads := make(map[string]bool, len(request.ArtifactRefs))
+	for _, ref := range request.ArtifactRefs { uploads[ref] = true }
 	graphs := []map[string]json.RawMessage{}
 	if chunksRaw, ok := payload["managed_chunks"]; ok {
 		var chunks []map[string]json.RawMessage
@@ -502,7 +507,7 @@ func validateComfyRequestSchema(request domain.WorkloadRequest, schema map[strin
 			if json.Unmarshal(promptRaw, &prompt) != nil || prompt == nil { return errComfyDiscoveryUnavailable }
 			graph = prompt
 		}
-		if err := validateComfyGraph(graph, schema); err != nil { return err }
+		if err := validateComfyGraphWithUploads(graph, schema, uploads); err != nil { return err }
 	}
 	return nil
 }
@@ -518,6 +523,10 @@ type comfyClass struct {
 }
 
 func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]json.RawMessage) error {
+	return validateComfyGraphWithUploads(graph, schemas, nil)
+}
+
+func validateComfyGraphWithUploads(graph map[string]json.RawMessage, schemas map[string]json.RawMessage, uploads map[string]bool) error {
 	if len(graph) == 0 || len(graph) > 10000 { return fmt.Errorf("%w: graph has %d nodes", errComfyDiscoveryUnavailable, len(graph)) }
 	nodes := make(map[string]comfyNode, len(graph))
 	classes := make(map[string]comfyClass, len(graph))
@@ -538,8 +547,21 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 		required, optional := class.Input["required"], class.Input["optional"]
 		allowedInputs := make(map[string]json.RawMessage, len(required)+len(optional))
 		dynamicInputOwner := make(map[string]string)
-		for name, spec := range required { allowedInputs[name] = spec; if _, exists := node.Inputs[name]; !exists { return comfyGraphError(5, id+"."+name) } }
-		for name, spec := range optional { allowedInputs[name] = spec }
+		for name, spec := range required {
+			if children, requiredChildren, autogrow := comfyAutogrowChildren(name, spec); autogrow {
+				for child, childSpec := range children { allowedInputs[child] = childSpec }
+				for _, child := range requiredChildren { if _, exists := node.Inputs[child]; !exists { return comfyGraphError(5, id+"."+child) } }
+				continue
+			}
+			allowedInputs[name] = spec; if _, exists := node.Inputs[name]; !exists { return comfyGraphError(5, id+"."+name) }
+		}
+		for name, spec := range optional {
+			if children, _, autogrow := comfyAutogrowChildren(name, spec); autogrow {
+				for child, childSpec := range children { allowedInputs[child] = childSpec }
+				continue
+			}
+			allowedInputs[name] = spec
+		}
 		// Expand selected conditional schemas to a bounded fixed point. Iteration order
 		// is deliberately irrelevant: every selected dynamic input is revisited until
 		// no new child name is admitted.
@@ -551,7 +573,10 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 				childRequired, childOptional, dynamic, selected := comfyDynamicChildInputsExact(spec, value)
 				if !dynamic { continue }
 				if !selected { return comfyGraphError(6, id+"."+name) }
-				for childName, childSpec := range childRequired {
+				for bareName, childSpec := range childRequired {
+					// ComfyUI's API keys a selected option's inputs as "<parent>.<child>";
+					// the bare child name is accepted for graphs written before that.
+					childName := comfyDynamicChildKey(node.Inputs, name, bareName)
 					// A selected dynamic option refines a same-named static input
 					// (ComfyUI V3 keeps a static fallback, e.g. SaveVideo.codec); only
 					// two different dynamic owners of one child are a conflict.
@@ -560,7 +585,8 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 					} else if !exists || dynamicInputOwner[childName] == "" && !bytes.Equal(old, childSpec) { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
 					if _, exists := node.Inputs[childName]; !exists { return comfyGraphError(8, id+"."+childName) }
 				}
-				for childName, childSpec := range childOptional {
+				for bareName, childSpec := range childOptional {
+					childName := comfyDynamicChildKey(node.Inputs, name, bareName)
 					if old, exists := allowedInputs[childName]; exists && dynamicInputOwner[childName] != "" {
 						if dynamicInputOwner[childName] != name || !bytes.Equal(old, childSpec) { return comfyGraphError(9, id+"."+childName) }
 					} else if !exists || dynamicInputOwner[childName] == "" && !bytes.Equal(old, childSpec) { allowedInputs[childName] = childSpec; dynamicInputOwner[childName] = name; changed = true }
@@ -596,6 +622,7 @@ func validateComfyGraph(graph map[string]json.RawMessage, schemas map[string]jso
 				if len(link) == 2 { return comfyGraphError(16, id+"."+name) }
 			}
 			if comfyForceInput(spec) { return comfyGraphError(17, id+"."+name) }
+			if comfyUploadedInput(spec, value, uploads) { continue }
 			if !comfyLiteralSupported(spec, value) { return comfyGraphError(18, id+"."+name) }
 		}
 	}
@@ -917,12 +944,94 @@ func safeComfySchemaMetadata(value any, depth int) bool {
 func comfyInputAccepts(raw json.RawMessage, outputType string) bool {
 	var spec []json.RawMessage
 	if json.Unmarshal(raw, &spec) != nil || len(spec) == 0 { return false }
+	// A MatchType output takes the concrete type of its matched inputs, which
+	// ComfyUI resolves at execution; the preflight cannot narrow it further.
+	if outputType == comfyMatchType { return true }
 	var encoded string
 	if json.Unmarshal(spec[0], &encoded) == nil {
+		if encoded == comfyMatchType {
+			encoded = "*"
+			var options struct {
+				Template struct {
+					AllowedTypes string `json:"allowed_types"`
+				} `json:"template"`
+			}
+			if len(spec) > 1 && json.Unmarshal(spec[1], &options) == nil && options.Template.AllowedTypes != "" { encoded = options.Template.AllowedTypes }
+		}
 		for _, alternative := range strings.Split(encoded, ",") { if alternative == "*" || alternative == outputType { return true } }
 		return false
 	}
 	return false
+}
+
+const comfyMatchType = "COMFY_MATCHTYPE_V3"
+
+// comfyUploadedInput reports whether value names one of the request's staged
+// artifacts on an input that takes uploads (LoadImage's image_upload, etc.).
+func comfyUploadedInput(raw, value json.RawMessage, uploads map[string]bool) bool {
+	if len(uploads) == 0 { return false }
+	var name string
+	if json.Unmarshal(value, &name) != nil || !uploads[name] { return false }
+	var spec []json.RawMessage
+	if json.Unmarshal(raw, &spec) != nil || len(spec) < 2 { return false }
+	var options map[string]any
+	if json.Unmarshal(spec[1], &options) != nil { return false }
+	for _, key := range []string{"image_upload", "video_upload", "audio_upload", "upload"} {
+		if enabled, _ := options[key].(bool); enabled { return true }
+	}
+	return false
+}
+
+// comfyDynamicChildKey returns the graph key carrying a selected dynamic
+// option's child input: ComfyUI's canonical "<parent>.<child>", or the bare
+// child name when only that form is present.
+func comfyDynamicChildKey(inputs map[string]json.RawMessage, parent, child string) string {
+	dotted := parent + "." + child
+	if _, ok := inputs[dotted]; ok { return dotted }
+	if _, ok := inputs[child]; ok { return child }
+	return dotted
+}
+
+// comfyAutogrowChildren expands a COMFY_AUTOGROW_V3 input the way ComfyUI
+// does: its template input is repeated under "<name>.<child>" for every
+// template name (or prefix+index), the first min of them required when the
+// template input itself is required.
+func comfyAutogrowChildren(name string, raw json.RawMessage) (map[string]json.RawMessage, []string, bool) {
+	var spec []json.RawMessage
+	if json.Unmarshal(raw, &spec) != nil || len(spec) < 2 { return nil, nil, false }
+	var kind string
+	if json.Unmarshal(spec[0], &kind) != nil || kind != "COMFY_AUTOGROW_V3" { return nil, nil, false }
+	var options struct {
+		Template struct {
+			Input  map[string]map[string]json.RawMessage `json:"input"`
+			Names  []string                              `json:"names"`
+			Prefix *string                               `json:"prefix"`
+			Min    int                                   `json:"min"`
+			Max    int                                   `json:"max"`
+		} `json:"template"`
+	}
+	if json.Unmarshal(spec[1], &options) != nil { return map[string]json.RawMessage{}, nil, true }
+	template := options.Template
+	var childSpec json.RawMessage
+	templateRequired := false
+	for _, group := range []string{"required", "optional"} {
+		for _, value := range template.Input[group] { childSpec, templateRequired = value, group == "required"; break }
+		if childSpec != nil { break }
+	}
+	names := template.Names
+	if len(names) == 0 && template.Prefix != nil {
+		for i := 0; i < template.Max && i < 100; i++ { names = append(names, fmt.Sprintf("%s%d", *template.Prefix, i)) }
+	}
+	if len(names) > 100 { names = names[:100] }
+	children := make(map[string]json.RawMessage, len(names))
+	var required []string
+	if childSpec == nil { return children, nil, true }
+	for i, child := range names {
+		key := name + "." + child
+		children[key] = childSpec
+		if templateRequired && i < template.Min { required = append(required, key) }
+	}
+	return children, required, true
 }
 
 func safeComfyTypeToken(value string) bool {
