@@ -35,6 +35,7 @@ WORKFLOW_PROFILES = {
     "image-krea2": ("IMAGE", ["image.generate"], ["application/json"], {"application/json", "image/png"}),
     "video-ltx25-t2v": ("VIDEO", ["video.generate_sequence"], ["application/json"], {"application/json", "video/mp4"}),
     "video-seedvr2": ("VIDEO", ["video.upscale"], ["application/json", "video/mp4"], {"application/json", "video/mp4"}),
+    "audio-qwen25-omni": ("AUDIO", ["audio.speech", "audio.transcribe"], ["application/json", "audio/*", "video/mp4"], {"application/json", "audio/mpeg", "text/plain"}),
 }
 
 

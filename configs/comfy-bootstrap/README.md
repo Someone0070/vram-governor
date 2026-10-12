@@ -24,7 +24,7 @@ POST /api/v1/workloads              # {"workflow": "...", "params": {...}}
 
 | Workflow | What it is for | Params (* required) | Typical |
 | --- | --- | --- | --- |
-| `image-krea2-turbo` | Stylized, 3D, clay, cartoon, painterly | prompt*, width, height, seed, steps | ~20 s |
+| `image-krea2-turbo` | Stylized, 3D, clay, cartoon, painterly; `style` adds a look LoRA (realism, snapshot, lenovo) | prompt*, width, height, seed, steps, style, style_strength | ~20 s |
 | `image-qwen21-photoreal` | Candid phone-photo realism | prompt*, negative_prompt, width, height, seed, steps, cfg, realism | ~2.5 min |
 | `image-qwen21` | General images, text inside the image | prompt*, negative_prompt, width, height, seed, steps, cfg | ~50 s |
 | `image-sdxl` | Classic SDXL 1.0 | prompt*, negative_prompt, width, height, seed, steps, cfg | ~25 s |
@@ -34,8 +34,12 @@ POST /api/v1/workloads              # {"workflow": "...", "params": {...}}
 | `video-minimax-h3-i2v` | Animate 2D/cartoon art on-model (H3) | image*, prompt*, seconds, seed, turbo | ~3 min |
 | `video-minimax-h3-flf` | Motion between a start and end frame | image*, last_image*, prompt*, seconds, seed, turbo | ~3 min |
 | `video-seedvr2-upscale` | Restore and upscale a video | video*, scale, seed | ~8.5 min |
+| `audio-speak` | Text to speech (Qwen2.5-Omni voices Chelsie, Ethan), MP3 | text*, voice | ~5 s per s of speech |
+| `audio-transcribe` | Speech to text from audio or video | audio*, language, context | ~real time |
 
 - `image`, `last_image` and `video` take an artifact id: upload with `POST /upload/image` (the response `name`), or pass the `artifact_ref` of an earlier job's output to chain jobs (e.g. Krea image → H3 video → SeedVR2 upscale).
+- The Qwen-Image, LTX-2.5 and MiniMax-H3 workflows also take `precision` (`int8`, the default, or `bf16`; bf16 is much slower on a 10 GB card).
+- OpenAI-compatible routes run on these workflows: `POST /v1/images/generations` (`model` = an image workflow, default `image-krea2-turbo`; `size`, `n`, `seed`, `negative_prompt`, plus `params` for anything else), `POST /v1/audio/speech` (`audio-speak`; OpenAI voice names map to Chelsie/Ethan) and `POST /v1/audio/transcriptions` (`audio-transcribe`, multipart `file`).
 - Omitted params use the workflow's defaults; `seed` is random when omitted. The response's `workflow.params` echoes every effective value, including the seed, so a result can be reproduced.
 - Invalid or unknown params are all reported in one `400` response.
 - `operation` and `profile_preferences` are optional; when given they must match the workflow.

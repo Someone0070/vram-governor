@@ -1,0 +1,81 @@
+{
+  "id": "audio-transcribe",
+  "version": 1,
+  "title": "Speech to text (Qwen2.5-Omni)",
+  "description": "Transcribes speech from an audio (or video) file in 30-second windows and returns the text. About real time on the 10 GB card.",
+  "operation": "audio.transcribe",
+  "profile": "audio-qwen25-omni@1",
+  "outputs": [
+    "text/plain"
+  ],
+  "typical_seconds": 20,
+  "params": [
+    {
+      "name": "audio",
+      "type": "audio",
+      "required": true,
+      "description": "Audio or video file (artifact id from POST /upload/image or an earlier job).",
+      "bind": [
+        {
+          "node": "1",
+          "input": "audio"
+        }
+      ]
+    },
+    {
+      "name": "language",
+      "type": "string",
+      "default": "",
+      "max_length": 40,
+      "description": "Optional spoken language, e.g. English.",
+      "bind": [
+        {
+          "node": "2",
+          "input": "language"
+        }
+      ]
+    },
+    {
+      "name": "context",
+      "type": "string",
+      "default": "",
+      "max_length": 1000,
+      "description": "Optional names or terms that appear in the audio.",
+      "bind": [
+        {
+          "node": "2",
+          "input": "context"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "LoadAudio",
+      "inputs": {
+        "audio": ""
+      }
+    },
+    "2": {
+      "class_type": "VGSpeechTranscribe",
+      "inputs": {
+        "audio": [
+          "1",
+          0
+        ],
+        "language": "",
+        "context": ""
+      }
+    },
+    "3": {
+      "class_type": "VGSaveText",
+      "inputs": {
+        "text": [
+          "2",
+          0
+        ],
+        "filename_prefix": "lb/transcript"
+      }
+    }
+  }
+}

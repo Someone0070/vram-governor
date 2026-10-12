@@ -34,6 +34,7 @@ const (
 	TypeSeed    = "seed"  // integer; random when omitted
 	TypeImage   = "image" // artifact id of an uploaded or produced image
 	TypeVideo   = "video" // artifact id of an uploaded or produced video
+	TypeAudio   = "audio" // artifact id of an uploaded or produced audio file
 )
 
 // maxSeed keeps seeds exactly representable as JSON numbers.
@@ -107,6 +108,10 @@ func (p *Param) bypasses(node, value string) bool {
 	return false
 }
 
+func (p *Param) isMedia() bool {
+	return p.Type == TypeImage || p.Type == TypeVideo || p.Type == TypeAudio
+}
+
 func containsValue(values []string, value string) bool {
 	for _, v := range values {
 		if v == value {
@@ -170,7 +175,7 @@ func (t *Template) Validate() error {
 		}
 		seen[p.Name] = true
 		switch p.Type {
-		case TypeString, TypeInteger, TypeNumber, TypeBoolean, TypeSeed, TypeImage, TypeVideo:
+		case TypeString, TypeInteger, TypeNumber, TypeBoolean, TypeSeed, TypeImage, TypeVideo, TypeAudio:
 		case TypeEnum:
 			if len(p.Values) == 0 {
 				return fmt.Errorf("template %s: enum %s lists no values", t.ID, p.Name)
@@ -234,7 +239,7 @@ func (t *Template) Validate() error {
 		if p.Required && p.Default != nil {
 			return fmt.Errorf("template %s: required parameter %s may not have a default", t.ID, p.Name)
 		}
-		if (p.Type == TypeImage || p.Type == TypeVideo) && p.Default != nil {
+		if p.isMedia() && p.Default != nil {
 			return fmt.Errorf("template %s: media parameter %s may not have a default", t.ID, p.Name)
 		}
 		if !p.Required && p.Default == nil && p.Type != TypeSeed {
@@ -337,7 +342,7 @@ func (p *Param) coerce(v any) (any, error) {
 			}
 		}
 		return nil, fmt.Errorf("must be one of %s", strings.Join(p.Values, ", "))
-	case TypeImage, TypeVideo:
+	case TypeImage, TypeVideo, TypeAudio:
 		s, ok := v.(string)
 		s = strings.TrimPrefix(strings.TrimSpace(s), "artifact://")
 		if !ok || s == "" || strings.ContainsAny(s, `/\`) {
@@ -439,7 +444,7 @@ func (t *Template) Compile(params map[string]any) (*Compiled, error) {
 			continue
 		}
 		out.Params[p.Name] = value
-		if p.Type == TypeImage || p.Type == TypeVideo {
+		if p.isMedia() {
 			out.ArtifactRefs = append(out.ArtifactRefs, value.(string))
 		}
 	}

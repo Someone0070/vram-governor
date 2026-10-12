@@ -67,6 +67,8 @@ func (s *Server) routes(dashboardFS http.FileSystem) {
 	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	s.mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
 	s.mux.HandleFunc("POST /v1/images/generations", s.handleOpenAIImages)
+	s.mux.HandleFunc("POST /v1/audio/speech", s.handleOpenAISpeech)
+	s.mux.HandleFunc("POST /v1/audio/transcriptions", s.handleOpenAITranscriptions)
 	s.mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("POST /prompt", s.handleComfyPrompt)
 	s.mux.HandleFunc("GET /object_info", s.handleComfyObjectInfo)

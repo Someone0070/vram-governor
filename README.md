@@ -314,7 +314,7 @@ Generate a credential digest, for example:
 |---|---|
 | Common async | `/api/v1/workloads`, status, approval, reprioritization, cancellation, artifacts, events, notifications |
 | Creator Studio | `/api/v1/capabilities`, capability-oriented `/api/v1/workloads`, `/api/v1/workloads/batch`, `/api/v1/batches/{id}`, session working-set hints |
-| OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`, human chat at `/chat/` |
+| OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`, human chat at `/chat/` |
 | ComfyUI | `/prompt`, `/ws`, `/history`, `/history/{id}`, `/queue`, `/upload/image`, `/view` |
 | Node | `/ws/node`, node engine/profile reporting |
 | System agent | `/api/agent/v1/incidents/*`, escalation/proposals, `/api/agent/v1/events` |

@@ -1,0 +1,63 @@
+{
+  "id": "audio-speak",
+  "version": 1,
+  "title": "Text to speech (Qwen2.5-Omni)",
+  "description": "Speaks the text with one of Qwen2.5-Omni's built-in voices and returns an MP3. Long text is spoken sentence by sentence. On the 10 GB card it takes roughly 10 s of compute per second of speech.",
+  "operation": "audio.speech",
+  "profile": "audio-qwen25-omni@1",
+  "outputs": [
+    "audio/mpeg"
+  ],
+  "typical_seconds": 100,
+  "params": [
+    {
+      "name": "text",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "What to say.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "text"
+        }
+      ]
+    },
+    {
+      "name": "voice",
+      "type": "enum",
+      "default": "Chelsie",
+      "values": [
+        "Chelsie",
+        "Ethan"
+      ],
+      "description": "Chelsie (female) or Ethan (male).",
+      "bind": [
+        {
+          "node": "1",
+          "input": "voice"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "VGSpeechSpeak",
+      "inputs": {
+        "text": "",
+        "voice": "Chelsie"
+      }
+    },
+    "2": {
+      "class_type": "SaveAudioMP3",
+      "inputs": {
+        "audio": [
+          "1",
+          0
+        ],
+        "filename_prefix": "lb/speech",
+        "quality": "V0"
+      }
+    }
+  }
+}

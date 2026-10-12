@@ -272,6 +272,40 @@
       "output_schema": {"type": "object", "required": ["outputs"], "properties": {"outputs": {"type": "array"}}},
       "accepted_artifact_types": ["application/json", "video/mp4"],
       "produced_artifact_types": ["application/json", "video/mp4"]
+    },
+    {
+      "profile_id": "audio-qwen25-omni",
+      "version": "1",
+      "digest": "d59c4613a72e518645c7911d575bfdfbeb38910ef1ff98ac07fb4c7470bd0e3c",
+      "capability_revision": "1",
+      "modality": "AUDIO",
+      "execution_locality": "LB_MANAGED",
+      "adapter": "comfy",
+      "model": "qwen2.5-omni-3b",
+      "workflow": "workflows/audio-speak.json",
+      "operations": ["audio.speech", "audio.transcribe"],
+      "features": ["speech_synthesis", "transcription"],
+      "input_schema": {
+        "type": "object",
+        "required": ["managed_chunks"],
+        "properties": {
+          "managed_chunks": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["id", "prompt"],
+              "properties": {
+                "id": {"type": "string", "minLength": 1},
+                "prompt": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "object", "required": ["class_type", "inputs"], "properties": {"class_type": {"type": "string"}, "inputs": {"type": "object"}}}}
+              }
+            }
+          }
+        }
+      },
+      "output_schema": {"type": "object", "required": ["outputs"], "properties": {"outputs": {"type": "array"}}},
+      "accepted_artifact_types": ["application/json", "audio/*", "video/mp4"],
+      "produced_artifact_types": ["application/json", "audio/mpeg", "text/plain"]
     }
   ]
 }
