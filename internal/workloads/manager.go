@@ -2173,7 +2173,7 @@ func reduceRuntimeProfileHistory(nodeID string, target Target, rows []*domain.No
 		if row.Attempts == 0 && (row.Status == domain.NodeCommandFailed || row.Status == domain.NodeCommandExpired) {
 			continue
 		}
-		if row.Status == domain.NodeCommandFailed && !row.Uncertain && row.CompletedAt != nil {
+		if row.Status == domain.NodeCommandFailed && !row.Uncertain && row.CompletedAt != nil && !strings.HasPrefix(row.Error, "runtime profile observation rejected") && !strings.HasPrefix(row.Error, "unresolved") {
 			// The node answered with a definite failure (no side-effect
 			// ambiguity, e.g. it rejected the command before acting), so
 			// the runtime's own advertisement stays authoritative.
@@ -5952,6 +5952,57 @@ func (m *Manager) beginRuntimeProfileTransition(target Target, desired RuntimeCa
 	}
 }
 
+// ErrNodeCommandFailed marks a node command the node itself completed as
+// failed without side-effect ambiguity (as opposed to an expired, lost or
+// uncertain command). Node control implementations wrap such errors with it.
+var ErrNodeCommandFailed = errors.New("node command failed")
+
+// abortRuntimeProfileTransition undoes beginRuntimeProfileTransition for a
+// switch the node definitively did not perform: the pre-switch capacity
+// observation is restored and the node/card/alias blocks it set are lifted.
+// It does nothing once the ticket was projected or replaced.
+func (m *Manager) abortRuntimeProfileTransition(transition *runtimeProfileTransition) {
+	if transition == nil {
+		return
+	}
+	transition.dispatchMu.Lock()
+	transition.resultMu.Lock()
+	defer transition.resultMu.Unlock()
+	defer transition.dispatchMu.Unlock()
+	m.residencyAdmissionMu.Lock()
+	defer m.residencyAdmissionMu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.runtimeProfileTransitionTarget[transition.targetID] != transition.commandKey || m.runtimeProfileTransitions[transition.commandKey] != transition || transition.projected {
+		return
+	}
+	current, found := m.targets[transition.targetID]
+	if found && m.targetGenerations[transition.targetID] == transition.expectedGeneration {
+		basis := transition.historyBasis
+		current.CapacityVerified, current.CapacitySource = basis.CapacityVerified, basis.CapacitySource
+		current.ContextLimit, current.Slots, current.ActiveRuntimeProfile = basis.ContextLimit, basis.Slots, basis.ActiveRuntimeProfile
+		if err := m.replaceTargetLocked(current); err != nil {
+			m.log.Error("runtime profile abort could not restore target capacity", "target", transition.targetID, "error", err)
+			return
+		}
+	}
+	delete(m.runtimeProfileTransitions, transition.commandKey)
+	delete(m.runtimeProfileTransitionTarget, transition.targetID)
+	const blockReason = "runtime profile observation_unavailable; physical switch outcome is unresolved"
+	if m.runtimeProfileBlockedNodes[transition.nodeID] == blockReason {
+		delete(m.runtimeProfileBlockedNodes, transition.nodeID)
+	}
+	if m.runtimeProfileBlockedCards[transition.acceleratorID] == blockReason {
+		delete(m.runtimeProfileBlockedCards, transition.acceleratorID)
+	}
+	for aliasID, reason := range m.runtimeProfileBlockedTargets {
+		if reason == blockReason && m.targets[aliasID].AcceleratorID == transition.acceleratorID {
+			delete(m.runtimeProfileBlockedTargets, aliasID)
+		}
+	}
+	m.log.Warn("runtime profile switch rejected by node; previous profile restored", "target", transition.targetID, "profile", transition.profile.ID)
+}
+
 // ValidateRuntimeProfileCommandResult validates a profile observation without
 // publishing it. The API uses this before the durable command-result CAS.
 func (m *Manager) ValidateRuntimeProfileCommandResult(commandKey, nodeID string, result map[string]any) error {
@@ -6212,6 +6263,13 @@ func (m *Manager) ensureRuntimeProfile(ctx context.Context, target Target, desir
 	m.mu.Unlock()
 	result, err := control(ctx, nodeID, "switch_runtime_profile", map[string]any{"target_id": target.ID, "profile_id": desired.ID, "fencing_token": int64(fence)}, transition.commandKey)
 	if err != nil {
+		if errors.Is(err, ErrNodeCommandFailed) {
+			// The node answered with a definite failure, so the runtime is
+			// still in its previous profile: restore it now instead of
+			// withholding the target until a controller restart.
+			m.abortRuntimeProfileTransition(transition)
+			return m.targetByID(target.ID), "", err
+		}
 		return target, "", err
 	}
 	if err = m.ProjectRuntimeProfileCommandResult(transition.commandKey, nodeID, result); err != nil {

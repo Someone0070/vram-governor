@@ -376,6 +376,12 @@ func (s *Server) waitForNodeCommand(ctx context.Context, stored *domain.NodeComm
 			}
 			return result, nil
 		case domain.NodeCommandFailed, domain.NodeCommandExpired:
+			// Only a failure the node itself reported is definite; a result the
+			// controller rejected after the node acted (observation rejected,
+			// unresolved custody) leaves the runtime state unknown.
+			if current.Status == domain.NodeCommandFailed && !current.Uncertain && !strings.HasPrefix(current.Error, "runtime profile observation rejected") && !strings.HasPrefix(current.Error, "unresolved") {
+				return nil, nodeCommandFailure{message: fmt.Sprintf("node command %s: %s", current.Status, current.Error)}
+			}
 			return nil, fmt.Errorf("node command %s: %s", current.Status, current.Error)
 		}
 		if current.Uncertain {
@@ -1803,3 +1809,12 @@ func newCommandID() string {
 	}
 	return "cmd-" + hex.EncodeToString(value[:])
 }
+
+// nodeCommandFailure is a failure the node reported for a command it ran (or
+// rejected) without side-effect ambiguity. It keeps the historic message text
+// and matches workloads.ErrNodeCommandFailed.
+type nodeCommandFailure struct{ message string }
+
+func (e nodeCommandFailure) Error() string { return e.message }
+
+func (e nodeCommandFailure) Is(target error) bool { return target == workloads.ErrNodeCommandFailed }

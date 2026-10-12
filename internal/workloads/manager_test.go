@@ -6795,4 +6795,74 @@ func TestRuntimeProfileHistoryIgnoresDefiniteRejection(t *testing.T) {
 	if blocker := reduceRuntimeProfileHistory("node", target, row(false, nil), known); blocker == "" {
 		t.Fatal("a failed switch without a node result must keep blocking")
 	}
+	rejectedObservation := row(false, &completed)
+	rejectedObservation[0].Error = "runtime profile observation rejected: missing adapters"
+	if blocker := reduceRuntimeProfileHistory("node", target, rejectedObservation, known); blocker == "" {
+		t.Fatal("a switch whose result the controller rejected may have happened and must keep blocking")
+	}
+}
+
+// A profile switch the node definitively rejects (live: missing fence) left
+// the target withheld with "operator reconciliation required" until the
+// controller restarted. The previous profile is now restored at once and the
+// next admission pass can switch again.
+func TestRejectedRuntimeProfileSwitchRestoresTargetImmediately(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	now := time.Now().UTC()
+	envelope := domain.CapacityBudget{VRAMTotalBytes: 8 << 30, VRAMHardCapBytes: 8 << 30}
+	if _, err := backing.UpsertNode(ctx, &domain.Node{ID: "node", SchedulingState: domain.SchedulingEnabled, Desired: domain.Desired{SchedulingEnabled: true}, Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true, LastSeenAt: now}, Accelerators: []domain.Accelerator{{ID: "node-gpu0", NodeID: "node", VRAMTotalMB: 24_000, VRAMFreeMB: 24_000}}}); err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	defer mgr.Close()
+	mgr.SetNodeStore(backing)
+	mgr.RegisterAdapter(modelAwareMockAdapter{NewMockAdapter()})
+	registered := Target{
+		ID: "node-runtime", NodeID: "node", Adapter: "model-mock", Endpoint: "http://runtime", AcceleratorID: "node-gpu0", Models: []string{"model"}, ResidentModels: []string{"model"},
+		ContextLimit: 8192, Slots: 4, ActiveRuntimeProfile: "ctx-8k", SupportsRuntimeProfileSwitch: true, Enabled: true,
+		CapabilityVersion: "runtime-v1", RuntimeIdentity: "runtime-v1", CapabilityRevision: "cap-v1", ModelFingerprint: "model-fp", CapacitySource: "runtime:/slots", CapacityVerified: true,
+		Capacity: envelope, RuntimeProfiles: []RuntimeCapacityProfile{{ID: "ctx-8k", ContextLimit: 8192, Slots: 4}, {ID: "ctx-32k", ContextLimit: 32768, Slots: 1}},
+	}
+	mgr.RegisterTarget(registered)
+	projected := mgr.targetByID(registered.ID)
+	projected.ActiveRuntimeProfile, projected.ContextLimit, projected.Slots = "ctx-32k", 32768, 1
+	capacity := measuredCapacityWithProfile(projected, "model", 3<<30, 2<<30)
+	if _, err := backing.UpsertModelCapacity(ctx, &capacity); err != nil {
+		t.Fatal(err)
+	}
+	commands := 0
+	mgr.SetNodeControl(func(_ context.Context, _, command string, _ map[string]any, _ string) (map[string]any, error) {
+		commands++
+		if commands == 1 {
+			return nil, fmt.Errorf("%w: fencing_token must be a nonnegative integer", ErrNodeCommandFailed)
+		}
+		return map[string]any{"adapters": []any{map[string]any{
+			"id": "runtime", "adapter": "model-mock", "endpoint": "http://runtime", "accelerator_index": 0,
+			"version": "runtime-v1", "model_fingerprint": "model-fp", "capability_version": "runtime-v1", "capability_revision": "cap-v1",
+			"context_limit": 32768, "slots": 1, "capacity_source": "runtime:/slots", "capabilities_verified": true, "active_runtime_profile": "ctx-32k",
+			"runtime_profiles": []any{map[string]any{"id": "ctx-8k", "context_limit": 8192, "slots": 4}, map[string]any{"id": "ctx-32k", "context_limit": 32768, "slots": 1}},
+		}}}, nil
+	})
+	row, _, err := mgr.Submit(ctx, domain.WorkloadRequest{OwnerID: "owner", Adapter: "model-mock", QueuePolicy: domain.QueueWait, Payload: json.RawMessage(`{"model":"model"}`), Bounds: domain.WorkloadBounds{ContextTokens: 30_000, MaxOutput: 1_000}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restored := mgr.targetByID(registered.ID)
+	if commands != 1 || row.Status != domain.WorkloadWaiting || restored.ActiveRuntimeProfile != "ctx-8k" || restored.ContextLimit != 8192 || !restored.CapacityVerified || restored.CapacitySource != "runtime:/slots" {
+		t.Fatalf("rejected switch did not restore the previous profile: commands=%d status=%s target=%+v", commands, row.Status, restored)
+	}
+	mgr.mu.RLock()
+	pending, blockedNode, blockedCard := mgr.runtimeProfileTransitionTarget[registered.ID], mgr.runtimeProfileBlockedNodes["node"], mgr.runtimeProfileBlockedCards["node-gpu0"]
+	mgr.mu.RUnlock()
+	if pending != "" || blockedNode != "" || blockedCard != "" {
+		t.Fatalf("rejected switch left blocks: pending=%q node=%q card=%q", pending, blockedNode, blockedCard)
+	}
+	latest, _ := backing.GetWorkload(ctx, row.Request.ID)
+	latest.TargetRetryAfter = nil
+	mgr.tryAdmit(ctx, latest)
+	after, _ := backing.GetWorkload(ctx, row.Request.ID)
+	if commands != 2 || (after.Status != domain.WorkloadRunning && after.Status != domain.WorkloadSucceeded) || mgr.targetByID(registered.ID).ActiveRuntimeProfile != "ctx-32k" {
+		t.Fatalf("next pass did not switch and admit: commands=%d status=%s decision=%+v", commands, after.Status, after.Decision)
+	}
 }
