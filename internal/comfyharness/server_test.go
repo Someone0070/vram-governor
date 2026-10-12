@@ -1401,7 +1401,7 @@ func (endlessDiscoveryReader) Read(buffer []byte) (int, error) {
 
 func TestComfyDiscoveryRejectsOversizedBodies(t *testing.T) {
 	for _, check := range []struct {
-		path string
+		path  string
 		limit int64
 	}{{path: "/object_info", limit: maxObjectInfoBytes}, {path: "/system_stats", limit: maxSystemStatsBytes}} {
 		t.Run(check.path, func(t *testing.T) {
@@ -1532,5 +1532,79 @@ func TestManagedComfyUpgradesLegacyTerminalStateWithoutPayloadHash(t *testing.T)
 	if server, err := New(Options{ComfyURL: "http://127.0.0.1:1", Authorization: "Bearer harness-secret", StateDirectory: running}); err == nil {
 		_ = server.Close()
 		t.Fatal("legacy nonterminal execution without payload identity was accepted")
+	}
+}
+
+// The live incident: the harness restarted while an LB job was in flight. The
+// new process inherits an execution with unknown custody and no live run, and
+// every cancel used to stay "uncertain", fencing the GPU forever. Cancel must
+// stay uncertain while Comfy still holds any prompt and become provable once
+// Comfy is idle - without interrupting anything.
+func TestManagedComfyCancelProvesStopAfterRestartWhenComfyIdle(t *testing.T) {
+	comfy := newFakeComfy()
+	comfyServer := httptest.NewServer(http.HandlerFunc(comfy.handler))
+	defer comfyServer.Close()
+	directory := privateStateDirectory(t)
+	first, firstServer := newHarnessTestServer(t, comfyServer.URL, directory)
+	_, started := harnessRequest(t, firstServer.Client(), http.MethodPost, firstServer.URL+"/v1/executions", managedStartBody())
+	prompt := <-comfy.started
+	waitForPrompt(t, first, started.ExecutionID)
+	first.mu.Lock()
+	first.executions[started.ExecutionID].Submission = "unknown" // custody lost, as after an unrecorded acceptance
+	if err := first.persistLocked(); err != nil {
+		first.mu.Unlock()
+		t.Fatal(err)
+	}
+	first.mu.Unlock()
+	firstServer.Close()
+	_ = first.Close()
+
+	second, secondServer := newHarnessTestServer(t, comfyServer.URL, directory)
+	cancel := func() (int, string) {
+		response, state := harnessRequest(t, secondServer.Client(), http.MethodPost, secondServer.URL+"/v1/executions/"+started.ExecutionID+"/cancel", map[string]any{})
+		return response.StatusCode, state.State
+	}
+	if status, state := cancel(); status != http.StatusConflict || state != "uncertain" {
+		t.Fatalf("cancel with the prompt still in Comfy was overstated: %d %s", status, state)
+	}
+	comfy.queue(prompt)
+	if status, state := cancel(); status != http.StatusConflict || state != "uncertain" {
+		t.Fatalf("cancel with the prompt still pending was overstated: %d %s", status, state)
+	}
+	comfy.mu.Lock()
+	comfy.queueRaw = "{"
+	comfy.mu.Unlock()
+	if status, state := cancel(); status != http.StatusConflict || state != "uncertain" {
+		t.Fatalf("cancel with an unreadable queue was overstated: %d %s", status, state)
+	}
+	comfy.mu.Lock()
+	comfy.queueRaw = ""
+	comfy.pending = make(map[string]bool)
+	comfy.running = make(map[string]bool)
+	comfy.mu.Unlock()
+	if status, state := cancel(); status != http.StatusOK || state != "cancelled" {
+		t.Fatalf("cancel with Comfy idle was not proven: %d %s", status, state)
+	}
+	if status, state := cancel(); status != http.StatusOK || state != "cancelled" {
+		t.Fatalf("repeated cancel is not idempotent: %d %s", status, state)
+	}
+	comfy.mu.Lock()
+	interrupts := comfy.interrupts
+	comfy.mu.Unlock()
+	if interrupts != 0 {
+		t.Fatalf("the proof must not interrupt Comfy: %d", interrupts)
+	}
+	secondServer.Close()
+	_ = second.Close()
+	third, err := New(Options{ComfyURL: comfyServer.URL, Authorization: "Bearer harness-test", StateDirectory: directory, PollInterval: 5 * time.Millisecond, StopTimeout: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
+	third.mu.Lock()
+	persisted := third.executions[started.ExecutionID]
+	third.mu.Unlock()
+	if persisted == nil || persisted.State != "cancelled" {
+		t.Fatalf("proven cancellation was not persisted: %+v", persisted)
 	}
 }

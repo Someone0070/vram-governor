@@ -50,12 +50,15 @@ type Server struct {
 	executions  map[string]*execution
 	idempotency map[string]string
 	runtimes    map[string]*runtimeState
-	writeState  func(string, []byte) error
-	lockFile    *os.File
-	wg          sync.WaitGroup
-	closeOnce   sync.Once
-	closeErr    error
-	closed      bool
+	// activeRuns counts this process's live run goroutines per execution; a
+	// submission can only still be in flight while one is active.
+	activeRuns map[string]int
+	writeState func(string, []byte) error
+	lockFile   *os.File
+	wg         sync.WaitGroup
+	closeOnce  sync.Once
+	closeErr   error
+	closed     bool
 }
 
 type runtimeState struct {
@@ -176,7 +179,7 @@ func New(options Options) (*Server, error) {
 	if writer == nil {
 		writer = durableWriteState
 	}
-	s := &Server{options: options, executions: make(map[string]*execution), idempotency: make(map[string]string), runtimes: make(map[string]*runtimeState), writeState: writer}
+	s := &Server{options: options, executions: make(map[string]*execution), idempotency: make(map[string]string), runtimes: make(map[string]*runtimeState), activeRuns: make(map[string]int), writeState: writer}
 	lockPath := filepath.Join(canonical, "state.lock")
 	lock, err := acquireStateLock(lockPath)
 	if err != nil {
@@ -466,6 +469,39 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if execution.Submission == "submitting" || execution.Submission == "unknown" || execution.CurrentPrompt == "" {
+			if s.activeRuns[id] == 0 {
+				// No run of this execution is live in this process, so any earlier
+				// submission belonged to a dead incarnation and cannot still be in
+				// flight. If Comfy is idle, whatever it submitted has ended: the
+				// cancellation is provable rather than a guess.
+				epoch := execution.Epoch
+				s.mu.Unlock()
+				idle, queueErr := s.comfyQueueIdle(r.Context())
+				s.mu.Lock()
+				execution = s.executions[id]
+				if queueErr == nil && idle && execution != nil && execution.Epoch == epoch && s.activeRuns[id] == 0 && execution.State != "cancelled" && execution.State != "completed" && execution.State != "failed" {
+					before := cloneExecution(execution)
+					execution.State, execution.Requested, execution.Error, execution.UpdatedAt = "cancelled", "", "", time.Now().UTC()
+					execution.Submission, execution.SubmittingChunk, execution.CurrentPrompt = "", "", ""
+					execution.Epoch++
+					if err := s.persistLocked(); err != nil {
+						*execution = *before
+						s.mu.Unlock()
+						writeState(w, http.StatusInternalServerError, stateResponse{ExecutionID: id, State: execution.State, Error: "could not durably record proven cancellation"})
+						return
+					}
+					s.notifyLocked(id)
+					response := s.responseLocked(execution, false)
+					s.mu.Unlock()
+					writeState(w, http.StatusOK, response)
+					return
+				}
+				if execution == nil {
+					s.mu.Unlock()
+					writeState(w, http.StatusNotFound, stateResponse{State: "failed", Error: "execution not found"})
+					return
+				}
+			}
 			execution.State, execution.Error, execution.UpdatedAt = "uncertain", "submission may have reached Comfy; exact prompt identity is unavailable", time.Now().UTC()
 			execution.Epoch++
 			if err := s.persistLocked(); err != nil {
@@ -592,8 +628,13 @@ func (s *Server) launchLocked(id string, epoch uint64) {
 	}
 	runtime.cancel = cancel
 	runtime.epoch = epoch
+	s.activeRuns[id]++
 	s.wg.Add(1)
-	go func() { defer s.wg.Done(); s.run(ctx, id, epoch) }()
+	go func() {
+		defer s.wg.Done()
+		defer func() { s.mu.Lock(); s.activeRuns[id]--; s.mu.Unlock() }()
+		s.run(ctx, id, epoch)
+	}()
 }
 
 func (s *Server) run(ctx context.Context, id string, epoch uint64) {
@@ -912,6 +953,30 @@ func (s *Server) comfyControl(ctx context.Context, path string, body []byte) err
 		return fmt.Errorf("Comfy control %s returned %d", path, response.StatusCode)
 	}
 	return nil
+}
+
+// comfyQueueIdle reports whether Comfy has no running and no pending prompt.
+func (s *Server) comfyQueueIdle(ctx context.Context) (bool, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(s.options.ComfyURL, "/")+"/queue", nil)
+	if err != nil {
+		return false, err
+	}
+	response, err := s.options.Client.Do(request)
+	if err != nil {
+		return false, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return false, fmt.Errorf("Comfy queue returned %d", response.StatusCode)
+	}
+	var queue struct {
+		Running *[]json.RawMessage `json:"queue_running"`
+		Pending *[]json.RawMessage `json:"queue_pending"`
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&queue); err != nil || queue.Running == nil || queue.Pending == nil {
+		return false, fmt.Errorf("Comfy queue response is invalid")
+	}
+	return len(*queue.Running) == 0 && len(*queue.Pending) == 0, nil
 }
 
 func (s *Server) promptQueueState(ctx context.Context, promptID string) (queued, running bool, err error) {
