@@ -112,6 +112,9 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	if contextLimit <= 0 {
 		return wsproto.AdapterAdvertisement{}, fmt.Errorf("runtime did not report a context limit and no fallback is configured")
 	}
+	if routerDetected {
+		contextLimit = routerProfileContextLimit(cfg.RuntimeProfiles, contextLimit, slots)
+	}
 
 	publicEndpoint := cfg.PublicEndpoint
 	if publicEndpoint == "" {
@@ -461,4 +464,34 @@ func llamaPropsContext(body json.RawMessage) int {
 	}
 	_ = json.Unmarshal(body, &response)
 	return response.DefaultGenerationSettings.Context
+}
+
+// routerProfileContextLimit maps a router's observed per-slot context to its
+// configured runtime profile. A loaded model trained on a shorter context
+// (live: nomic-embed-text, 2048) caps n_ctx below the profile the router runs
+// (8192 x 4 slots). Advertising the model's cap made the controller see no
+// active profile and attempt a runtime switch, and refused chat requests as
+// "context too small" while that model was resident. When exactly one
+// profile has the observed slot count and a larger context, the router is in
+// that profile; otherwise the observation is advertised unchanged.
+func routerProfileContextLimit(profiles []RuntimeProfileConfig, contextLimit, slots int) int {
+	match := 0
+	for _, profile := range profiles {
+		if profile.Slots != slots {
+			continue
+		}
+		if profile.ContextLimit == contextLimit {
+			return contextLimit
+		}
+		if contextLimit > 0 && contextLimit < profile.ContextLimit {
+			if match != 0 {
+				return contextLimit
+			}
+			match = profile.ContextLimit
+		}
+	}
+	if match != 0 {
+		return match
+	}
+	return contextLimit
 }

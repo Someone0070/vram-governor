@@ -2434,6 +2434,9 @@ func TestRuntimeProfileSchedulerSwitchesIdleTargetToSmallestSufficientProfile(t 
 		if nodeID != "node" || command != "switch_runtime_profile" || args["target_id"] != "node-runtime" || args["profile_id"] != "ctx-32k" {
 			t.Fatalf("unexpected profile command: node=%q command=%q args=%+v", nodeID, command, args)
 		}
+		if fence, ok := args["fencing_token"].(int64); !ok || fence <= 0 {
+			t.Fatalf("profile switch lacks the fencing token the node requires: %+v", args)
+		}
 		return map[string]any{"adapters": []any{map[string]any{
 			"id": "runtime", "adapter": "model-mock", "endpoint": "http://runtime", "accelerator_index": 0,
 			"version": "runtime-v1", "model_fingerprint": "model-fp", "capability_version": "runtime-v1", "capability_revision": "cap-v1",
@@ -6773,5 +6776,23 @@ func TestAdmissionOwnedPlacementGenerationHandoff(t *testing.T) {
 			loaded, getErr := backing.GetModelResidency(ctx, target.ID, "owned-model")
 			if getErr != nil || loaded.ObservedTier != domain.ResidencyHotVRAM { t.Fatalf("requested model durable observation=%+v err=%v", loaded, getErr) }
 		})
+	}
+}
+
+func TestRuntimeProfileHistoryIgnoresDefiniteRejection(t *testing.T) {
+	target := Target{ID: "node-runtime", NodeID: "node", Adapter: "mock", Endpoint: "http://runtime", AcceleratorID: "node-gpu0", ContextLimit: 8192, Slots: 4, ActiveRuntimeProfile: "ctx-8k"}
+	known := map[string]Target{target.ID: target}
+	completed := time.Now().UTC()
+	row := func(uncertain bool, done *time.Time) []*domain.NodeCommand {
+		return []*domain.NodeCommand{{ID: "rejected-switch", NodeID: "node", Command: "switch_runtime_profile", Args: map[string]any{"target_id": "runtime", "profile_id": "ctx-8k"}, Attempts: 1, Status: domain.NodeCommandFailed, Error: "fencing_token must be a nonnegative integer", Uncertain: uncertain, CreatedAt: completed, UpdatedAt: completed, CompletedAt: done}}
+	}
+	if blocker := reduceRuntimeProfileHistory("node", target, row(false, &completed), known); blocker != "" {
+		t.Fatalf("a definite node rejection still withholds the target: %q", blocker)
+	}
+	if blocker := reduceRuntimeProfileHistory("node", target, row(true, &completed), known); blocker == "" {
+		t.Fatal("an uncertain failed switch must keep blocking until reconciled")
+	}
+	if blocker := reduceRuntimeProfileHistory("node", target, row(false, nil), known); blocker == "" {
+		t.Fatal("a failed switch without a node result must keep blocking")
 	}
 }

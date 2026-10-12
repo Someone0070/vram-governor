@@ -2173,6 +2173,12 @@ func reduceRuntimeProfileHistory(nodeID string, target Target, rows []*domain.No
 		if row.Attempts == 0 && (row.Status == domain.NodeCommandFailed || row.Status == domain.NodeCommandExpired) {
 			continue
 		}
+		if row.Status == domain.NodeCommandFailed && !row.Uncertain && row.CompletedAt != nil {
+			// The node answered with a definite failure (no side-effect
+			// ambiguity, e.g. it rejected the command before acting), so
+			// the runtime's own advertisement stays authoritative.
+			continue
+		}
 		if routeID == "" {
 			return fmt.Sprintf("profile command %s has unknown target identity; node %s requires reconciliation", row.ID, nodeID)
 		}
@@ -6193,7 +6199,18 @@ func (m *Manager) ensureRuntimeProfile(ctx context.Context, target Target, desir
 		return target, "", err
 	}
 	target = pendingTarget
-	result, err := control(ctx, nodeID, "switch_runtime_profile", map[string]any{"target_id": target.ID, "profile_id": desired.ID}, transition.commandKey)
+	// The node fences runtime profile switches per runtime like every other
+	// mutation; without a token it rejects the command and the target stays
+	// withheld. Wall-clock milliseconds stay above any prior controller run.
+	m.mu.Lock()
+	fenceKey := "runtime-profile:" + target.ID
+	fence := m.gpuCommandFences[fenceKey] + 1
+	if now := uint64(time.Now().UnixMilli()); now > fence {
+		fence = now
+	}
+	m.gpuCommandFences[fenceKey] = fence
+	m.mu.Unlock()
+	result, err := control(ctx, nodeID, "switch_runtime_profile", map[string]any{"target_id": target.ID, "profile_id": desired.ID, "fencing_token": int64(fence)}, transition.commandKey)
 	if err != nil {
 		return target, "", err
 	}
