@@ -1,0 +1,58 @@
+#!/bin/bash
+# Nightly backup of the controller: a pg_dump of the database plus the
+# controller configuration, uploaded to the NAS with smbclient (the LB is an
+# unprivileged container and cannot mount the share). Every dump is restored
+# into a scratch database and its row counts compared with the live database,
+# so a broken backup is noticed the night it is made.
+set -euo pipefail
+DB=${VRAM_BACKUP_DB:-vram_governor}
+DIR=${VRAM_BACKUP_DIR:-/var/backups/vram-governor/daily}
+KEEP=${VRAM_BACKUP_KEEP:-14}
+SHARE=${VRAM_BACKUP_SHARE:-//10.0.0.28/models}
+DEST=${VRAM_BACKUP_DEST:-Backups/vram-governor-lb}
+CRED=${VRAM_BACKUP_CREDENTIALS:-/etc/samba/model-sync.cred}
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DAY=$(date -u +%F)
+mkdir -p "$DIR"
+chmod 700 "$DIR"
+
+dump="$DIR/$DB-$STAMP.dump"
+runuser -u postgres -- pg_dump -Fc -d "$DB" > "$dump.partial"
+mv "$dump.partial" "$dump"
+conf="$DIR/config-$STAMP.tar.gz"
+tar -czf "$conf" -C / etc/vram-governor $(cd / && ls -d etc/systemd/system/vram-* etc/samba 2>/dev/null)
+chmod 600 "$dump" "$conf"
+
+# Verify: restore into a scratch database and compare per-table row counts.
+check=${DB}_restore_check
+runuser -u postgres -- dropdb --if-exists "$check"
+runuser -u postgres -- createdb "$check"
+runuser -u postgres -- pg_restore --no-owner -d "$check" < "$dump"
+counts() {
+	runuser -u postgres -- psql -d "$1" -Atc "select string_agg(relname || '=' || n, ',' order by relname) from (select c.relname, (xpath('/row/n/text()', query_to_xml(format('select count(*) as n from %I.%I', n.nspname, c.relname), false, true, '')))[1]::text as n from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relkind = 'r' and n.nspname = 'public') t"
+}
+restored=$(counts "$check")
+live=$(counts "$DB")
+runuser -u postgres -- dropdb "$check"
+tables=$(echo "$restored" | tr ',' '\n' | grep -c . || true)
+live_tables=$(echo "$live" | tr ',' '\n' | grep -c . || true)
+# Rows may change between the dump and now; the table set may not.
+if [ "$tables" -eq 0 ] || [ "$tables" -ne "$live_tables" ]; then
+	echo "backup verify FAILED: restored $tables tables, live database has $live_tables" >&2
+	exit 1
+fi
+rows=$(echo "$restored" | tr ',' '\n' | cut -d= -f2 | paste -sd+ | bc)
+echo "verified restore: $tables tables, $rows rows"
+
+smb() { smbclient "$SHARE" -A "$CRED" -m SMB3 -c "$1" >/dev/null 2>&1; }
+smb "mkdir ${DEST%%/*}" || true
+smb "mkdir $DEST" || true
+smb "mkdir $DEST/$DAY" || true
+for f in "$dump" "$conf"; do
+	smb "put \"$f\" \"$DEST/$DAY/$(basename "$f")\"" || { echo "upload FAILED: $(basename "$f")" >&2; exit 1; }
+done
+echo "uploaded $(basename "$dump") $(du -h "$dump" | cut -f1), $(basename "$conf") to $DEST/$DAY"
+
+# Local retention: keep the newest $KEEP of each kind.
+ls -1t "$DIR"/"$DB"-*.dump 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+ls -1t "$DIR"/config-*.tar.gz 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f

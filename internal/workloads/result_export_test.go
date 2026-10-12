@@ -78,3 +78,27 @@ func TestResultExportNamesRawGraphRunsByOperation(t *testing.T) {
 		t.Fatalf("raw graph export names = %v", all)
 	}
 }
+
+func TestResultExportSkipsWhenDiskIsNearlyFull(t *testing.T) {
+	ctx := context.Background()
+	artifactStore, _ := artifacts.NewFileStore(t.TempDir())
+	image, _ := artifactStore.Put(ctx, "owner", "x", "a.png", "image/png", strings.NewReader("png"))
+	manager := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	manager.SetArtifactStore(artifactStore)
+	original := exportDiskFree
+	defer func() { exportDiskFree = original }()
+	exportDiskFree = func(string) (int64, error) { return 512 << 20, nil }
+	dir := t.TempDir()
+	workload := &domain.Workload{Request: domain.WorkloadRequest{ID: "x", Operation: "image.generate", Payload: json.RawMessage(`{}`)}, OutputRefs: []string{image.ID}}
+	err := manager.writeResultExport(ctx, ResultExport{Dir: dir, MediaTypes: []string{"image/*"}}, workload)
+	if err == nil || !strings.Contains(err.Error(), "export skipped") {
+		t.Fatalf("err = %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("wrote %d entries despite low disk", len(entries))
+	}
+	exportDiskFree = func(string) (int64, error) { return 10 << 30, nil }
+	if err := manager.writeResultExport(ctx, ResultExport{Dir: dir, MediaTypes: []string{"image/*"}}, workload); err != nil {
+		t.Fatal(err)
+	}
+}

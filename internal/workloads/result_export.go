@@ -26,7 +26,17 @@ import (
 type ResultExport struct {
 	Dir        string
 	MediaTypes []string // e.g. image/*, video/*, audio/*
+	// MinFreeBytes skips an export while the export directory's filesystem
+	// has less free space (the spool is drained to the NAS separately; if
+	// the NAS is away, results stop exporting instead of filling the disk).
+	MinFreeBytes int64
 }
+
+// defaultExportMinFree applies when MinFreeBytes is unset.
+const defaultExportMinFree = 2 << 30
+
+// exportDiskFree is replaceable in tests.
+var exportDiskFree = diskFreeBytes
 
 // SetResultExport enables exporting; an empty Dir disables it.
 func (m *Manager) SetResultExport(export ResultExport) {
@@ -94,6 +104,13 @@ func (m *Manager) writeResultExport(ctx context.Context, export ResultExport, wo
 	finished := time.Now()
 	if workload.FinishedAt != nil {
 		finished = *workload.FinishedAt
+	}
+	minFree := export.MinFreeBytes
+	if minFree <= 0 {
+		minFree = defaultExportMinFree
+	}
+	if free, err := exportDiskFree(export.Dir); err == nil && free < minFree {
+		return fmt.Errorf("export skipped: only %d MiB free in %s", free>>20, export.Dir)
 	}
 	dir := filepath.Join(export.Dir, finished.Local().Format("2006-01-02"))
 	if err := os.MkdirAll(dir, 0o755); err != nil {

@@ -1,0 +1,22 @@
+#!/bin/bash
+# Nightly backup of a GPU node's VRAM Governor and runtime configuration to
+# the NAS (written through the node's read-write share mount). Model weights
+# are not included: they already live on the NAS.
+set -euo pipefail
+DEST=${VRAM_NODE_BACKUP_DEST:-/mnt/models-rw/Backups/$(hostname)}
+KEEP_DAYS=${VRAM_NODE_BACKUP_KEEP_DAYS:-60}
+mountpoint -q "$(dirname "$(dirname "$DEST")")" || { echo "NAS share is not mounted" >&2; exit 1; }
+mkdir -p "$DEST"
+out="$DEST/config-$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+paths=()
+for p in etc/vram-governor etc/systemd/system/llama-server.service.d etc/systemd/system/comfyui.service.d \
+	etc/systemd/system/vram-* etc/systemd/system/comfy-harness.service etc/systemd/system/llama-server.service \
+	etc/systemd/system/comfyui.service etc/fstab etc/samba opt/ComfyUI/extra_model_paths.yaml \
+	opt/ComfyUI/custom_nodes/vram_governor_speech opt/ComfyUI/custom_nodes/vram_governor_compat \
+	usr/local/sbin/model-fetch-tee usr/local/sbin/vram-model-cache-sync var/lib/vram-warm-keeper; do
+	for match in /$p; do [ -e "$match" ] && paths+=("${match#/}"); done
+done
+tar -czf "$out.partial" -C / "${paths[@]}"
+mv "$out.partial" "$out"
+find "$DEST" -name 'config-*.tar.gz' -mtime +"$KEEP_DAYS" -delete
+echo "backed up ${#paths[@]} paths to $out ($(du -h "$out" | cut -f1))"

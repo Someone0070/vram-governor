@@ -1,0 +1,10 @@
+[Unit]
+Description=Back up the VRAM Governor database and config to the NAS
+After=postgresql.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/vram-governor/vram-backup
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,8 @@
+[Unit]
+Description=Back up VRAM Governor node configuration to the NAS
+RequiresMountsFor=/mnt/models-rw
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/vram-governor/vram-node-config-backup
+Nice=10
