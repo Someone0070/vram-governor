@@ -2518,6 +2518,11 @@ func (a *HTTPAdapter) collectComfyOutputs(ctx context.Context, req domain.Worklo
 			}
 		case map[string]any:
 			filename, hasFilename := typed["filename"].(string)
+			if kind, _ := typed["type"].(string); hasFilename && kind == "input" {
+				// Load nodes (e.g. LoadVideo) echo the request's own staged
+				// inputs into the history; they are not results.
+				return nil
+			}
 			if hasFilename && filename != "" {
 				subfolder, _ := typed["subfolder"].(string)
 				kind, _ := typed["type"].(string)

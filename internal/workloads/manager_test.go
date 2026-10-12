@@ -288,9 +288,18 @@ func TestComfyStagesCentralInputsAndCollectsOutputs(t *testing.T) {
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"prompt_id": "backend-output"})
 		case "/history/backend-output":
-			_ = json.NewEncoder(w).Encode(map[string]any{"backend-output": map[string]any{"status": map[string]any{"completed": true, "status_str": "success"}, "outputs": map[string]any{"9": map[string]any{"images": []any{map[string]any{"filename": "result.png", "subfolder": "", "type": "output"}}}}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"backend-output": map[string]any{"status": map[string]any{"completed": true, "status_str": "success"}, "outputs": map[string]any{
+				// Load nodes such as LoadVideo echo the staged input; it is
+				// not a result and must not become an output artifact.
+				"1": map[string]any{"images": []any{map[string]any{"filename": input.ID, "subfolder": "", "type": "input"}}},
+				"9": map[string]any{"images": []any{map[string]any{"filename": "result.png", "subfolder": "", "type": "output"}}}}}})
 		case "/view":
-			w.Header().Set("Content-Type", "image/png")
+			if r.URL.Query().Get("type") == "input" {
+				t.Error("staged input echo was fetched as an output")
+				w.Header().Set("Content-Type", "application/octet-stream")
+			} else {
+				w.Header().Set("Content-Type", "image/png")
+			}
 			_, _ = io.WriteString(w, "output-bytes")
 		default:
 			http.NotFound(w, r)
