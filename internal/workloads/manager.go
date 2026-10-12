@@ -5314,7 +5314,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 					targetLock.RUnlock()
 					m.residencyAdmissionMu.Unlock()
 					m.endResidencyTransition(target.AcceleratorID)
-					if cleanupResult := m.releaseAdmissionReservation(context.Background(), reservation, target.ID, &blockers); cleanupResult != admitCandidateNext { return cleanupResult }
+					if cleanupResult := m.releaseAdmissionReservation(context.Background(), reservation, target.ID, &blockers); cleanupResult != admitCandidateNext {
+						return cleanupResult
+					}
 					blockers = append(blockers, target.ID+": workflow schema generation changed during admission")
 					return admitCandidateNext
 				}
@@ -5657,10 +5659,6 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		estimateConfidence = waitingEstimate.confidence
 	}
 	w.Status = domain.WorkloadWaiting
-	primaryBlocker := "no eligible capacity"
-	if len(blockers) > 0 {
-		primaryBlocker = blockers[0]
-	}
 	codes := make([]domain.AdmissionBlocker, 0, len(blockers))
 	for _, blocker := range blockers {
 		code, ok := blockerCodes[blocker]
@@ -5669,7 +5667,17 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		}
 		codes = append(codes, code)
 	}
-	w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: primaryBlocker, BlockerCode: dominantBlockerCode(codes), EstimatedStart: &estimatedStart, EstimatedEnd: &estimatedEnd, Confidence: estimateConfidence, Alternatives: blockers}
+	blockerCode := dominantBlockerCode(codes)
+	if w.Request.Plane == domain.PlaneCreatorStudio && !creatorProfileMatched {
+		// No profile serves this operation anywhere; other targets' transient
+		// causes are irrelevant.
+		blockerCode = domain.BlockerRuntimeUnsupported
+	}
+	primaryBlocker := "no eligible capacity"
+	if len(blockers) > 0 {
+		primaryBlocker = blockers[primaryBlockerIndex(codes, blockerCode)]
+	}
+	w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: primaryBlocker, BlockerCode: blockerCode, EstimatedStart: &estimatedStart, EstimatedEnd: &estimatedEnd, Confidence: estimateConfidence, Alternatives: blockers}
 	if protectedUntil != nil {
 		// A min_residency window is a known instant, not a statistical guess:
 		// publish it even when the queue estimate is only a placeholder.
@@ -6732,7 +6740,7 @@ type targetReservation struct {
 	targetID         string
 	workloadID       string
 	targetGeneration uint64
-	comfySchemaProof  comfySchemaProof
+	comfySchemaProof comfySchemaProof
 	lease            *domain.AcceleratorLease
 	shared           bool
 	predictedVRAMMB  int64
@@ -6803,7 +6811,7 @@ type activePlacement struct {
 	runtimeIdentity    string
 	// requestIncrementBytes is populated only from an identity-bound runtime
 	// observation. EstimatedVRAMMB and standalone envelopes never populate it.
-	requestIncrementBytes int64
+	requestIncrementBytes    int64
 	requestIncrementVerified bool
 }
 

@@ -68,17 +68,45 @@ func ClassifyBlocker(text string) domain.AdmissionBlocker {
 
 // dominantBlockerCode is the code for a decision with several per-target
 // causes: a shared code is reported as-is, a mix is reported as capacity
-// because at least one route may clear by waiting.
+// because at least one route may clear by waiting. Targets that can never
+// serve the request (runtime_unsupported: model missing, context too small)
+// are ignored while any other target is blocked for a reason that can clear,
+// so a node lacking the model never masks why the real candidates are busy.
 func dominantBlockerCode(codes []domain.AdmissionBlocker) domain.AdmissionBlocker {
-	if len(codes) == 0 {
+	relevant := relevantBlockerCodes(codes)
+	if len(relevant) == 0 {
 		return domain.BlockerCapacity
 	}
-	for _, code := range codes[1:] {
-		if code != codes[0] {
+	for _, code := range relevant[1:] {
+		if code != relevant[0] {
 			return domain.BlockerCapacity
 		}
 	}
-	return codes[0]
+	return relevant[0]
+}
+
+func relevantBlockerCodes(codes []domain.AdmissionBlocker) []domain.AdmissionBlocker {
+	clearable := make([]domain.AdmissionBlocker, 0, len(codes))
+	for _, code := range codes {
+		if code != domain.BlockerRuntimeUnsupported {
+			clearable = append(clearable, code)
+		}
+	}
+	if len(clearable) == 0 {
+		return codes
+	}
+	return clearable
+}
+
+// primaryBlockerIndex picks the blocker whose text explains the reported
+// code: the first one carrying that code, else the first one overall.
+func primaryBlockerIndex(codes []domain.AdmissionBlocker, dominant domain.AdmissionBlocker) int {
+	for i, code := range codes {
+		if code == dominant {
+			return i
+		}
+	}
+	return 0
 }
 
 func earlierTime(current, candidate *time.Time) *time.Time {

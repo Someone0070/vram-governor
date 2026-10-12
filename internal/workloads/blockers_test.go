@@ -37,6 +37,91 @@ func TestClassifyBlockerAndDominantCode(t *testing.T) {
 	if got := dominantBlockerCode(nil); got != domain.BlockerCapacity {
 		t.Fatalf("no blockers must report capacity: %s", got)
 	}
+	// Targets that can never serve the request do not dilute a real cause.
+	if got := dominantBlockerCode([]domain.AdmissionBlocker{domain.BlockerRuntimeUnsupported, domain.BlockerTransitionBusy}); got != domain.BlockerTransitionBusy {
+		t.Fatalf("unsupported target masked the real cause: %s", got)
+	}
+	if got := dominantBlockerCode([]domain.AdmissionBlocker{domain.BlockerRuntimeUnsupported, domain.BlockerRuntimeUnsupported}); got != domain.BlockerRuntimeUnsupported {
+		t.Fatalf("all-unsupported must stay unsupported: %s", got)
+	}
+	if got := dominantBlockerCode([]domain.AdmissionBlocker{domain.BlockerRuntimeUnsupported, domain.BlockerNodeOffline, domain.BlockerTransitionBusy}); got != domain.BlockerCapacity {
+		t.Fatalf("a real mix must still report capacity: %s", got)
+	}
+	codes := []domain.AdmissionBlocker{domain.BlockerRuntimeUnsupported, domain.BlockerTransitionBusy}
+	if got := primaryBlockerIndex(codes, domain.BlockerTransitionBusy); got != 1 {
+		t.Fatalf("primary blocker must explain the reported code: %d", got)
+	}
+	if got := primaryBlockerIndex(codes, domain.BlockerCapacity); got != 0 {
+		t.Fatalf("no matching code must fall back to the first blocker: %d", got)
+	}
+}
+
+func TestBlockerCodeIgnoresTargetLackingTheModel(t *testing.T) {
+	fixture, backend := newRouterFixture(t, "small")
+	defer backend.Close()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 10 * time.Minute, TransitionTimeout: time.Second})
+	mgr.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", backend.Client()))
+	target := Target{
+		ID: "router", Adapter: "llamacpp", Endpoint: backend.URL, AcceleratorID: "gpu-0", Models: []string{"small", "large"},
+		ResidentModels: []string{"small"}, SupportsModelLifecycle: true, MaxResidentModels: 1, ResidencyPolicy: domain.ResidencyAuto,
+		CapabilityVersion: "router-runtime-v1", CapabilityRevision: domain.CapabilityContractVersion,
+		Capabilities:     domain.ResidencyCapabilities{Version: domain.CapabilityContractVersion, SupportsModelLifecycle: true, MaxResidentModels: 1},
+		ModelFingerprint: "router-model-fp",
+		ContextLimit:     8192, Slots: 1, ActiveRuntimeProfile: "router-profile",
+		RuntimeProfiles:  []RuntimeCapacityProfile{{ID: "router-profile", ContextLimit: 8192, Slots: 1}},
+		Capacity:         domain.CapacityBudget{VRAMTotalBytes: 16 << 30, VRAMReserveBytes: 1 << 30, VRAMHardCapBytes: 16 << 30},
+		CapacityVerified: true, CapacitySource: "runtime:/slots", Enabled: true,
+	}
+	mgr.RegisterTarget(target)
+	// A second node that does not serve "large" at all (the 780M in production).
+	mgr.RegisterTarget(Target{ID: "aaa-other-node", Adapter: "llamacpp", Endpoint: "http://127.0.0.1:1", Models: []string{"unrelated"}, ContextLimit: 4096, Slots: 1, CapacityVerified: true, Enabled: true})
+	registered := mgr.targetByID(target.ID)
+	for _, measurement := range []store.ModelCapacity{
+		measuredCapacityWithProfile(registered, "small", 1<<30, 1<<30),
+		measuredCapacityWithProfile(registered, "large", 2<<30, 1<<30),
+	} {
+		if _, err := mgr.SetModelCapacity(context.Background(), measurement); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := seedHotResidency(context.Background(), backing, registered, "small", domain.ResidencyAuto); err != nil {
+		t.Fatal(err)
+	}
+	small, err := backing.GetModelResidency(context.Background(), target.ID, "small")
+	if err != nil {
+		t.Fatal(err)
+	}
+	until := time.Now().Add(10 * time.Minute).UTC().Truncate(time.Second)
+	small.MinResidentUntil = &until
+	if _, err := backing.UpsertModelResidency(context.Background(), small); err != nil {
+		t.Fatal(err)
+	}
+	row, _, err := mgr.Submit(context.Background(), domain.WorkloadRequest{OwnerID: "alice", Adapter: "llamacpp", Priority: 1, QueuePolicy: domain.QueueWait, Payload: json.RawMessage(`{"model":"large","messages":[{"role":"user","content":"x"}]}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unsupported := false
+	for _, alt := range row.Decision.Alternatives {
+		if alt == "aaa-other-node: model unavailable" {
+			unsupported = true
+		}
+	}
+	// Precondition (negative control): the unrelated node really contributed a
+	// runtime_unsupported blocker, which the old rule turned into "capacity".
+	if !unsupported {
+		t.Fatalf("fixture did not produce the unsupported blocker: %+v", row.Decision.Alternatives)
+	}
+	if row.Status != domain.WorkloadWaiting || row.Decision.BlockerCode != domain.BlockerTransitionBusy {
+		t.Fatalf("node lacking the model masked the min_residency cause: %+v", row.Decision)
+	}
+	if len(row.Decision.Blocker) < 7 || row.Decision.Blocker[:7] != "router:" {
+		t.Fatalf("primary blocker text does not explain the code: %q", row.Decision.Blocker)
+	}
+	if events, _ := fixture.snapshot(); len(events) != 0 {
+		t.Fatalf("protected resident was touched: %v", events)
+	}
 }
 
 func TestCompleteAdmissionDecisionPublishesOnlyRealEstimates(t *testing.T) {
@@ -143,8 +228,8 @@ func TestDemandEvictionHonorsMinResidencyUnlessUrgent(t *testing.T) {
 		Capabilities:     domain.ResidencyCapabilities{Version: domain.CapabilityContractVersion, SupportsModelLifecycle: true, MaxResidentModels: 1},
 		ModelFingerprint: "router-model-fp",
 		ContextLimit:     8192, Slots: 1, ActiveRuntimeProfile: "router-profile",
-		RuntimeProfiles: []RuntimeCapacityProfile{{ID: "router-profile", ContextLimit: 8192, Slots: 1}},
-		Capacity:        domain.CapacityBudget{VRAMTotalBytes: 16 << 30, VRAMReserveBytes: 1 << 30, VRAMHardCapBytes: 16 << 30},
+		RuntimeProfiles:  []RuntimeCapacityProfile{{ID: "router-profile", ContextLimit: 8192, Slots: 1}},
+		Capacity:         domain.CapacityBudget{VRAMTotalBytes: 16 << 30, VRAMReserveBytes: 1 << 30, VRAMHardCapBytes: 16 << 30},
 		CapacityVerified: true, CapacitySource: "runtime:/slots", Enabled: true,
 	}
 	mgr.RegisterTarget(target)
