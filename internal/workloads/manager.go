@@ -115,6 +115,7 @@ type Manager struct {
 	gpuAppliedProfile              map[string]string
 	gpuIdleLinger                  time.Duration
 	resultExport                   ResultExport
+	modelLoadFailures              map[string]modelLoadFailure
 	artifacts                      artifacts.Store
 	defaultMaxAcceleratorsPerModel int
 	modelCapacityPolicies          map[string]int
@@ -248,6 +249,7 @@ func NewManager(log *slog.Logger, backing store.WorkloadStore, leaseTTL time.Dur
 		gpuPowerGeneration:       make(map[string]uint64),
 		gpuCommandFences:         make(map[string]uint64),
 		gpuAppliedProfile:        make(map[string]string),
+		modelLoadFailures:        make(map[string]modelLoadFailure),
 		residency:                DefaultResidencyOptions(), residencyObservationLocks: make(map[string]*sync.Mutex), residencyAdmissionLocks: make(map[string]*sync.RWMutex), residencyTransitions: make(map[string]struct{}), recoveryTransitions: make(map[string]struct{}), pendingResidencyObservations: make(map[string]pendingResidencyObservation),
 		pendingLeaseFinalizations: make(map[string]pendingLeaseFinalization),
 		notifications:             DefaultNotificationOptions(),
@@ -4898,6 +4900,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	})
 
 	var blockers []string
+	loadFailures := 0
 	// Codes are recorded where the cause is known; blockers without an entry
 	// fall back to ClassifyBlocker when the decision is built.
 	blockerCodes := map[string]domain.AdmissionBlocker{}
@@ -5116,6 +5119,14 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			unlockAdmission()
 			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": model is not resident and target cannot load it"))
 			continue
+		}
+		if needsModelLoad {
+			if reason, failed := m.modelLoadFailed(target, req.Model); failed {
+				unlockAdmission()
+				loadFailures++
+				blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": "+reason))
+				continue
+			}
 		}
 		if needsModelLoad {
 			residency, residencyErr := observedResidency, observedResidencyErr
@@ -5393,6 +5404,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 						return cleanupResult
 					}
 					text := target.ID + ": model load failed: " + loadErr.Error()
+					if isRuntimeLoadFailure(loadErr) {
+						m.recordModelLoadFailure(target, req.Model, loadErr.Error())
+					}
 					if code, until := blockerFromError(loadErr); code != "" {
 						text = coded(code, text)
 						protectedUntil = earlierTime(protectedUntil, until)
@@ -5676,6 +5690,10 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		codes = append(codes, code)
 	}
 	blockerCode := dominantBlockerCode(codes)
+	permanentlyBlocked := loadFailures > 0
+	for _, code := range codes {
+		permanentlyBlocked = permanentlyBlocked && code == domain.BlockerRuntimeUnsupported
+	}
 	if w.Request.Plane == domain.PlaneCreatorStudio && !creatorProfileMatched {
 		// No profile serves this operation anywhere; other targets' transient
 		// causes are irrelevant.
@@ -5699,6 +5717,13 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		// causes stay in Alternatives and drive BlockerCode.
 		w.Decision.Blocker = "no eligible capacity (fail_fast)"
 		w.Status = domain.WorkloadRejected
+		now := time.Now().UTC()
+		w.FinishedAt = &now
+	} else if permanentlyBlocked {
+		// Every route either cannot serve the request or just failed to load
+		// its model; waiting would only repeat the failure until the deadline.
+		w.Status = domain.WorkloadRejected
+		w.Error = primaryBlocker
 		now := time.Now().UTC()
 		w.FinishedAt = &now
 	}

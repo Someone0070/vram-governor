@@ -2184,3 +2184,54 @@ func TestDemandLoadRetryAfterFailedAttemptUsesFreshTransitionKeys(t *testing.T) 
 		t.Fatalf("retry did not load the model: status=%s blocker=%q events=%v resident=%v", after.Status, after.Decision.Blocker, events, resident)
 	}
 }
+
+// A model the runtime cannot load (live: llama.cpp "unknown model
+// architecture") must not be retried on every admission pass: each attempt
+// made the node briefly not-ready for all other work. After one definite
+// failure the model is fenced and the request fails with the reason.
+func TestRuntimeLoadFailureFencesModelAndFailsFast(t *testing.T) {
+	backing := store.NewMemoryStore()
+	_, err := backing.UpsertNode(context.Background(), &domain.Node{ID: "node-1", SchedulingState: domain.SchedulingEnabled, Desired: domain.Desired{SchedulingEnabled: true}, Observed: domain.Observed{Connectivity: domain.ConnectivityConnected, Ready: true}, Accelerators: []domain.Accelerator{{ID: "gpu-1", VRAMTotalMB: 16_000, VRAMFreeMB: 16_000}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	mgr.SetNodeStore(backing)
+	mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 0, TransitionTimeout: time.Second})
+	mgr.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", nil))
+	target := Target{ID: "node-1-router", Adapter: "llamacpp", Endpoint: "http://controller-must-not-call.invalid", AcceleratorID: "gpu-1", Models: []string{"broken"}, CapabilityVersion: "runtime-v1", CapabilityRevision: domain.CapabilityContractVersion, Capabilities: domain.ResidencyCapabilities{Version: domain.CapabilityContractVersion, SupportsModelLifecycle: true, MaxAcceleratorsPerWorkload: 1}, SupportsModelLifecycle: true, MaxResidentModels: 1, Slots: 1, Enabled: true}
+	mgr.RegisterTarget(target)
+	loads := 0
+	mgr.SetNodeControl(func(_ context.Context, _, command string, _ map[string]any, _ string) (map[string]any, error) {
+		if command == "load_model" {
+			loads++
+		}
+		return nil, fmt.Errorf("node command failed: model failed to load in the runtime")
+	})
+	workload, _, err := mgr.Submit(context.Background(), domain.WorkloadRequest{OwnerID: "alice", Adapter: "llamacpp", QueuePolicy: domain.QueueWait, Payload: json.RawMessage(`{"model":"broken","messages":[{"role":"user","content":"hi"}]}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, _ := backing.GetWorkload(context.Background(), workload.Request.ID)
+	if loads != 1 || first.Status != domain.WorkloadWaiting || !strings.Contains(strings.Join(first.Decision.Alternatives, " "), "model failed to load in the runtime") {
+		t.Fatalf("first attempt: loads=%d status=%s alternatives=%v", loads, first.Status, first.Decision.Alternatives)
+	}
+	first.TargetRetryAfter = nil
+	mgr.tryAdmit(context.Background(), first)
+	second, _ := backing.GetWorkload(context.Background(), workload.Request.ID)
+	if loads != 1 {
+		t.Fatalf("fenced model was loaded again: loads=%d", loads)
+	}
+	if second.Status != domain.WorkloadRejected || !strings.Contains(second.Error, "failed to load in the runtime") || second.Decision.BlockerCode != domain.BlockerRuntimeUnsupported {
+		t.Fatalf("fenced request did not fail fast with the reason: status=%s error=%q decision=%+v", second.Status, second.Error, second.Decision)
+	}
+	// A runtime change (e.g. upgraded llama.cpp) lifts the fence.
+	if _, failed := mgr.modelLoadFailed(target, "broken"); !failed {
+		t.Fatal("fence missing")
+	}
+	upgraded := target
+	upgraded.CapabilityVersion = "runtime-v2"
+	if _, failed := mgr.modelLoadFailed(upgraded, "broken"); failed {
+		t.Fatal("runtime change did not lift the fence")
+	}
+}
