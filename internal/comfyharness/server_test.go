@@ -1608,3 +1608,75 @@ func TestManagedComfyCancelProvesStopAfterRestartWhenComfyIdle(t *testing.T) {
 		t.Fatalf("proven cancellation was not persisted: %+v", persisted)
 	}
 }
+
+func waitForState(t *testing.T, client *http.Client, endpoint string, wanted ...string) stateResponse {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	var state stateResponse
+	for time.Now().Before(deadline) {
+		_, state = harnessRequest(t, client, http.MethodGet, endpoint, nil)
+		for _, w := range wanted {
+			if state.State == w {
+				return state
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("execution did not reach %v: %+v", wanted, state)
+	return state
+}
+
+// A prompt Comfy reports as completed with an execution error is a definite
+// failure: nothing is left running, so it must not become "uncertain", and
+// the caller gets Comfy's own reason.
+func TestManagedComfyExecutionErrorFailsWithComfyReason(t *testing.T) {
+	comfy := newFakeComfy()
+	comfy.historyRaw = `{"prompt-1":{"status":{"status_str":"error","completed":true,"messages":[["execution_start",{"prompt_id":"prompt-1"}],["execution_error",{"prompt_id":"prompt-1","node_id":"75","node_type":"SaveVideo","exception_type":"av.error.ArgumentError","exception_message":"Invalid argument: [aac] Input contains (near) NaN/+-Inf\n"}]]}}}`
+	comfyServer := httptest.NewServer(http.HandlerFunc(comfy.handler))
+	defer comfyServer.Close()
+	directory := privateStateDirectory(t)
+	harness, server := newHarnessTestServer(t, comfyServer.URL, directory)
+	_, started := harnessRequest(t, server.Client(), http.MethodPost, server.URL+"/v1/executions", managedStartBody())
+	<-comfy.started
+	state := waitForState(t, server.Client(), server.URL+"/v1/executions/"+started.ExecutionID, "failed", "uncertain")
+	if state.State != "failed" || !strings.Contains(state.Error, "SaveVideo (node 75)") || !strings.Contains(state.Error, "NaN") {
+		t.Fatalf("execution error was not a definite failure with Comfy's reason: %+v", state)
+	}
+	_ = harness.Close()
+	server.Close()
+	_, reloaded := newHarnessTestServer(t, comfyServer.URL, directory)
+	_, again := harnessRequest(t, reloaded.Client(), http.MethodGet, reloaded.URL+"/v1/executions/"+started.ExecutionID, nil)
+	if again.State != "failed" {
+		t.Fatalf("failure did not survive restart as failed: %+v", again)
+	}
+}
+
+func TestManagedComfyPromptValidationRejectionFails(t *testing.T) {
+	comfy := newFakeComfy()
+	comfy.promptStatus = http.StatusBadRequest
+	comfy.promptRaw = `{"error":{"type":"prompt_outputs_failed_validation","message":"Prompt outputs failed validation","details":""},"node_errors":{"17":{"errors":[{"type":"value_not_in_list","message":"Value not in list","details":"sampler_name: 'bogus' not in [...]"}],"class_type":"KSampler"}}}`
+	comfyServer := httptest.NewServer(http.HandlerFunc(comfy.handler))
+	defer comfyServer.Close()
+	_, server := newHarnessTestServer(t, comfyServer.URL, privateStateDirectory(t))
+	_, started := harnessRequest(t, server.Client(), http.MethodPost, server.URL+"/v1/executions", managedStartBody())
+	<-comfy.started
+	state := waitForState(t, server.Client(), server.URL+"/v1/executions/"+started.ExecutionID, "failed", "uncertain")
+	if state.State != "failed" || !strings.Contains(state.Error, "KSampler (node 17)") || !strings.Contains(state.Error, "sampler_name") {
+		t.Fatalf("validation rejection was not a definite failure: %+v", state)
+	}
+}
+
+func TestManagedComfyUnrecognizedBadRequestStaysUncertain(t *testing.T) {
+	comfy := newFakeComfy()
+	comfy.promptStatus = http.StatusBadRequest
+	comfy.promptRaw = `<html>bad gateway</html>`
+	comfyServer := httptest.NewServer(http.HandlerFunc(comfy.handler))
+	defer comfyServer.Close()
+	_, server := newHarnessTestServer(t, comfyServer.URL, privateStateDirectory(t))
+	_, started := harnessRequest(t, server.Client(), http.MethodPost, server.URL+"/v1/executions", managedStartBody())
+	<-comfy.started
+	state := waitForState(t, server.Client(), server.URL+"/v1/executions/"+started.ExecutionID, "failed", "uncertain")
+	if state.State != "uncertain" {
+		t.Fatalf("an unrecognized 400 was treated as a definite rejection: %+v", state)
+	}
+}

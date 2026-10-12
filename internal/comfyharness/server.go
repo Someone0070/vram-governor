@@ -691,6 +691,22 @@ func (s *Server) run(ctx context.Context, id string, epoch uint64) {
 			s.mu.Unlock()
 			return
 		}
+		var failure *comfyChunkFailure
+		if errors.As(err, &failure) {
+			// Comfy itself reported the chunk finished with an error (or
+			// rejected it before queueing), so nothing is still running.
+			before := cloneExecution(execution)
+			execution.State, execution.Error, execution.UpdatedAt = "failed", failure.Message, time.Now().UTC()
+			execution.Submission, execution.SubmittingChunk, execution.CurrentPrompt = "", "", ""
+			if persistErr := s.persistLocked(); persistErr != nil {
+				*execution = *before
+				execution.State, execution.Submission = "uncertain", "unknown"
+				execution.Error, execution.UpdatedAt = failure.Message+"; durable state update failed", time.Now().UTC()
+			}
+			s.notifyLocked(id)
+			s.mu.Unlock()
+			return
+		}
 		if err != nil {
 			before := cloneExecution(execution)
 			execution.State, execution.Submission = "uncertain", "unknown"
@@ -762,6 +778,11 @@ func (s *Server) executeChunk(ctx context.Context, executionID string, epoch uin
 		return "", nil, err
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusBadRequest {
+		if rejection, ok := comfyPromptRejection(response.Body); ok {
+			return "", nil, &comfyChunkFailure{Message: rejection, NotQueued: true}
+		}
+	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		err := fmt.Errorf("Comfy prompt returned HTTP %d; acceptance remains ambiguous", response.StatusCode)
 		s.markSubmissionUnknown(executionID, epoch, err)
@@ -877,6 +898,7 @@ func (s *Server) comfyHistory(ctx context.Context, promptID string) (historyObse
 	if strings.EqualFold(status.Status.StatusStr, "error") {
 		if *status.Status.Completed {
 			observation.Terminal = true
+			return observation, &comfyChunkFailure{Message: comfyExecutionErrorMessage(history, promptID)}
 		}
 		return observation, fmt.Errorf("Comfy chunk %s failed", promptID)
 	}
@@ -888,6 +910,91 @@ func (s *Server) comfyHistory(ctx context.Context, promptID string) (historyObse
 	}
 	observation.Terminal = true
 	return observation, nil
+}
+
+// comfyChunkFailure is a definite outcome reported by Comfy itself: the
+// prompt finished with an execution error, or /prompt rejected the graph
+// before queueing it. Unlike transport or journal failures it leaves no work
+// running, so the execution fails instead of becoming uncertain.
+type comfyChunkFailure struct {
+	Message   string
+	NotQueued bool
+}
+
+func (f *comfyChunkFailure) Error() string { return f.Message }
+
+// comfyExecutionErrorMessage extracts node and exception from the history
+// record's execution_error message, e.g. "SaveVideo (node 75): Invalid argument".
+func comfyExecutionErrorMessage(history json.RawMessage, promptID string) string {
+	var record struct {
+		Status struct {
+			Messages []json.RawMessage `json:"messages"`
+		} `json:"status"`
+	}
+	if json.Unmarshal(history, &record) == nil {
+		for _, raw := range record.Status.Messages {
+			var message []json.RawMessage
+			var kind string
+			if json.Unmarshal(raw, &message) != nil || len(message) != 2 || json.Unmarshal(message[0], &kind) != nil || kind != "execution_error" {
+				continue
+			}
+			var detail struct {
+				NodeID           string `json:"node_id"`
+				NodeType         string `json:"node_type"`
+				ExceptionType    string `json:"exception_type"`
+				ExceptionMessage string `json:"exception_message"`
+			}
+			if json.Unmarshal(message[1], &detail) == nil && detail.ExceptionMessage != "" {
+				return truncateComfyMessage(fmt.Sprintf("Comfy execution error in %s (node %s): %s", detail.NodeType, detail.NodeID, strings.TrimSpace(detail.ExceptionMessage)))
+			}
+		}
+	}
+	return fmt.Sprintf("Comfy chunk %s failed", promptID)
+}
+
+// comfyPromptRejection recognizes Comfy's validation response to /prompt,
+// {"error": {...}, "node_errors": {...}}; anything else stays ambiguous.
+func comfyPromptRejection(body io.Reader) (string, bool) {
+	raw, err := io.ReadAll(io.LimitReader(body, 1<<20))
+	if err != nil {
+		return "", false
+	}
+	var rejection struct {
+		Error *struct {
+			Message string `json:"message"`
+			Details string `json:"details"`
+		} `json:"error"`
+		NodeErrors map[string]struct {
+			ClassType string `json:"class_type"`
+			Errors    []struct {
+				Message string `json:"message"`
+				Details string `json:"details"`
+			} `json:"errors"`
+		} `json:"node_errors"`
+	}
+	if json.Unmarshal(raw, &rejection) != nil || rejection.Error == nil || rejection.NodeErrors == nil {
+		return "", false
+	}
+	parts := []string{strings.TrimSpace(rejection.Error.Message + " " + rejection.Error.Details)}
+	ids := make([]string, 0, len(rejection.NodeErrors))
+	for id := range rejection.NodeErrors {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		for _, e := range rejection.NodeErrors[id].Errors {
+			parts = append(parts, fmt.Sprintf("%s (node %s): %s %s", rejection.NodeErrors[id].ClassType, id, e.Message, e.Details))
+		}
+	}
+	return truncateComfyMessage("Comfy rejected the prompt: " + strings.Join(parts, "; ")), true
+}
+
+func truncateComfyMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if len(message) > 1000 {
+		return message[:1000] + "..."
+	}
+	return message
 }
 
 func (s *Server) stopComfyPrompt(ctx context.Context, promptID string) error {
