@@ -896,7 +896,10 @@ func (s *Server) comfyHistory(ctx context.Context, promptID string) (historyObse
 		return historyObservation{}, fmt.Errorf("Comfy history for exact prompt %s is malformed", promptID)
 	}
 	if strings.EqualFold(status.Status.StatusStr, "error") {
-		if *status.Status.Completed {
+		// Comfy reports a prompt that failed in execution as status "error"
+		// with completed=false; the execution_error message is what marks it
+		// as finished. Either signal means nothing is still running.
+		if *status.Status.Completed || comfyHistoryHasExecutionError(history) {
 			observation.Terminal = true
 			return observation, &comfyChunkFailure{Message: comfyExecutionErrorMessage(history, promptID)}
 		}
@@ -922,6 +925,25 @@ type comfyChunkFailure struct {
 }
 
 func (f *comfyChunkFailure) Error() string { return f.Message }
+
+func comfyHistoryHasExecutionError(history json.RawMessage) bool {
+	var record struct {
+		Status struct {
+			Messages []json.RawMessage `json:"messages"`
+		} `json:"status"`
+	}
+	if json.Unmarshal(history, &record) != nil {
+		return false
+	}
+	for _, raw := range record.Status.Messages {
+		var message []json.RawMessage
+		var kind string
+		if json.Unmarshal(raw, &message) == nil && len(message) == 2 && json.Unmarshal(message[0], &kind) == nil && kind == "execution_error" {
+			return true
+		}
+	}
+	return false
+}
 
 // comfyExecutionErrorMessage extracts node and exception from the history
 // record's execution_error message, e.g. "SaveVideo (node 75): Invalid argument".

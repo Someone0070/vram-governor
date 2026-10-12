@@ -33,3 +33,17 @@ Weights: the Qwen2.5-Omni-3B files (config, `model-0000x-of-00003`, index,
 tokenizer, `spk_dict.pt`, preprocessor) in `VG_OMNI_DIR`, default
 `/models/qwen2.5-omni-3b`. Keep that directory free of other checkpoints: a
 stray `model.safetensors` is preferred by the loader over the sharded index.
+
+## vram_governor_compat
+
+No nodes; runtime shims loaded at ComfyUI start. It wraps
+`comfy_kitchen.flash_attention_decode_is_available()` with a one-time probe
+that runs the fused decode kernel. On CT200's NVIDIA 535 driver (CUDA 12.2)
+the kernel fails with "CUDA driver version is insufficient for CUDA runtime
+version" (YuE2's language model hit it), so the probe disables it and ComfyUI
+uses its standard attention path; a newer driver re-enables it automatically.
+
+```sh
+install -d /opt/ComfyUI/custom_nodes/vram_governor_compat
+install -m 0644 vram_governor_compat/__init__.py /opt/ComfyUI/custom_nodes/vram_governor_compat/
+```

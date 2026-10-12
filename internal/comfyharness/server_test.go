@@ -1630,8 +1630,15 @@ func waitForState(t *testing.T, client *http.Client, endpoint string, wanted ...
 // failure: nothing is left running, so it must not become "uncertain", and
 // the caller gets Comfy's own reason.
 func TestManagedComfyExecutionErrorFailsWithComfyReason(t *testing.T) {
+	for _, completed := range []string{"true", "false"} {
+		t.Run("completed="+completed, func(t *testing.T) { testManagedComfyExecutionError(t, completed) })
+	}
+}
+
+// Live Comfy reports execution errors with completed=false.
+func testManagedComfyExecutionError(t *testing.T, completed string) {
 	comfy := newFakeComfy()
-	comfy.historyRaw = `{"prompt-1":{"status":{"status_str":"error","completed":true,"messages":[["execution_start",{"prompt_id":"prompt-1"}],["execution_error",{"prompt_id":"prompt-1","node_id":"75","node_type":"SaveVideo","exception_type":"av.error.ArgumentError","exception_message":"Invalid argument: [aac] Input contains (near) NaN/+-Inf\n"}]]}}}`
+	comfy.historyRaw = `{"prompt-1":{"status":{"status_str":"error","completed":` + completed + `,"messages":[["execution_start",{"prompt_id":"prompt-1"}],["execution_error",{"prompt_id":"prompt-1","node_id":"75","node_type":"SaveVideo","exception_type":"av.error.ArgumentError","exception_message":"Invalid argument: [aac] Input contains (near) NaN/+-Inf\n"}]]}}}`
 	comfyServer := httptest.NewServer(http.HandlerFunc(comfy.handler))
 	defer comfyServer.Close()
 	directory := privateStateDirectory(t)

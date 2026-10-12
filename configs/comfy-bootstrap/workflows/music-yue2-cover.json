@@ -1,0 +1,241 @@
+{
+  "id": "music-yue2-cover",
+  "version": 1,
+  "title": "Song cover (YuE2)",
+  "description": "Keeps the melody of an existing song and re-sings it in a new style with new lyrics. YuE2-3B; non-commercial license (CC BY-NC 4.0).",
+  "operation": "audio.music",
+  "profile": "audio-yue2@1",
+  "outputs": [
+    "audio/mpeg"
+  ],
+  "typical_seconds": 300,
+  "params": [
+    {
+      "name": "audio",
+      "type": "audio",
+      "required": true,
+      "description": "Song to cover (artifact id). Its melody is transcribed and kept.",
+      "bind": [
+        {
+          "node": "11",
+          "input": "audio"
+        }
+      ]
+    },
+    {
+      "name": "style",
+      "type": "string",
+      "required": true,
+      "max_length": 1000,
+      "description": "Genre, instruments, vocal type and mood, e.g. 'Upbeat indie pop with warm female vocals, bright electric guitars'.",
+      "bind": [
+        {
+          "node": "3",
+          "input": "style"
+        }
+      ]
+    },
+    {
+      "name": "lyrics",
+      "type": "string",
+      "required": true,
+      "max_length": 6000,
+      "description": "Lyrics with section tags such as [Verse], [Chorus], [Bridge]. English or Chinese.",
+      "bind": [
+        {
+          "node": "3",
+          "input": "lyrics"
+        }
+      ]
+    },
+    {
+      "name": "seconds",
+      "type": "number",
+      "default": 120.0,
+      "min": 10.0,
+      "max": 300.0,
+      "description": "Maximum length; the song can end earlier.",
+      "bind": [
+        {
+          "node": "3",
+          "input": "max_duration"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "3",
+          "input": "seed"
+        },
+        {
+          "node": "6",
+          "input": "seed"
+        }
+      ]
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 32,
+      "min": 16,
+      "max": 64,
+      "description": "Audio sampling steps.",
+      "bind": [
+        {
+          "node": "6",
+          "input": "steps"
+        }
+      ]
+    },
+    {
+      "name": "precision",
+      "type": "enum",
+      "default": "int8",
+      "values": [
+        "int8",
+        "bf16"
+      ],
+      "description": "Model weights. int8 is tuned for this card; bf16 is full precision: the reference precision; about 24 GB VRAM is recommended, so on a 10 GB card it streams from RAM and is much slower.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "ckpt_name",
+          "map": {
+            "int8": "yue2_3b_int8_convrot.safetensors",
+            "bf16": "yue2_3b_bf16.safetensors"
+          }
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "CheckpointLoaderSimple",
+      "inputs": {
+        "ckpt_name": "yue2_3b_int8_convrot.safetensors"
+      }
+    },
+    "3": {
+      "class_type": "YuE2GenerateMusic",
+      "inputs": {
+        "clip": [
+          "1",
+          1
+        ],
+        "style": "",
+        "lyrics": "",
+        "abc": [
+          "7",
+          0
+        ],
+        "seed": 0,
+        "mode": "melody",
+        "max_duration": 120.0,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 100,
+        "repetition_penalty": 1.2
+      }
+    },
+    "4": {
+      "class_type": "ConditioningZeroOut",
+      "inputs": {
+        "conditioning": [
+          "3",
+          0
+        ]
+      }
+    },
+    "5": {
+      "class_type": "EmptyYuE2LatentAudio",
+      "inputs": {
+        "seconds": [
+          "3",
+          1
+        ],
+        "batch_size": 1
+      }
+    },
+    "6": {
+      "class_type": "KSampler",
+      "inputs": {
+        "model": [
+          "1",
+          0
+        ],
+        "positive": [
+          "3",
+          0
+        ],
+        "negative": [
+          "4",
+          0
+        ],
+        "latent_image": [
+          "5",
+          0
+        ],
+        "seed": 0,
+        "steps": 32,
+        "cfg": 1.0,
+        "sampler_name": "dpm_2",
+        "scheduler": "sgm_uniform",
+        "denoise": 1.0
+      }
+    },
+    "9": {
+      "class_type": "VAEDecodeAudio",
+      "inputs": {
+        "samples": [
+          "6",
+          0
+        ],
+        "vae": [
+          "1",
+          2
+        ]
+      }
+    },
+    "10": {
+      "class_type": "SaveAudioMP3",
+      "inputs": {
+        "audio": [
+          "9",
+          0
+        ],
+        "filename_prefix": "lb/cover",
+        "quality": "V0"
+      }
+    },
+    "11": {
+      "class_type": "LoadAudio",
+      "inputs": {
+        "audio": ""
+      }
+    },
+    "12": {
+      "class_type": "AudioEncoderLoader",
+      "inputs": {
+        "audio_encoder_name": "sheetsage2_bf16.safetensors"
+      }
+    },
+    "7": {
+      "class_type": "SheetSage2AudioToABC",
+      "inputs": {
+        "audio_encoder": [
+          "12",
+          0
+        ],
+        "audio": [
+          "11",
+          0
+        ],
+        "mode": "melody"
+      }
+    }
+  }
+}

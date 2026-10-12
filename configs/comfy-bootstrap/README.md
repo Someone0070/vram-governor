@@ -36,6 +36,8 @@ POST /api/v1/workloads              # {"workflow": "...", "params": {...}}
 | `video-seedvr2-upscale` | Restore and upscale a video | video*, scale, seed | ~8.5 min |
 | `audio-speak` | Text to speech (Qwen2.5-Omni voices Chelsie, Ethan), MP3 | text*, voice | ~5 s per s of speech |
 | `audio-transcribe` | Speech to text from audio or video | audio*, language, context | ~real time |
+| `music-yue2` | Full song with vocals from style + lyrics (YuE2-3B, CC BY-NC 4.0, non-commercial) | style*, lyrics*, seconds, seed, steps, plan, precision | ~6 min for 45 s |
+| `music-yue2-cover` | Keep a song's melody, re-sing it in a new style with new lyrics | audio*, style*, lyrics*, seconds, seed, steps, precision | ~6 min |
 
 - `image`, `last_image` and `video` take an artifact id: upload with `POST /upload/image` (the response `name`), or pass the `artifact_ref` of an earlier job's output to chain jobs (e.g. Krea image → H3 video → SeedVR2 upscale).
 - The Qwen-Image, LTX-2.5 and MiniMax-H3 workflows also take `precision` (`int8`, the default, or `bf16`; bf16 is much slower on a 10 GB card).
