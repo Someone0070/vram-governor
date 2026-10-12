@@ -948,6 +948,11 @@ func (m *Manager) finalizeTerminalLeaseIntent(ctx context.Context, intent *domai
 		if _, err := m.store.RecordAcceleratorLeaseCleanupIntent(ctx, intent); err != nil {
 			return err
 		}
+		// Leased (GPU) work publishes success here rather than in the
+		// observe loop; export its final results once, with the audit event.
+		if eventType == "workload.succeeded" {
+			m.exportResults(workload)
+		}
 	}
 	if !intent.NotificationPublished {
 		if workload.Request.Notifications.OnFinish {
