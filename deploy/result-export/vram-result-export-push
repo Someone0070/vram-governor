@@ -1,0 +1,39 @@
+#!/bin/sh
+# Push exported workload results from the controller's spool to the NAS share
+# and delete each local copy once its upload succeeded. Runs from a timer;
+# smbclient needs no kernel mount, so this works in an unprivileged container.
+set -u
+SPOOL=${RESULT_EXPORT_SPOOL:-/var/lib/vram-governor/result-export}
+SHARE=${RESULT_EXPORT_SHARE:-//10.0.0.28/models}
+DEST=${RESULT_EXPORT_DEST:-Outputs/LB}
+CRED=${RESULT_EXPORT_CREDENTIALS:-/etc/samba/model-sync.cred}
+TODAY=$(date +%F)
+
+cd "$SPOOL" 2>/dev/null || exit 0
+smb() { smbclient "$SHARE" -A "$CRED" -m SMB3 -c "$1" >/dev/null 2>&1; }
+
+failed=0
+for day in */; do
+	day=${day%/}
+	[ -d "$day" ] || continue
+	made=0
+	for f in "$day"/*; do
+		[ -f "$f" ] || continue
+		name=$(basename "$f")
+		case "$name" in .partial-*) continue ;; esac
+		if [ "$made" = 0 ]; then
+			# mkdir fails harmlessly when a level already exists.
+			smb "mkdir ${DEST%%/*}"; smb "mkdir $DEST"; smb "mkdir $DEST/$day"
+			made=1
+		fi
+		if smb "put \"$f\" \"$DEST/$day/$name\""; then
+			rm -f "$f"
+		else
+			failed=$((failed + 1))
+		fi
+	done
+	# Never remove today's directory: the controller may be writing into it.
+	[ "$day" != "$TODAY" ] && rmdir "$day" 2>/dev/null
+done
+[ "$failed" = 0 ] || { echo "result export: $failed file(s) not uploaded; will retry" >&2; exit 1; }
+exit 0

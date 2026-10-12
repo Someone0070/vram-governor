@@ -1,0 +1,10 @@
+[Unit]
+Description=Push exported VRAM Governor results to the NAS every 30 s
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
