@@ -442,6 +442,17 @@ func (s *Server) handleNotifications(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	s.serveOpenAIInference(w, r, "llm.chat")
+}
+
+// handleEmbeddings serves POST /v1/embeddings through the same admission,
+// residency and queueing path as chat; the adapter forwards it to the
+// runtime's /v1/embeddings.
+func (s *Server) handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	s.serveOpenAIInference(w, r, workloads.WorkloadTypeEmbeddings)
+}
+
+func (s *Server) serveOpenAIInference(w http.ResponseWriter, r *http.Request, workloadType string) {
 	if s.workloadsUnavailable(w) {
 		return
 	}
@@ -479,6 +490,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		} `json:"governor"`
 	}
 	_ = json.Unmarshal(body, &envelope)
+	if workloadType == workloads.WorkloadTypeEmbeddings {
+		envelope.Stream = false
+	}
 	adapter := envelope.Governor.Adapter
 	if adapter == "" {
 		adapter = "llamacpp"
@@ -511,7 +525,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if requestedQueue == domain.QueueWait {
 		queuePolicy = domain.QueueWait
 	}
-	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: "llm.chat", Payload: body, QoS: domain.QoSInteractive, Priority: priority, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
+	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: workloadType, Payload: body, QoS: domain.QoSInteractive, Priority: priority, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
 	if err := s.prepareRequest(r, p, &req); err != nil {
 		writeJSON(w, 403, map[string]string{"error": err.Error()})
 		return

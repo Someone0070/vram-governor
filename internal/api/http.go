@@ -65,6 +65,7 @@ func (s *Server) routes(dashboardFS http.FileSystem) {
 	s.mux.HandleFunc("PUT /api/v1/sessions/{session_id}/working-set/{phase_id}", s.handleUpsertWorkingSet)
 	s.mux.HandleFunc("DELETE /api/v1/sessions/{session_id}/working-set/{phase_id}", s.handleReleaseWorkingSet)
 	s.mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	s.mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
 	s.mux.HandleFunc("GET /v1/models", s.handleOpenAIModels)
 	s.mux.HandleFunc("POST /prompt", s.handleComfyPrompt)
 	s.mux.HandleFunc("GET /object_info", s.handleComfyObjectInfo)

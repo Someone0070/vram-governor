@@ -493,10 +493,17 @@ func (a *HTTPAdapter) Validate(ctx context.Context, req domain.WorkloadRequest) 
 		var body struct {
 			Messages []json.RawMessage `json:"messages"`
 			Prompt   any               `json:"prompt"`
+			Input    any               `json:"input"`
 			Model    string            `json:"model"`
 		}
 		if err := json.Unmarshal(req.Payload, &body); err != nil {
 			return err
+		}
+		if req.WorkloadType == WorkloadTypeEmbeddings {
+			if a.kind != "llama" || body.Input == nil || body.Model == "" {
+				return fmt.Errorf("embeddings require a local model and input")
+			}
+			break
 		}
 		if len(body.Messages) == 0 && body.Prompt == nil {
 			return fmt.Errorf("LLM payload requires messages or prompt")
@@ -639,12 +646,23 @@ func (a *HTTPAdapter) Plan(ctx context.Context, req domain.WorkloadRequest, targ
 	return &domain.ExecutionPlan{Material: material}, nil
 }
 
+// WorkloadTypeEmbeddings marks OpenAI /v1/embeddings requests; they share
+// LLM admission and residency but use the runtime's embeddings route.
+const WorkloadTypeEmbeddings = "llm.embeddings"
+
+func llmPath(req domain.WorkloadRequest) string {
+	if req.WorkloadType == WorkloadTypeEmbeddings {
+		return "/v1/embeddings"
+	}
+	return "/v1/chat/completions"
+}
+
 func (a *HTTPAdapter) Start(ctx context.Context, req domain.WorkloadRequest, plan *domain.ExecutionPlan, target Target) (*domain.ExecutionHandle, error) {
 	if a.kind == "comfy" && target.RuntimeProtocol == managedComfyProtocol {
 		return a.startManagedComfy(ctx, req, plan, target, "")
 	}
 	startedAt := a.clockNow()
-	path := "/v1/chat/completions"
+	path := llmPath(req)
 	if a.kind == "comfy" {
 		path = "/prompt"
 		if err := a.stageComfyInputs(ctx, req, target); err != nil {
@@ -659,7 +677,11 @@ func (a *HTTPAdapter) Start(ctx context.Context, req domain.WorkloadRequest, pla
 	if a.kind == "llama" || a.kind == "openrouter" {
 		var body map[string]any
 		if json.Unmarshal(payload, &body) == nil {
-			body["stream"] = false
+			if req.WorkloadType == WorkloadTypeEmbeddings {
+				delete(body, "stream")
+			} else {
+				body["stream"] = false
+			}
 			delete(body, "governor")
 			if a.kind == "openrouter" && target.Provider != "" {
 				body["provider"] = map[string]any{"order": []string{target.Provider}, "allow_fallbacks": false}
@@ -730,7 +752,11 @@ func (a *HTTPAdapter) StartAsync(ctx context.Context, req domain.WorkloadRequest
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return nil, err
 	}
-	body["stream"] = false
+	if req.WorkloadType == WorkloadTypeEmbeddings {
+		delete(body, "stream")
+	} else {
+		body["stream"] = false
+	}
 	delete(body, "governor")
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -738,12 +764,13 @@ func (a *HTTPAdapter) StartAsync(ctx context.Context, req domain.WorkloadRequest
 	}
 	startedAt := a.clockNow()
 	id := newID("http-run")
+	path := llmPath(req)
 	runCtx, cancel := context.WithCancel(ctx)
 	a.runMu.Lock()
 	a.runs[id] = &httpRun{startedAt: startedAt.wall, cancel: cancel}
 	a.runMu.Unlock()
 	go func() {
-		result, status, _, requestErr := a.request(runCtx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/chat/completions", target.Authorization, payload)
+		result, status, _, requestErr := a.request(runCtx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+path, target.Authorization, payload)
 		finishedAt := a.clockNow()
 		backendID := ""
 		if requestErr == nil && status >= 200 && status < 300 {
