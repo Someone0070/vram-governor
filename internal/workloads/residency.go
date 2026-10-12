@@ -772,7 +772,7 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 			}
 			for i := 0; i < needed; i++ {
 				victim := candidates[i]
-				transition, err := m.transitionModel(ctx, lifecycle, target, victim.Model, domain.ResidencyColdDisk, "capacity_for_demand", workload.Request.OwnerID, workload.Request.ID, "demand-evict:"+workload.Request.ID+":"+target.ID+":"+victim.Model, lease)
+				transition, err := m.transitionModel(ctx, lifecycle, target, victim.Model, domain.ResidencyColdDisk, "capacity_for_demand", workload.Request.OwnerID, workload.Request.ID, demandEvictKey(workload.Request.ID, target.ID, victim.Model, lease), lease)
 				if err != nil {
 					return transitionIDs, err
 				}
@@ -809,7 +809,7 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 			if victim == nil {
 				return transitionIDs, protection.blockError(capacityErr)
 			}
-			transition, transitionErr := m.transitionModel(ctx, lifecycle, target, victim.Model, domain.ResidencyColdDisk, "capacity_for_demand", workload.Request.OwnerID, workload.Request.ID, "demand-evict:"+workload.Request.ID+":"+target.ID+":"+victim.Model, lease)
+			transition, transitionErr := m.transitionModel(ctx, lifecycle, target, victim.Model, domain.ResidencyColdDisk, "capacity_for_demand", workload.Request.OwnerID, workload.Request.ID, demandEvictKey(workload.Request.ID, target.ID, victim.Model, lease), lease)
 			if transition != nil {
 				transitionIDs = append(transitionIDs, transition.ID)
 				evicted = append(evicted, victim.Model)
@@ -825,15 +825,12 @@ func (m *Manager) ensureModelResidentLocked(ctx context.Context, target Target, 
 			return transitionIDs, err
 		}
 	}
-	loadKey := "demand-load:" + workload.Request.ID + ":" + target.ID + ":" + model
-	if workload.Request.IdempotencyKey != "" {
-		loadKey = workload.Request.IdempotencyKey
-	}
+	loadKey := demandLoadKey(workload.Request.ID, target.ID, model, workload.Request.IdempotencyKey, lease)
 	transition, err := m.transitionModel(ctx, lifecycle, target, model, domain.ResidencyHotVRAM, "workload_demand", workload.Request.OwnerID, workload.Request.ID, loadKey, lease)
 	if err != nil {
 		for i := len(evicted) - 1; i >= 0; i-- {
 			current := m.targetByID(target.ID)
-			rollback, rollbackErr := m.transitionModel(ctx, lifecycle, current, evicted[i], domain.ResidencyHotVRAM, "demand_load_rollback", workload.Request.OwnerID, workload.Request.ID, "demand-rollback:"+workload.Request.ID+":"+target.ID+":"+evicted[i], lease)
+			rollback, rollbackErr := m.transitionModel(ctx, lifecycle, current, evicted[i], domain.ResidencyHotVRAM, "demand_load_rollback", workload.Request.OwnerID, workload.Request.ID, demandTransitionKey("demand-rollback:"+workload.Request.ID+":"+target.ID+":"+evicted[i], workload.Request.ID, lease), lease)
 			if rollback != nil {
 				transitionIDs = append(transitionIDs, rollback.ID)
 			}
@@ -1612,6 +1609,38 @@ func (m *Manager) modelHasQueuedDemand(ctx context.Context, model string) bool {
 	return false
 }
 
+// operatorWorkloadPrefix marks the synthetic workload ConfigureResidency
+// uses to drive an operator's hot_vram request through demand loading.
+const operatorWorkloadPrefix = "operator:"
+
+// demandTransitionKey binds a workload's residency transition key to the
+// admission lease it runs under. The store only replays a leased key for the
+// exact lease that allocated it, so a per-workload key reused by a later
+// admission attempt (new lease) was rejected forever: one failed attempt, e.g.
+// a load refused while the node briefly reported not-ready right after the
+// eviction, made every retry fail until the request's deadline. A replay under
+// the same lease (restart recovery) still maps to the same key. Operator
+// commands keep their caller key unscoped: it names one requested change and
+// must replay across calls.
+func demandTransitionKey(key, workloadID string, lease *domain.AcceleratorLease) string {
+	if lease == nil || strings.HasPrefix(workloadID, operatorWorkloadPrefix) {
+		return key
+	}
+	return fmt.Sprintf("%s:lease%d", key, lease.FencingToken)
+}
+
+func demandEvictKey(workloadID, targetID, model string, lease *domain.AcceleratorLease) string {
+	return demandTransitionKey("demand-evict:"+workloadID+":"+targetID+":"+model, workloadID, lease)
+}
+
+func demandLoadKey(workloadID, targetID, model, requestKey string, lease *domain.AcceleratorLease) string {
+	key := "demand-load:" + workloadID + ":" + targetID + ":" + model
+	if requestKey != "" {
+		key = requestKey
+	}
+	return demandTransitionKey(key, workloadID, lease)
+}
+
 func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleAdapter, target Target, model string, to domain.ResidencyTier, reason, actor, workloadID, idempotencyKey string, lease *domain.AcceleratorLease) (*domain.ResidencyTransition, error) {
 	// Callers may hold a pre-registration advertisement (notably admission
 	// tests and recovery replay). Bind the transition fence to the current
@@ -2016,7 +2045,7 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 				if m.modelHasActiveDemand(model) || m.modelHasQueuedDemand(ctx, model) {
 					return transitionIDs, fmt.Errorf("foreign resident %s on %s is protected by active or queued demand", model, foreign.ID)
 				}
-				transition, err := m.transitionModel(ctx, lifecycle, foreign, model, domain.ResidencyColdDisk, "cross_adapter_reclaim", workload.Request.OwnerID, workload.Request.ID, "cross-adapter:"+workload.Request.ID+":"+foreign.ID+":"+model, lease)
+				transition, err := m.transitionModel(ctx, lifecycle, foreign, model, domain.ResidencyColdDisk, "cross_adapter_reclaim", workload.Request.OwnerID, workload.Request.ID, demandTransitionKey("cross-adapter:"+workload.Request.ID+":"+foreign.ID+":"+model, workload.Request.ID, lease), lease)
 				if transition != nil {
 					transitionIDs = append(transitionIDs, transition.ID)
 				}
@@ -2849,7 +2878,7 @@ func (m *Manager) ConfigureResidency(ctx context.Context, targetID, model string
 
 	var transitions []*domain.ResidencyTransition
 	if desired == domain.ResidencyHotVRAM {
-		fake := &domain.Workload{Request: domain.WorkloadRequest{ID: "operator:" + idempotencyKey, IdempotencyKey: idempotencyKey, OwnerID: actor}}
+		fake := &domain.Workload{Request: domain.WorkloadRequest{ID: operatorWorkloadPrefix + idempotencyKey, IdempotencyKey: idempotencyKey, OwnerID: actor}}
 		ids, err := m.reclaimForeignTargets(ctx, target, fake, reservation.lease)
 		if err != nil {
 			return residency, transitionsForIDs(ctx, m.store, ids), err

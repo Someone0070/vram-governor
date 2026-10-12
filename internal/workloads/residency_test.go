@@ -2101,3 +2101,86 @@ func TestStaleRuntimeQueueCountersDoNotBlockDemandEviction(t *testing.T) {
 		t.Fatalf("counters advertised before the last release still blocked eviction: candidates=%d err=%v", len(candidates), err)
 	}
 }
+
+// A failed admission attempt records its eviction/load transitions under its
+// lease. The retry runs under a new lease and must get fresh transition keys;
+// replaying the first attempt's keys was refused by the store ("no exact
+// allocated lease origin") on every retry until the request's deadline.
+func TestDemandLoadRetryAfterFailedAttemptUsesFreshTransitionKeys(t *testing.T) {
+	var mu sync.Mutex
+	resident := map[string]bool{"small": true, "large": false}
+	failLarge := true
+	var events []string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch r.URL.Path {
+		case "/v1/models":
+			data := []map[string]string{}
+			for model, loaded := range resident {
+				status := "unloaded"
+				if loaded {
+					status = "loaded"
+				}
+				data = append(data, map[string]string{"id": model, "status": status})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+		case "/models/unload":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			for model := range resident {
+				resident[model] = false
+			}
+			events = append(events, "unload")
+			w.WriteHeader(http.StatusOK)
+		case "/models/load":
+			var body struct {
+				Model string `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			events = append(events, "load:"+body.Model)
+			if body.Model == "large" && failLarge {
+				failLarge = false
+				http.Error(w, "node briefly not ready", http.StatusServiceUnavailable)
+				return
+			}
+			for model := range resident {
+				resident[model] = false
+			}
+			resident[body.Model] = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			_ = json.NewEncoder(w).Encode(map[string]any{"choices": []any{map[string]any{"message": map[string]string{"content": "ok"}}}})
+		}
+	}))
+	defer backend.Close()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	mgr.SetResidencyOptions(ResidencyOptions{Enabled: true, DefaultMinResidency: 0})
+	mgr.RegisterAdapter(NewHTTPAdapter("llamacpp", "llama", backend.Client()))
+	mgr.RegisterTarget(Target{ID: "router", Adapter: "llamacpp", Endpoint: backend.URL, AcceleratorID: "gpu-0", Models: []string{"small", "large"}, ResidentModels: []string{"small"}, SupportsModelLifecycle: true, MaxResidentModels: 1, Enabled: true})
+	workload, _, err := mgr.Submit(context.Background(), domain.WorkloadRequest{OwnerID: "alice", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"large","messages":[{}]}`)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workload.Status != domain.WorkloadWaiting {
+		t.Fatalf("first attempt should fail and wait: %+v", workload)
+	}
+	retry, err := backing.GetWorkload(context.Background(), workload.Request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry.TargetRetryAfter = nil
+	mgr.tryAdmit(context.Background(), retry)
+	after, err := backing.GetWorkload(context.Background(), workload.Request.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if after.Status == domain.WorkloadWaiting || !resident["large"] {
+		t.Fatalf("retry did not load the model: status=%s blocker=%q events=%v resident=%v", after.Status, after.Decision.Blocker, events, resident)
+	}
+}

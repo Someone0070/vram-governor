@@ -1781,7 +1781,7 @@ func (m *Manager) handoffAdmissionOwnedPlacementGeneration(
 			if _, duplicate := seenModels[transition.Model]; duplicate || transition.Model == "" || !hasExact(cursor.ResidentModels, transition.Model) {
 				return fmt.Errorf("transition %s removes a nonresident or repeated victim", transitionID)
 			}
-			if transition.IdempotencyKey != "demand-evict:"+reservation.workloadID+":"+cursor.ID+":"+transition.Model {
+			if transition.IdempotencyKey != demandEvictKey(reservation.workloadID, cursor.ID, transition.Model, lease) {
 				return fmt.Errorf("victim transition has an unexpected idempotency key")
 			}
 			if err := validateAuthoritativeTransitionEvidence(transition, cursor, transition.Model, domain.ResidencyColdDisk); err != nil {
@@ -1793,11 +1793,7 @@ func (m *Manager) handoffAdmissionOwnedPlacementGeneration(
 			if hasExact(cursor.ResidentModels, model) {
 				return fmt.Errorf("requested model is already resident before its owned load")
 			}
-			wantKey := "demand-load:" + reservation.workloadID + ":" + cursor.ID + ":" + model
-			if idempotencyKey != "" {
-				wantKey = idempotencyKey
-			}
-			if transition.IdempotencyKey != wantKey {
+			if transition.IdempotencyKey != demandLoadKey(reservation.workloadID, cursor.ID, model, idempotencyKey, lease) {
 				return fmt.Errorf("requested model transition has an unexpected idempotency key")
 			}
 			if err := validateAuthoritativeTransitionEvidence(transition, cursor, model, domain.ResidencyHotVRAM); err != nil {

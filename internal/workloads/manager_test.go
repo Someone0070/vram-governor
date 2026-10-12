@@ -6649,9 +6649,9 @@ func TestAdmissionOwnedPlacementGenerationHandoff(t *testing.T) {
 				generation++
 			}
 			for index, victim := range test.victims {
-				createReceipt(fmt.Sprintf("victim-%d", index), victim, "capacity_for_demand", "demand-evict:"+fixturePlacement.workloadID+":"+fixtureBefore.ID+":"+victim, domain.ResidencyColdDisk)
+				createReceipt(fmt.Sprintf("victim-%d", index), victim, "capacity_for_demand", demandEvictKey(fixturePlacement.workloadID, fixtureBefore.ID, victim, allocationLease), domain.ResidencyColdDisk)
 			}
-			createReceipt("load-owned", "owned-model", "workload_demand", "demand-load:"+fixturePlacement.workloadID+":"+fixtureBefore.ID+":owned-model", domain.ResidencyHotVRAM)
+			createReceipt("load-owned", "owned-model", "workload_demand", demandLoadKey(fixturePlacement.workloadID, fixtureBefore.ID, "owned-model", "", allocationLease), domain.ResidencyHotVRAM)
 			if test.foreignOrigin {
 				if releaseErr := backing.ReleaseAcceleratorLease(context.Background(), allocationLease.AcceleratorID, allocationLease.WorkloadID, allocationLease.FencingToken); releaseErr != nil { t.Fatalf("release foreign-origin lease: %v", releaseErr) }
 				lease, acquired, leaseErr = backing.AcquireAcceleratorLease(context.Background(), fixtureBefore.AcceleratorID, "handoff-lease-owner", time.Minute)
