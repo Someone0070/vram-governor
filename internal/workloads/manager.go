@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"vram-governor/internal/artifacts"
@@ -119,6 +120,10 @@ type Manager struct {
 	artifacts                      artifacts.Store
 	defaultMaxAcceleratorsPerModel int
 	modelCapacityPolicies          map[string]int
+
+	// capacityReleases counts released reservations; reconcile uses it to
+	// notice capacity freed while a pass is under way.
+	capacityReleases atomic.Uint64
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -4493,10 +4498,24 @@ func (m *Manager) tryReconcileWithin(ctx context.Context, wait time.Duration) bo
 }
 
 func (m *Manager) reconcileLocked(ctx context.Context) {
+	// Capacity released mid-pass (a running job finishing) would otherwise go
+	// to whichever lower-priority row is evaluated next, although a higher
+	// priority row was refused moments earlier. Restart the pass from the top
+	// once in that case; a second restart is left to the next signal so a
+	// release caused by the pass itself cannot loop.
+	if m.reconcilePass(ctx, true) {
+		m.reconcilePass(ctx, false)
+	}
+}
+
+// reconcilePass admits queued work in priority order. It reports whether it
+// stopped early because capacity was released during the pass.
+func (m *Manager) reconcilePass(ctx context.Context, restartOnRelease bool) bool {
+	releases := m.capacityReleases.Load()
 	rows, err := m.store.ListWorkloads(ctx)
 	if err != nil {
 		m.log.Error("list workloads", "err", err)
-		return
+		return false
 	}
 	m.reconcileRunningNodeLoss(ctx, rows)
 	sort.SliceStable(rows, func(i, j int) bool {
@@ -4512,6 +4531,7 @@ func (m *Manager) reconcileLocked(ctx context.Context) {
 		}
 		return rows[i].CreatedAt.Before(rows[j].CreatedAt)
 	})
+	evaluated := false
 	for _, w := range rows {
 		if w.CancellationOwner != "" {
 			continue
@@ -4522,8 +4542,13 @@ func (m *Manager) reconcileLocked(ctx context.Context) {
 		if w.Status == domain.WorkloadWaiting && w.Decision.Blocker == restartReconciliationBlocker {
 			continue
 		}
+		if restartOnRelease && evaluated && m.capacityReleases.Load() != releases {
+			return true
+		}
 		m.tryAdmit(ctx, w)
+		evaluated = true
 	}
+	return false
 }
 
 func (m *Manager) reconcileRecoveredExecutionsForTarget(ctx context.Context, targetID string) {
@@ -8433,6 +8458,7 @@ func (m *Manager) finishReleasedReservationLocked(reservation *targetReservation
 	reservation.backendCleanupTerminal = ""
 	delete(m.activePlacements, reservation.workloadID)
 	m.targetReleasedAt[reservation.targetID] = time.Now()
+	m.capacityReleases.Add(1)
 	active := m.targetActive[reservation.targetID]
 	if active > 1 {
 		m.targetActive[reservation.targetID] = active - 1
