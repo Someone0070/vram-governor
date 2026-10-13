@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -6864,5 +6865,127 @@ func TestRejectedRuntimeProfileSwitchRestoresTargetImmediately(t *testing.T) {
 	after, _ := backing.GetWorkload(ctx, row.Request.ID)
 	if commands != 2 || (after.Status != domain.WorkloadRunning && after.Status != domain.WorkloadSucceeded) || mgr.targetByID(registered.ID).ActiveRuntimeProfile != "ctx-32k" {
 		t.Fatalf("next pass did not switch and admit: commands=%d status=%s decision=%+v", commands, after.Status, after.Decision)
+	}
+}
+
+// gatedAdapter runs each workload until the test marks its ID done. An
+// optional hook runs inside Requirements, i.e. inside admission.
+type gatedAdapter struct {
+	name string
+	done *sync.Map
+	hook func(domain.WorkloadRequest)
+}
+
+func (a gatedAdapter) Name() string                                           { return a.name }
+func (gatedAdapter) Version() string                                          { return "v1" }
+func (gatedAdapter) Validate(context.Context, domain.WorkloadRequest) error { return nil }
+func (a gatedAdapter) Requirements(_ context.Context, req domain.WorkloadRequest) (Requirements, error) {
+	if a.hook != nil {
+		a.hook(req)
+	}
+	return Requirements{AcceleratorRequired: true}, nil
+}
+func (gatedAdapter) Plan(context.Context, domain.WorkloadRequest, Target) (*domain.ExecutionPlan, error) {
+	return &domain.ExecutionPlan{}, nil
+}
+func (gatedAdapter) Start(_ context.Context, req domain.WorkloadRequest, _ *domain.ExecutionPlan, _ Target) (*domain.ExecutionHandle, error) {
+	return &domain.ExecutionHandle{ExternalID: req.ID, StartedAt: time.Now().UTC()}, nil
+}
+func (a gatedAdapter) Observe(_ context.Context, req domain.WorkloadRequest, _ *domain.ExecutionPlan, _ *domain.ExecutionHandle, _ Target) (Observation, error) {
+	if _, done := a.done.Load(req.ID); done {
+		return Observation{Status: domain.WorkloadSucceeded, Progress: 1}, nil
+	}
+	return Observation{Status: domain.WorkloadRunning}, nil
+}
+func (gatedAdapter) Yield(context.Context, *domain.ExecutionHandle, Target) error {
+	return ErrUnsupported
+}
+func (gatedAdapter) Checkpoint(context.Context, *domain.ExecutionHandle, Target) (string, error) {
+	return "", ErrUnsupported
+}
+func (gatedAdapter) Resume(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, string, Target) (*domain.ExecutionHandle, error) {
+	return nil, ErrUnsupported
+}
+func (gatedAdapter) Cancel(context.Context, *domain.ExecutionHandle, Target) error { return nil }
+func (gatedAdapter) CollectOutputs(context.Context, domain.WorkloadRequest, *domain.ExecutionPlan, *domain.ExecutionHandle, Target) (json.RawMessage, []string, error) {
+	return json.RawMessage(`{"ok":true}`), nil, nil
+}
+
+// Two runtimes share one GPU (Comfy and an LLM router on CT200). When the
+// running job finishes, a waiting higher-priority job on the other runtime
+// must get the GPU before a lower-priority job queued for the same runtime,
+// including when the GPU frees up while the lower one is being admitted.
+func TestFreedAcceleratorGoesToHigherPriorityAcrossTargets(t *testing.T) {
+	for round := 0; round < 10; round++ {
+		func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := &sync.Map{}
+			var mgr *Manager
+			var running *domain.Workload
+			var armed atomic.Bool
+			var fired sync.Once
+			// The first admission attempt of the image after arming finishes the
+			// video and waits until its reservation is released: the interleaving
+			// seen live, where the GPU frees up mid-pass, after the chat was refused.
+			hook := func(req domain.WorkloadRequest) {
+				if req.ItemID != "image" || !armed.Load() {
+					return
+				}
+				fired.Do(func() {
+					done.Store(running.Request.ID, true)
+					deadline := time.Now().Add(2 * time.Second)
+					for time.Now().Before(deadline) {
+						if latest, err := mgr.Get(ctx, running.Request.ID); err == nil && latest.Status == domain.WorkloadSucceeded {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+					time.Sleep(20 * time.Millisecond)
+				})
+			}
+			mgr = NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+			mgr.RegisterAdapter(gatedAdapter{name: "comfy", done: done, hook: hook})
+			mgr.RegisterAdapter(gatedAdapter{name: "llm", done: done})
+			mgr.RegisterTarget(Target{ID: "comfy", Adapter: "comfy", AcceleratorID: "gpu-0", Slots: 1, Enabled: true})
+			mgr.RegisterTarget(Target{ID: "llm", Adapter: "llm", AcceleratorID: "gpu-0", Slots: 1, Enabled: true})
+			mgr.Start(ctx)
+			submit := func(adapter, item string, priority int) *domain.Workload {
+				w, _, err := mgr.Submit(ctx, domain.WorkloadRequest{OwnerID: "owner", Adapter: adapter, ItemID: item, Payload: json.RawMessage(`{}`), Priority: priority})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return w
+			}
+			running = submit("comfy", "video", 10)
+			waitFor := func(what string, cond func() bool) {
+				deadline := time.Now().Add(3 * time.Second)
+				for !cond() {
+					if time.Now().After(deadline) {
+						t.Fatalf("round %d: timed out waiting for %s", round, what)
+					}
+					time.Sleep(2 * time.Millisecond)
+				}
+			}
+			status := func(w *domain.Workload) domain.WorkloadStatus {
+				latest, _ := mgr.Get(ctx, w.Request.ID)
+				return latest.Status
+			}
+			waitFor("video running", func() bool { return status(running) == domain.WorkloadRunning })
+			image := submit("comfy", "image", 50)
+			chat := submit("llm", "chat", 60)
+			if status(image) == domain.WorkloadRunning || status(chat) == domain.WorkloadRunning {
+				t.Fatalf("round %d: work started while the GPU was busy", round)
+			}
+			armed.Store(true)
+			waitFor("next admission", func() bool {
+				return status(image) == domain.WorkloadRunning || status(chat) == domain.WorkloadRunning
+			})
+			if status(image) == domain.WorkloadRunning {
+				t.Fatalf("round %d: priority-50 image took the GPU ahead of the priority-60 chat", round)
+			}
+			done.Store(chat.Request.ID, true)
+			waitFor("image after chat", func() bool { return status(image) == domain.WorkloadRunning })
+		}()
 	}
 }

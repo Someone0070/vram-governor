@@ -124,6 +124,11 @@ type Manager struct {
 	// capacityReleases counts released reservations; reconcile uses it to
 	// notice capacity freed while a pass is under way.
 	capacityReleases atomic.Uint64
+	// passWaiters holds, per accelerator, the highest priority refused as
+	// busy during the current reconcile pass. Lower-priority work may not
+	// take that accelerator in the same pass, even if it frees up meanwhile.
+	passWaitersMu sync.Mutex
+	passWaiters   map[string]int
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -4512,6 +4517,9 @@ func (m *Manager) reconcileLocked(ctx context.Context) {
 // stopped early because capacity was released during the pass.
 func (m *Manager) reconcilePass(ctx context.Context, restartOnRelease bool) bool {
 	releases := m.capacityReleases.Load()
+	m.passWaitersMu.Lock()
+	m.passWaiters = make(map[string]int)
+	m.passWaitersMu.Unlock()
 	rows, err := m.store.ListWorkloads(ctx)
 	if err != nil {
 		m.log.Error("list workloads", "err", err)
@@ -5312,6 +5320,11 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			// Fence this physical accelerator before releasing the refresh lock for
 			// durable lease acquisition. Other admissions observe the short marker
 			// and cannot reserve the same envelope while this optimistic phase waits.
+			if waiting, ok := m.passWaiter(target.AcceleratorID); ok && waiting > effectiveWorkloadPriority(w) {
+				unlockAdmission()
+				blockers = append(blockers, target.ID+": accelerator is busy; higher-priority work is waiting for it")
+				return admitCandidateNext
+			}
 			if !m.beginResidencyTransition(target.AcceleratorID) {
 				unlockAdmission()
 				blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": accelerator residency transition in progress"))
@@ -5326,6 +5339,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			}
 			if !acquired {
 				m.endResidencyTransition(target.AcceleratorID)
+				if strings.HasPrefix(reason, "accelerator is busy") || strings.HasPrefix(reason, acceleratorReservedBy) {
+					m.notePassWaiter(target.AcceleratorID, effectiveWorkloadPriority(w))
+				}
 				waitingEstimate = preferEstimate(waitingEstimate, targetEstimates[target.ID])
 				if m.tryPreempt(ctx, w, target) {
 					blockers = append(blockers, coded(domain.BlockerTransitionBusy, target.ID+": victim transition in progress"))
@@ -6528,6 +6544,30 @@ func estimateTargetCost(target Target, requirements Requirements) int64 {
 	}
 	numerator := int64(requirements.ContextTokens) * rate
 	return (numerator + 999_999) / 1_000_000
+}
+
+func (m *Manager) passWaiter(acceleratorID string) (int, bool) {
+	if acceleratorID == "" {
+		return 0, false
+	}
+	m.passWaitersMu.Lock()
+	defer m.passWaitersMu.Unlock()
+	priority, ok := m.passWaiters[acceleratorID]
+	return priority, ok
+}
+
+func (m *Manager) notePassWaiter(acceleratorID string, priority int) {
+	if acceleratorID == "" {
+		return
+	}
+	m.passWaitersMu.Lock()
+	defer m.passWaitersMu.Unlock()
+	if m.passWaiters == nil {
+		m.passWaiters = make(map[string]int)
+	}
+	if current, ok := m.passWaiters[acceleratorID]; !ok || priority > current {
+		m.passWaiters[acceleratorID] = priority
+	}
 }
 
 func (m *Manager) principalActiveCount(ctx context.Context, principalID, excludeWorkloadID string) int {
