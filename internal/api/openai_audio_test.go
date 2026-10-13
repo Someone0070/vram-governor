@@ -5,7 +5,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"testing"
+	"vram-governor/internal/workflowtpl"
 )
 
 func TestOpenAISpeechRejectsBadRequests(t *testing.T) {
@@ -65,5 +67,27 @@ func TestOpenAITranscriptionsRejectsBadRequests(t *testing.T) {
 	}
 	if code := post(map[string]string{"model": "image-test"}, "a.mp3", "audio/mpeg", []byte("x")); code != http.StatusNotFound {
 		t.Errorf("image workflow as transcriber: %d", code)
+	}
+}
+
+func TestOpenAISpeechParamsMapVoicesAndInstructions(t *testing.T) {
+	twoVoices := &workflowtpl.Template{Params: []workflowtpl.Param{{Name: "text"}, {Name: "voice", Values: []string{"Chelsie", "Ethan"}}}}
+	named := &workflowtpl.Template{Params: []workflowtpl.Param{{Name: "text"}, {Name: "voice", Values: []string{"alloy", "nova", "onyx"}}, {Name: "instructions"}}}
+	for _, tc := range []struct {
+		template            *workflowtpl.Template
+		voice, instructions string
+		want                map[string]any
+	}{
+		{twoVoices, "nova", "", map[string]any{"text": "hi", "voice": "Chelsie"}},
+		{twoVoices, "onyx", "whisper", map[string]any{"text": "hi", "voice": "Ethan"}},
+		{twoVoices, "ethan", "", map[string]any{"text": "hi", "voice": "Ethan"}},
+		{named, "onyx", "", map[string]any{"text": "hi", "voice": "onyx"}},
+		{named, "NOVA", "An old man, slowly.", map[string]any{"text": "hi", "voice": "nova", "instructions": "An old man, slowly."}},
+		{named, "", "", map[string]any{"text": "hi"}},
+	} {
+		got := openAISpeechParams(tc.template, "hi", tc.voice, tc.instructions)
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("voice=%q instructions=%q: got %v want %v", tc.voice, tc.instructions, got, tc.want)
+		}
 	}
 }

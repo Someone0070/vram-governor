@@ -1,0 +1,114 @@
+{
+  "id": "audio-auk-clone",
+  "version": 1,
+  "title": "Speak in a reference voice (AuK)",
+  "description": "Speaks new text in the voice of a short reference recording (3-10 s is ideal; reference plus each spoken part must stay under 30 s) and returns an MP3.",
+  "operation": "audio.speech",
+  "profile": "audio-auk@1",
+  "outputs": [
+    "audio/mpeg"
+  ],
+  "typical_seconds": 60,
+  "params": [
+    {
+      "name": "text",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "What to say.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "text"
+        }
+      ]
+    },
+    {
+      "name": "reference",
+      "type": "audio",
+      "required": true,
+      "description": "Recording of the voice to use (artifact id).",
+      "bind": [
+        {
+          "node": "3",
+          "input": "audio"
+        }
+      ]
+    },
+    {
+      "name": "seconds",
+      "type": "number",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 30.0,
+      "description": "Length in seconds; 0 estimates it from the text. Only used when the text fits one run.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "seconds"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "seed"
+        }
+      ]
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 32,
+      "min": 8,
+      "max": 64,
+      "description": "Sampling steps; fewer is faster, 32 is the reference.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "steps"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "VGAuK",
+      "inputs": {
+        "text": "",
+        "voice_description": "A neutral, balanced adult voice, clear and even, speaking at a natural pace.",
+        "style": "",
+        "instruction": "",
+        "seconds": 0.0,
+        "seed": 0,
+        "steps": 32,
+        "cfg": 2.0,
+        "audio": [
+          "3",
+          0
+        ]
+      }
+    },
+    "2": {
+      "class_type": "SaveAudioMP3",
+      "inputs": {
+        "audio": [
+          "1",
+          0
+        ],
+        "filename_prefix": "lb/auk",
+        "quality": "V0"
+      }
+    },
+    "3": {
+      "class_type": "LoadAudio",
+      "inputs": {
+        "audio": ""
+      }
+    }
+  }
+}

@@ -1,0 +1,143 @@
+{
+  "id": "audio-auk-tts",
+  "version": 1,
+  "title": "Text to speech, any described voice (AuK)",
+  "description": "Speaks the text in a voice you describe (or one of the OpenAI-named presets) and returns an MP3. Text longer than ~20 s of speech is spoken sentence by sentence. Roughly 3-4 s of compute per second of speech.",
+  "operation": "audio.speech",
+  "profile": "audio-auk@1",
+  "outputs": [
+    "audio/mpeg"
+  ],
+  "typical_seconds": 60,
+  "params": [
+    {
+      "name": "text",
+      "type": "string",
+      "required": true,
+      "max_length": 4000,
+      "description": "What to say.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "text"
+        }
+      ]
+    },
+    {
+      "name": "voice",
+      "type": "enum",
+      "default": "alloy",
+      "values": [
+        "alloy",
+        "ash",
+        "ballad",
+        "coral",
+        "echo",
+        "fable",
+        "nova",
+        "onyx",
+        "sage",
+        "shimmer",
+        "verse"
+      ],
+      "description": "Preset voice (OpenAI voice names): alloy: A neutral, balanced adult voice, clear and even, speaking at a natural pace.; ash: A man in his thirties with a warm, slightly raspy voice, relaxed and conversational.; ballad: A man with a soft, melodic voice, gentle and expressive, speaking unhurriedly.; coral: A woman with a warm, friendly voice, upbeat and approachable.; echo: A man with a calm, resonant voice, steady and reassuring.; fable: A British male storyteller with an expressive, animated voice.; nova: A young woman with a bright, energetic voice, lively and clear.; onyx: A man with a deep, authoritative voice, speaking slowly and deliberately.; sage: A woman with a calm, measured voice, thoughtful and wise.; shimmer: A woman with a soft, gentle voice, quiet and soothing.; verse: A man with a versatile, dynamic voice, expressive and engaging.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "voice_description",
+          "map": {
+            "alloy": "A neutral, balanced adult voice, clear and even, speaking at a natural pace.",
+            "ash": "A man in his thirties with a warm, slightly raspy voice, relaxed and conversational.",
+            "ballad": "A man with a soft, melodic voice, gentle and expressive, speaking unhurriedly.",
+            "coral": "A woman with a warm, friendly voice, upbeat and approachable.",
+            "echo": "A man with a calm, resonant voice, steady and reassuring.",
+            "fable": "A British male storyteller with an expressive, animated voice.",
+            "nova": "A young woman with a bright, energetic voice, lively and clear.",
+            "onyx": "A man with a deep, authoritative voice, speaking slowly and deliberately.",
+            "sage": "A woman with a calm, measured voice, thoughtful and wise.",
+            "shimmer": "A woman with a soft, gentle voice, quiet and soothing.",
+            "verse": "A man with a versatile, dynamic voice, expressive and engaging."
+          }
+        }
+      ]
+    },
+    {
+      "name": "instructions",
+      "type": "string",
+      "default": "",
+      "max_length": 1000,
+      "description": "Optional voice and delivery description that replaces the preset, e.g. 'An elderly man, hoarse and amused, speaking slowly.'",
+      "bind": [
+        {
+          "node": "1",
+          "input": "style"
+        }
+      ]
+    },
+    {
+      "name": "seconds",
+      "type": "number",
+      "default": 0.0,
+      "min": 0.0,
+      "max": 30.0,
+      "description": "Length in seconds; 0 estimates it from the text. Only used when the text fits one run (~20 s).",
+      "bind": [
+        {
+          "node": "1",
+          "input": "seconds"
+        }
+      ]
+    },
+    {
+      "name": "seed",
+      "type": "seed",
+      "description": "Same seed and params give the same result. Random when omitted.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "seed"
+        }
+      ]
+    },
+    {
+      "name": "steps",
+      "type": "integer",
+      "default": 32,
+      "min": 8,
+      "max": 64,
+      "description": "Sampling steps; fewer is faster, 32 is the reference.",
+      "bind": [
+        {
+          "node": "1",
+          "input": "steps"
+        }
+      ]
+    }
+  ],
+  "graph": {
+    "1": {
+      "class_type": "VGAuK",
+      "inputs": {
+        "text": "",
+        "voice_description": "A neutral, balanced adult voice, clear and even, speaking at a natural pace.",
+        "style": "",
+        "instruction": "",
+        "seconds": 0.0,
+        "seed": 0,
+        "steps": 32,
+        "cfg": 2.0
+      }
+    },
+    "2": {
+      "class_type": "SaveAudioMP3",
+      "inputs": {
+        "audio": [
+          "1",
+          0
+        ],
+        "filename_prefix": "lb/auk",
+        "quality": "V0"
+      }
+    }
+  }
+}

@@ -118,22 +118,7 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusNotFound, err.Error(), "invalid_request_error")
 		return
 	}
-	params := map[string]any{"text": body.Input}
-	for _, param := range template.Params {
-		if param.Name != "voice" || len(param.Values) == 0 || body.Voice == "" {
-			continue
-		}
-		voice := body.Voice
-		for _, allowed := range param.Values {
-			if strings.EqualFold(allowed, voice) {
-				voice = allowed
-			}
-		}
-		if index, mapped := openAIVoices[strings.ToLower(voice)]; mapped && index < len(param.Values) {
-			voice = param.Values[index]
-		}
-		params["voice"] = voice
-	}
+	params := openAISpeechParams(template, body.Input, body.Voice, body.Instructions)
 	_, response, status, err := s.runWorkflowAndWait(r, p, template, params, "")
 	if err != nil {
 		writeOpenAIError(w, status, err.Error(), "server_error")
@@ -152,6 +137,34 @@ func (s *Server) handleOpenAISpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(audio)
+}
+
+// openAISpeechParams maps an OpenAI speech request onto a template's params.
+// A voice the template names exactly is used as is; other OpenAI voice names
+// fall back to the template's first (feminine) or second voice.
+func openAISpeechParams(template *workflowtpl.Template, input, requested, instructions string) map[string]any {
+	params := map[string]any{"text": input}
+	for _, param := range template.Params {
+		// instructions describes the voice and delivery (as in OpenAI's
+		// API); only templates that declare the param receive it.
+		if param.Name == "instructions" && strings.TrimSpace(instructions) != "" {
+			params["instructions"] = instructions
+		}
+		if param.Name != "voice" || len(param.Values) == 0 || requested == "" {
+			continue
+		}
+		voice, exact := requested, false
+		for _, allowed := range param.Values {
+			if strings.EqualFold(allowed, voice) {
+				voice, exact = allowed, true
+			}
+		}
+		if index, mapped := openAIVoices[strings.ToLower(voice)]; !exact && mapped && index < len(param.Values) {
+			voice = param.Values[index]
+		}
+		params["voice"] = voice
+	}
+	return params
 }
 
 func (s *Server) handleOpenAITranscriptions(w http.ResponseWriter, r *http.Request) {
