@@ -526,6 +526,14 @@ func (s *Server) creatorBlockingReason(r *http.Request, row *domain.Workload) st
 	if strings.HasPrefix(row.Decision.Blocker, "DEPENDENCY_") {
 		return row.Decision.Blocker
 	}
+	// Contention named by the admission decision itself (another job or
+	// runtime holds the GPU) is transient. The capability snapshot below can
+	// read "offline" while the GPU switches runtimes, which would misreport it.
+	for _, contention := range []string{"accelerator is busy", "execution slots are busy", "accelerator is reserved by", "residency transition in progress"} {
+		if strings.Contains(blocker, contention) {
+			return "TEMPORARILY_BUSY"
+		}
+	}
 	capabilities, err := s.workloads.Capabilities(r.Context())
 	if err != nil {
 		return "NO_FEASIBLE_ROUTE"

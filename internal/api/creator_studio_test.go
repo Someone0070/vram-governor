@@ -491,3 +491,18 @@ func TestCreatorStudioWorkingSet(t *testing.T) {
 		t.Fatalf("mutable working-set profile identity was accepted: status=%d body=%s", bad.Code, bad.Body.String())
 	}
 }
+
+func TestCreatorBlockingReasonReportsGPUContentionAsTemporarilyBusy(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/workloads/x", nil)
+	for _, blocker := range []string{
+		"cmp170-node-cmp170-llm: accelerator is busy and newcomer policy does not allow sharing",
+		"cmp170-video-managed: accelerator is busy; higher-priority work is waiting for it",
+		"cmp170-video-managed: all execution slots are busy",
+		"cmp170-video-managed: accelerator residency transition in progress",
+	} {
+		row := &domain.Workload{Decision: domain.AdmissionDecision{Blocker: blocker}}
+		if got := (&Server{}).creatorBlockingReason(request, row); got != "TEMPORARILY_BUSY" {
+			t.Fatalf("%q classified as %s", blocker, got)
+		}
+	}
+}
