@@ -78,10 +78,11 @@ def _release():
 
 
 def _estimate_seconds(text):
-    """Speaking time for text: ~2.7 words/s, ~4.5 CJK characters/s."""
+    """Speaking time for text, generously: AuK drops words from the start when
+    the target is too short (11 words: 4.7 s lost half, 6 s was complete)."""
     cjk = len(re.findall(r"[぀-ヿ㐀-鿿가-힯]", text))
     words = len(re.sub(r"[぀-ヿ㐀-鿿가-힯]", " ", text).split())
-    return words / 2.7 + cjk / 4.5 + 0.6
+    return words / 2.2 + cjk / 3.5 + 1.0
 
 
 def _chunks(text, limit_seconds):

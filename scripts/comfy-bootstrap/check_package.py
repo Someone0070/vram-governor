@@ -37,6 +37,7 @@ WORKFLOW_PROFILES = {
     "video-seedvr2": ("VIDEO", ["video.upscale"], ["application/json", "video/mp4"], {"application/json", "video/mp4"}),
     "audio-qwen25-omni": ("AUDIO", ["audio.speech", "audio.transcribe"], ["application/json", "audio/*", "video/mp4"], {"application/json", "audio/mpeg", "text/plain"}),
     "audio-yue2": ("AUDIO", ["audio.music"], ["application/json", "audio/*", "video/mp4"], {"application/json", "audio/mpeg"}),
+    "audio-auk": ("AUDIO", ["audio.speech", "audio.edit"], ["application/json", "audio/*", "video/mp4"], {"application/json", "audio/mpeg"}),
 }
 
 
