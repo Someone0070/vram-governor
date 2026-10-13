@@ -2007,8 +2007,21 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 
 	var transitionIDs []string
 	for _, foreign := range targets {
-		if foreign.ID == selected.ID || foreign.AcceleratorID != selected.AcceleratorID || m.targetActiveCount(foreign.ID) > 0 || foreign.QueueRunning > 0 || foreign.QueuePending > 0 {
+		if foreign.ID == selected.ID || foreign.AcceleratorID != selected.AcceleratorID || m.targetActiveCount(foreign.ID) > 0 {
 			continue
+		}
+		if foreign.QueueRunning > 0 || foreign.QueuePending > 0 {
+			// Busy counters arrive with periodic node advertisements. Counters
+			// published before the LB's last release on that target are stale
+			// (the request just finished): reclaim as if idle. Skipping instead
+			// started Comfy work beside a still-loaded LLM model and ran the card
+			// out of memory. Fresh counters mean work the LB is not tracking.
+			if !m.runtimeQueueCountersStale(foreign) {
+				if foreign.SupportsModelLifecycle && foreign.Enabled {
+					return transitionIDs, fmt.Errorf("foreign target %s on the same accelerator reports running or queued work", foreign.ID)
+				}
+				continue
+			}
 		}
 		adapter := adapters[foreign.Adapter]
 		if foreign.SupportsModelLifecycle {

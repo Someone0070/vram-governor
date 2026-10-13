@@ -2250,3 +2250,29 @@ func TestModelLoadFailuresBackOffThenFailFast(t *testing.T) {
 		t.Fatal("runtime change did not lift the fence")
 	}
 }
+
+// An LLM router's busy counters lag behind its requests. Counters from before
+// the LB's last release must not stop a reclaim (Comfy then ran beside a
+// still-loaded model and ran out of memory); fresh ones mean untracked work
+// and must refuse admission rather than skip the target silently.
+func TestReclaimForeignLifecycleTargetHonoursOnlyFreshBusyCounters(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		ctx := context.Background()
+		mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+		mgr.RegisterAdapter(newAdmissionLifecycleAdapter("router-mock"))
+		selected := Target{ID: "comfy", Adapter: "comfy", AcceleratorID: "shared-gpu", Enabled: true}
+		foreign := Target{ID: "router", Adapter: "router-mock", AcceleratorID: "shared-gpu", SupportsModelLifecycle: true, Enabled: true, QueueRunning: 1}
+		mgr.RegisterTarget(selected)
+		mgr.RegisterTarget(foreign)
+		if stale {
+			mgr.placementMu.Lock()
+			mgr.targetReleasedAt[foreign.ID] = time.Now().Add(time.Second)
+			mgr.placementMu.Unlock()
+		}
+		_, err := mgr.reclaimForeignTargets(ctx, selected, &domain.Workload{Request: domain.WorkloadRequest{ID: "image", OwnerID: "owner"}}, nil)
+		busy := err != nil && strings.Contains(err.Error(), "reports running or queued work")
+		if busy == stale {
+			t.Fatalf("stale=%t: err=%v", stale, err)
+		}
+	}
+}

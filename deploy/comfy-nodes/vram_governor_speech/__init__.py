@@ -10,6 +10,7 @@ ComfyUI's own models are unloaded first, and every part goes back to system
 RAM after the node, so the GPU is free for the next workflow.
 """
 
+import gc
 import os
 import re
 import threading
@@ -72,7 +73,30 @@ def _release():
         for mode in ("speak", "transcribe"):
             for part in _parts(model, mode):
                 part.to("cpu")
+    gc.collect()
     mm.soft_empty_cache()
+
+
+def _run_on_gpu(mode, work):
+    """Run work(model, processor) with the parts for mode on the GPU.
+
+    A failure is re-raised only after cleanup, as a new exception: the
+    original's traceback pins the failed attempt's GPU tensors, and ComfyUI
+    keeps the exception, so ~4 GB stayed allocated after an out-of-memory
+    error and no later workflow could get it back (not even via /free).
+    """
+    failure = None
+    with _lock:
+        try:
+            # Inside the try: an out-of-memory error while moving the parts
+            # to the GPU must still move the ones already there back.
+            model, processor = _acquire(mode)
+            return work(model, processor)
+        except Exception as error:  # noqa: BLE001 - re-raised below
+            failure = (type(error) if isinstance(error, torch.OutOfMemoryError) else RuntimeError, str(error))
+        finally:
+            _release()
+    raise failure[0](failure[1])
 
 
 def _conversation(content):
@@ -138,25 +162,25 @@ class VGSpeechTranscribe:
         if context.strip():
             instruction += " Context that may help with names and terms: " + context.strip()
         window = ASR_WINDOW_SECONDS * INPUT_RATE
-        texts = []
-        with _lock:
-            model, processor = _acquire("transcribe")
-            try:
-                device = mm.get_torch_device()
-                for start in range(0, max(len(samples), 1), window):
-                    chunk = samples[start:start + window]
-                    if len(chunk) < INPUT_RATE // 4:
-                        continue
-                    prompt = processor.apply_chat_template(_conversation([{"type": "audio", "audio": chunk}, {"type": "text", "text": instruction}]), add_generation_prompt=True, tokenize=False)
-                    inputs = _to_device(processor(text=prompt, audio=[chunk], return_tensors="pt", padding=True), device)
-                    # Bound the text by the audio's length (speech is ~3-4
-                    # tokens/s) so the chat model cannot run on after it.
-                    budget = int(len(chunk) / INPUT_RATE * 8) + 24
-                    with torch.inference_mode():
-                        ids = model.generate(**inputs, return_audio=False, thinker_max_new_tokens=budget)
-                    texts.append(processor.batch_decode(ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip())
-            finally:
-                _release()
+
+        def work(model, processor):
+            texts = []
+            device = mm.get_torch_device()
+            for start in range(0, max(len(samples), 1), window):
+                chunk = samples[start:start + window]
+                if len(chunk) < INPUT_RATE // 4:
+                    continue
+                prompt = processor.apply_chat_template(_conversation([{"type": "audio", "audio": chunk}, {"type": "text", "text": instruction}]), add_generation_prompt=True, tokenize=False)
+                inputs = _to_device(processor(text=prompt, audio=[chunk], return_tensors="pt", padding=True), device)
+                # Bound the text by the audio's length (speech is ~3-4
+                # tokens/s) so the chat model cannot run on after it.
+                budget = int(len(chunk) / INPUT_RATE * 8) + 24
+                with torch.inference_mode():
+                    ids = model.generate(**inputs, return_audio=False, thinker_max_new_tokens=budget)
+                texts.append(processor.batch_decode(ids[:, inputs["input_ids"].shape[1]:], skip_special_tokens=True)[0].strip())
+            return texts
+
+        texts = _run_on_gpu("transcribe", work)
         return (" ".join(t for t in texts if t),)
 
 
@@ -171,16 +195,19 @@ def _speak_chunk(model, processor, device, chunk, voice):
         with torch.inference_mode():
             _, audio = model.generate(**inputs, speaker=voice, return_audio=True, thinker_max_new_tokens=budget)
         return [audio.reshape(-1).float().cpu()]
-    except torch.OutOfMemoryError:
-        # The vocoder's memory grows with the clip; on a 10 GB card a long
-        # chunk can just miss. Retry it as two halves.
-        del inputs
-        torch.cuda.empty_cache()
-        cut = chunk.rfind(" ", 0, len(chunk) // 2 + 1)
-        if cut <= 0 or len(chunk) < 40:
-            raise
-        return (_speak_chunk(model, processor, device, chunk[:cut].strip(), voice)
-                + _speak_chunk(model, processor, device, chunk[cut:].strip(), voice))
+    except torch.OutOfMemoryError as error:
+        message = str(error)
+    # The vocoder's memory grows with the clip; on a 10 GB card a long chunk
+    # can just miss. Retry it as two halves, outside the except block: the
+    # exception's traceback pins the failed attempt's GPU tensors.
+    del inputs
+    gc.collect()
+    torch.cuda.empty_cache()
+    cut = chunk.rfind(" ", 0, len(chunk) // 2 + 1)
+    if cut <= 0 or len(chunk) < 40:
+        raise torch.OutOfMemoryError(message)
+    return (_speak_chunk(model, processor, device, chunk[:cut].strip(), voice)
+            + _speak_chunk(model, processor, device, chunk[cut:].strip(), voice))
 
 
 class VGSpeechSpeak:
@@ -197,16 +224,16 @@ class VGSpeechSpeak:
         chunks = _sentences(text)
         if not chunks:
             raise ValueError("text is empty")
-        pieces = []
-        with _lock:
-            model, processor = _acquire("speak")
-            try:
-                device = mm.get_torch_device()
-                for chunk in chunks:
-                    pieces.extend(_speak_chunk(model, processor, device, chunk, voice))
-                    pieces.append(torch.zeros(int(OUTPUT_RATE * 0.15)))
-            finally:
-                _release()
+
+        def work(model, processor):
+            pieces = []
+            device = mm.get_torch_device()
+            for chunk in chunks:
+                pieces.extend(_speak_chunk(model, processor, device, chunk, voice))
+                pieces.append(torch.zeros(int(OUTPUT_RATE * 0.15)))
+            return pieces
+
+        pieces = _run_on_gpu("speak", work)
         waveform = torch.cat(pieces).clamp(-1, 1).reshape(1, 1, -1)
         return ({"waveform": waveform, "sample_rate": OUTPUT_RATE},)
 
