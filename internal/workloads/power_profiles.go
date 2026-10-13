@@ -2,6 +2,7 @@ package workloads
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -158,6 +159,10 @@ func (m *Manager) ReconcileGPUIdleAfterTelemetry(nodeID string) {
 // The in-flight marker is a short state fence; the signed GPU command itself
 // runs with every manager/state mutex released. A waiter sleeps on the marker
 // channel and retries after the prior command publishes its result.
+// errTargetFactsChanged: the node applied the profile, but the accelerator's
+// targets were refreshed meanwhile, so the result cannot be attributed.
+var errTargetFactsChanged = errors.New("GPU performance result target facts changed during command")
+
 func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, profile, idempotencyKey string) error {
 	if acceleratorID == "" || profile == "" {
 		return nil
@@ -207,16 +212,7 @@ func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, p
 		m.mu.Unlock()
 		return nil
 	}
-	// The node keeps its fence high-water across controller restarts, so an
-	// in-memory counter starting at 1 was rejected as stale after every
-	// restart. Wall-clock milliseconds keep fences above any prior run.
-	fence := m.gpuCommandFences[acceleratorID] + 1
-	if now := uint64(time.Now().UnixMilli()); now > fence {
-		fence = now
-	}
-	m.gpuCommandFences[acceleratorID] = fence
 	m.mu.Unlock()
-	targetFences := m.snapshotAcceleratorTargetFences(acceleratorID)
 	if profile == "idle" {
 		m.placementMu.Lock()
 		for _, placement := range m.activePlacements {
@@ -227,23 +223,49 @@ func (m *Manager) setGPUPerformanceProfile(ctx context.Context, acceleratorID, p
 		}
 		m.placementMu.Unlock()
 	}
-	result, err := control(ctx, nodeID, "set_gpu_performance_profile", map[string]any{
-		"accelerator_id": acceleratorID,
-		"profile":        profile,
-		"fencing_token":  int64(fence),
-	}, idempotencyKey)
-	if err == nil {
-		if managed, _ := result["managed"].(bool); !managed {
-			err = fmt.Errorf("node did not apply advertised GPU performance control")
+	// A target refresh while the command is in flight (job starts change the
+	// advertised queue counters) invalidates the result although the node
+	// applied the profile. Send it again, freshly fenced, a few times before
+	// failing the job that asked for it.
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		key := idempotencyKey
+		if attempt > 0 {
+			key = fmt.Sprintf("%s:refresh-%d", idempotencyKey, attempt)
 		}
-	}
-	if err == nil {
-		if reported, _ := result["accelerator_id"].(string); reported != acceleratorID {
-			err = fmt.Errorf("GPU performance result accelerator mismatch")
+		// The node keeps its fence high-water across controller restarts, so an
+		// in-memory counter starting at 1 was rejected as stale after every
+		// restart. Wall-clock milliseconds keep fences above any prior run.
+		m.mu.Lock()
+		fence := m.gpuCommandFences[acceleratorID] + 1
+		if now := uint64(time.Now().UnixMilli()); now > fence {
+			fence = now
 		}
-	}
-	if err == nil && !m.acceleratorTargetFencesMatch(targetFences) {
-		err = fmt.Errorf("GPU performance result target facts changed during command")
+		m.gpuCommandFences[acceleratorID] = fence
+		m.mu.Unlock()
+		targetFences := m.snapshotAcceleratorTargetFences(acceleratorID)
+		var result map[string]any
+		result, err = control(ctx, nodeID, "set_gpu_performance_profile", map[string]any{
+			"accelerator_id": acceleratorID,
+			"profile":        profile,
+			"fencing_token":  int64(fence),
+		}, key)
+		if err == nil {
+			if managed, _ := result["managed"].(bool); !managed {
+				err = fmt.Errorf("node did not apply advertised GPU performance control")
+			}
+		}
+		if err == nil {
+			if reported, _ := result["accelerator_id"].(string); reported != acceleratorID {
+				err = fmt.Errorf("GPU performance result accelerator mismatch")
+			}
+		}
+		if err == nil && !m.acceleratorTargetFencesMatch(targetFences) {
+			err = errTargetFactsChanged
+		}
+		if err == nil || !errors.Is(err, errTargetFactsChanged) {
+			break
+		}
 	}
 	m.mu.Lock()
 	if err != nil {

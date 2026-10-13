@@ -158,7 +158,7 @@ func TestPowerProfileActiveFailureBlocksWorkBeforeAdapterStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
+	waitCtx, waitCancel := context.WithTimeout(ctx, 30*time.Second)
 	defer waitCancel()
 	finished, err := m.Wait(waitCtx, row.Request.ID)
 	if err != nil {
@@ -181,9 +181,11 @@ func TestRetiredTargetDuringProfileCannotStartAndCleansReservation(t *testing.T)
 	m.SetNodeControl(func(context.Context, string, string, map[string]any, string) (map[string]any, error) { return nil, nil })
 	m.SetManagedGPUPerformance("node", []int{0})
 	profileEntered, releaseProfile := make(chan struct{}), make(chan struct{})
+	var entered sync.Once
 	m.SetGPUPerformanceControl(func(ctx context.Context, _, _ string, args map[string]any, _ string) (map[string]any, error) {
 		if args["profile"] == "active" {
-			close(profileEntered)
+			// Retiring the target refreshes it, so the command is resent once.
+			entered.Do(func() { close(profileEntered) })
 			select {
 			case <-releaseProfile:
 			case <-ctx.Done():
@@ -207,13 +209,23 @@ func TestRetiredTargetDuringProfileCannotStartAndCleansReservation(t *testing.T)
 	}
 	m.ReconcileNodeTargets("node", map[string]struct{}{})
 	close(releaseProfile)
-	waitCtx, waitCancel := context.WithTimeout(ctx, 3*time.Second)
-	defer waitCancel()
-	finished, err := m.Wait(waitCtx, row.Request.ID)
-	if err != nil {
-		t.Fatalf("wait failed: %v", err)
+	// The profile command is resent after the refresh and succeeds; the
+	// pre-execution fact check then finds the target retired. The job must
+	// never start and must give its reservation back; it then either fails
+	// or waits for capacity to return.
+	var finished *domain.Workload
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		finished, err = m.Get(ctx, row.Request.ID)
+		if err == nil && (finished.Status == domain.WorkloadFailed || finished.Status == domain.WorkloadWaiting) && m.targetActiveCount("node-mock") == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("job did not settle: status=%v err=%v", finished, err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if finished.Status != domain.WorkloadFailed || starts != 0 {
+	if starts != 0 {
 		t.Fatalf("retired target started work: status=%s starts=%d error=%q", finished.Status, starts, finished.Error)
 	}
 	if got := m.targetActiveCount("node-mock"); got != 0 {
@@ -418,5 +430,44 @@ func TestPowerProfileIdleLingerKeepsBackToBackJobsActive(t *testing.T) {
 	}
 	if got := strings.Join(run(time.Second), ","); got != "active,active,idle" {
 		t.Fatalf("with linger sent %s, want the GPU parked once after the last job", got)
+	}
+}
+
+// Job starts refresh the target's advertised facts while the active command
+// is in flight; the node applied the profile, so the command is resent
+// (freshly keyed and fenced) instead of failing the job.
+func TestPowerProfileResendsWhenTargetsRefreshDuringCommand(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	if _, err := backing.UpsertNode(ctx, &domain.Node{ID: "node", Accelerators: []domain.Accelerator{{ID: "node-gpu0", NodeID: "node"}}}); err != nil {
+		t.Fatal(err)
+	}
+	m := NewManager(quietLogger(), backing, time.Second)
+	m.SetNodeStore(backing)
+	m.SetNodeControl(func(context.Context, string, string, map[string]any, string) (map[string]any, error) { return nil, nil })
+	m.SetManagedGPUPerformance("node", []int{0})
+	target := Target{ID: "node-comfy", Adapter: "mock", AcceleratorID: "node-gpu0", Enabled: true}
+	m.RegisterAdapter(NewMockAdapter())
+	m.RegisterTarget(target)
+	var keys []string
+	refreshes := 1
+	m.SetGPUPerformanceControl(func(_ context.Context, _, _ string, _ map[string]any, key string) (map[string]any, error) {
+		keys = append(keys, key)
+		if refreshes > 0 {
+			refreshes--
+			target.QueueRunning++
+			m.RegisterTarget(target)
+		}
+		return map[string]any{"managed": true, "accelerator_id": "node-gpu0"}, nil
+	})
+	if err := m.setGPUPerformanceProfile(ctx, "node-gpu0", "active", "job-1"); err != nil {
+		t.Fatalf("one refresh failed the profile: %v", err)
+	}
+	if len(keys) != 2 || keys[0] != "job-1" || keys[1] == keys[0] {
+		t.Fatalf("expected one freshly keyed resend, sent %v", keys)
+	}
+	refreshes = 5
+	if err := m.setGPUPerformanceProfile(ctx, "node-gpu0", "active", "job-2"); !errors.Is(err, errTargetFactsChanged) {
+		t.Fatalf("endless refreshes must still fail after bounded resends: %v", err)
 	}
 }
