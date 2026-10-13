@@ -337,6 +337,38 @@ type nativeCheckpointFixture struct {
 	nodeDone    chan error
 	registered  chan struct{}
 	cancel      context.CancelFunc
+	// prefixRelayed closes once the public client has received the victim's
+	// first content. Preempting earlier races the controller's own read of
+	// the prefix: the backend has flushed it, but under load the gateway may
+	// not have parsed it, and the node then rejects the boundary as empty.
+	prefixRelayed chan struct{}
+	relayOnce     sync.Once
+}
+
+// readPublicStream copies a public response body, closing the fixture's
+// prefixRelayed signal when the victim prefix reaches the client.
+func (fixture *nativeCheckpointFixture) readPublicStream(body io.Reader) []byte {
+	var data []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := body.Read(buf)
+		data = append(data, buf[:n]...)
+		if bytes.Contains(data, []byte("VICTIM_PREFIX")) {
+			fixture.relayOnce.Do(func() { close(fixture.prefixRelayed) })
+		}
+		if err != nil {
+			return data
+		}
+	}
+}
+
+func (fixture *nativeCheckpointFixture) waitPrefixRelayed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-fixture.prefixRelayed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("victim prefix did not reach the public client")
+	}
 }
 
 func nativeCheckpointProof(nodeID, targetID string) checkpointRuntime.CheckpointCapabilityProof {
@@ -461,7 +493,7 @@ func newNativeCheckpointFixture(t *testing.T, blockResumed bool) *nativeCheckpoi
 			}
 		}
 	}()
-	fixture := &nativeCheckpointFixture{root: root, backing: backing, manager: manager, adapter: adapter, server: server, gateway: gateway, backend: backend, backendHTTP: backendHTTP, nodeDone: nodeDone, registered: registered, cancel: func() {
+	fixture := &nativeCheckpointFixture{root: root, backing: backing, manager: manager, adapter: adapter, server: server, gateway: gateway, backend: backend, backendHTTP: backendHTTP, nodeDone: nodeDone, registered: registered, prefixRelayed: make(chan struct{}), cancel: func() {
 		cancel()
 		nodeCancel()
 		manager.Close()
@@ -554,7 +586,7 @@ func nativeStartPublicStream(t *testing.T, fixture *nativeCheckpointFixture, bod
 	}
 	chunks := make(chan []byte, 1)
 	go func() {
-		data, _ := io.ReadAll(resp.Body)
+		data := fixture.readPublicStream(resp.Body)
 		resp.Body.Close()
 		chunks <- data
 	}()
@@ -614,6 +646,7 @@ func nativeRunCheckpointedResumedStream(t *testing.T, fixture *nativeCheckpointF
 	case <-time.After(10 * time.Second):
 		t.Fatal("victim did not emit the preemption prefix")
 	}
+	fixture.waitPrefixRelayed(t)
 	nativeWaitFor(t, 10*time.Second, "checkpointed victim running execution", func() bool {
 		rows, err := fixture.backing.ListWorkloads(context.Background())
 		if err != nil {
@@ -660,7 +693,7 @@ func nativeRunCheckpointedResumedStream(t *testing.T, fixture *nativeCheckpointF
 		}
 	}
 	if initial == nil || resumed == nil {
-		t.Fatalf("public stream did not include initial and resumed backend requests: %+v", requests)
+		t.Fatalf("public stream did not include initial and resumed backend requests: %+v RESPONSE=%q", requests, response)
 	}
 	if resumed.Body["cache_prompt"] != true || resumed.Body["continue_final_message"] != true {
 		t.Fatalf("resumed backend request omitted continuation controls: %+v", resumed.Body)
@@ -684,6 +717,7 @@ func TestHTTPAdapterNodeCommandCheckpointContinuationE2E(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("victim did not emit the preemption prefix")
 	}
+	fixture.waitPrefixRelayed(t)
 	nativeWaitFor(t, 10*time.Second, "victim running execution", func() bool {
 		rows, err := fixture.backing.ListWorkloads(context.Background())
 		if err != nil {
@@ -1049,12 +1083,13 @@ func TestNativeNodeCheckpointResumedDisconnectSignsCancelAndRelease(t *testing.T
 		t.Fatal(err)
 	}
 	responseDone := make(chan struct{})
-	go func() { _, _ = io.Copy(io.Discard, response.Body); _ = response.Body.Close(); close(responseDone) }()
+	go func() { fixture.readPublicStream(response.Body); _ = response.Body.Close(); close(responseDone) }()
 	select {
 	case <-fixture.backend.prefixSent:
 	case <-time.After(10 * time.Second):
 		t.Fatal("victim did not emit a prefix before disconnect test")
 	}
+	fixture.waitPrefixRelayed(t)
 	nativeWaitFor(t, 10*time.Second, "victim running execution", func() bool {
 		rows, _ := fixture.backing.ListWorkloads(context.Background())
 		for _, row := range rows {

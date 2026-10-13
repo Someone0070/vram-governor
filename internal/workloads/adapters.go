@@ -2290,6 +2290,10 @@ func (a *HTTPAdapter) ResumeWithLease(ctx context.Context, req domain.WorkloadRe
 	var reused int
 	var reuseErr error
 	deadline := time.Now().Add(3 * time.Second)
+	// A bare break inside the select below only left the select: once ctx was
+	// cancelled every pass returned at once and the loop spun until the
+	// deadline, sending a node command per pass.
+verifyReuse:
 	for time.Now().Before(deadline) {
 		reused, reuseErr = nodeRuntime.VerifyKVReuse(ctx, assignedLease, savedTokens)
 		if reuseErr == nil && reused > 0 {
@@ -2298,7 +2302,7 @@ func (a *HTTPAdapter) ResumeWithLease(ctx context.Context, req domain.WorkloadRe
 		select {
 		case <-ctx.Done():
 			reuseErr = ctx.Err()
-			break
+			break verifyReuse
 		case <-time.After(50 * time.Millisecond):
 		}
 	}
