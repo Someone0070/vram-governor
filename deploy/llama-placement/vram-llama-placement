@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Place each llama.cpp router model on one GPU or across several.
+
+Runs before every llama-server start (ExecStartPre), so placement follows
+the cards that are actually installed and the context size of the active
+runtime profile. For each model it estimates the VRAM it needs (weights +
+KV cache for the configured context + a working margin):
+
+* fits the primary GPU          -> pinned there (other cards stay free)
+* fits all GPUs together        -> split by layers, weighted by VRAM, with
+                                   llama.cpp's auto-fit off (it misjudges
+                                   cards without Resizable BAR and parked
+                                   their share in system RAM)
+* fits nowhere                  -> primary GPU with auto-fit (CPU spill)
+
+Hand-written settings live in the base file and always win; the generated
+presets are the base plus the placement keys.
+
+Split ratios are calibrated, not guessed: some layer boundaries of hybrid
+models run at half speed, and which ones differs per model (27B on a 4070
+SUPER + 6900 XT: 9 tok/s at 11:16 but 24.5 at 12:15). --calibrate benchmarks
+candidate ratios for every split model and caches the fastest per model file
+and card set; without a cached result the primary GPU is filled first (it
+also processes prompts fastest). Run --calibrate with llama-server stopped
+after adding models or changing cards.
+
+usage: vram-llama-placement [--dry-run | --calibrate]
+"""
+
+import configparser
+import io
+import json
+import os
+import re
+import struct
+import subprocess
+import sys
+
+MODELS_DIR = os.environ.get("VG_LLAMA_MODELS_DIR", "/etc/vram-governor/llama-models")
+BASE = os.environ.get("VG_LLAMA_PRESETS_BASE", "/etc/vram-governor/llama-presets.base.ini")
+OUT = os.environ.get("VG_LLAMA_PRESETS", "/etc/vram-governor/llama-presets.ini")
+SERVER = os.environ.get("VG_LLAMA_SERVER", "/root/llama.cpp-mixed/build/bin/llama-server")
+RESERVE_MIB = int(os.environ.get("VG_LLAMA_RESERVE_MIB", "512"))
+CALIBRATION = os.environ.get("VG_LLAMA_CALIBRATION", "/var/lib/vram-governor/llama-placement-calibration.json")
+CACHE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
+GIB = 1 << 30
+
+
+def read_gguf_metadata(path):
+    """Scalar metadata of a GGUF file (arrays are skipped, except int arrays)."""
+    scalar = {0: "<B", 1: "<b", 2: "<H", 3: "<h", 4: "<I", 5: "<i", 6: "<f", 7: "<?", 10: "<Q", 11: "<q", 12: "<d"}
+    meta = {}
+    with open(path, "rb") as f:
+        if f.read(4) != b"GGUF":
+            raise ValueError("not a GGUF file")
+        version, = struct.unpack("<I", f.read(4))
+        if version < 2:
+            raise ValueError("GGUF v1 is not supported")
+        _, kv_count = struct.unpack("<QQ", f.read(16))
+
+        def string():
+            n, = struct.unpack("<Q", f.read(8))
+            return f.read(n).decode("utf-8", "replace")
+
+        def value(kind):
+            if kind == 8:
+                return string()
+            if kind == 9:
+                inner, count = struct.unpack("<IQ", f.read(12))
+                if inner == 8:
+                    for _ in range(count):
+                        n, = struct.unpack("<Q", f.read(8))
+                        f.seek(n, io.SEEK_CUR)
+                    return None
+                fmt = scalar[inner]
+                size = struct.calcsize(fmt)
+                if inner in (0, 1, 2, 3, 4, 5, 10, 11) and count <= 4096:
+                    return [struct.unpack(fmt, f.read(size))[0] for _ in range(count)]
+                f.seek(size * count, io.SEEK_CUR)
+                return None
+            fmt = scalar[kind]
+            return struct.unpack(fmt, f.read(struct.calcsize(fmt)))[0]
+
+        for _ in range(kv_count):
+            key = string()
+            kind, = struct.unpack("<I", f.read(4))
+            meta[key] = value(kind)
+    return meta
+
+
+def kv_cache_bytes(meta, context, k_type, v_type):
+    arch = meta.get("general.architecture", "")
+    get = lambda name, default=None: meta.get(f"{arch}.{name}", default)
+    layers = int(get("block_count", 0) or 0)
+    heads = get("attention.head_count", 0) or 0
+    heads = max(heads) if isinstance(heads, list) else heads
+    kv_heads = get("attention.head_count_kv", heads)
+    embedding = get("embedding_length", 0) or 0
+    head_dim = get("attention.key_length") or (embedding // heads if heads else 0)
+    value_dim = get("attention.value_length") or head_dim
+    if isinstance(kv_heads, list):
+        per_layer = [h for h in kv_heads[:layers] if h]
+    else:
+        per_layer = [kv_heads] * layers
+    interval = get("full_attention_interval")
+    if interval:
+        # Hybrid models keep a KV cache only on their full-attention layers.
+        per_layer = per_layer[::max(1, int(interval))]
+    k = CACHE_BYTES.get(k_type, 2.0)
+    v = CACHE_BYTES.get(v_type, 2.0)
+    return int(sum(h * (head_dim * k + value_dim * v) for h in per_layer) * context)
+
+
+def devices():
+    """[(name, total_mib)] for llama.cpp's devices, one entry per physical card."""
+    try:
+        out = subprocess.run([SERVER, "--list-devices"], capture_output=True, text=True, timeout=60).stdout
+    except Exception:
+        return []
+    found = []
+    for line in out.splitlines():
+        match = re.match(r"\s+(\w+): (.+?) \((\d+) MiB, \d+ MiB free\)", line)
+        if match:
+            found.append((match.group(1), match.group(2), int(match.group(3))))
+    cards = []
+    for name, label, total in sorted(found, key=lambda d: not d[0].startswith("CUDA")):
+        card = re.sub(r"\s*\(.*\)$", "", label)
+        if card not in [c[1] for c in cards]:
+            cards.append((name, card, total))
+    return [(name, total) for name, _, total in cards]
+
+
+def models():
+    """{model_id: weights_path}, as the router names them."""
+    out = {}
+    for entry in sorted(os.listdir(MODELS_DIR)):
+        path = os.path.join(MODELS_DIR, entry)
+        if entry.endswith(".gguf"):
+            out[entry[:-5]] = path
+        elif os.path.isdir(path):
+            weights = [f for f in sorted(os.listdir(path)) if f.endswith(".gguf") and not f.startswith("mmproj")]
+            if weights:
+                out[entry] = os.path.join(path, weights[0])
+    return out
+
+
+def placement(model, path, base, cards, context):
+    options = base[model] if base.has_section(model) else {}
+    if options.get("placement") == "single" and cards:
+        return {"device": cards[0][0]}, "placement = single (base file) -> " + cards[0][0]
+    if options.get("embeddings") in ("1", "true", "on") or not cards:
+        return {"device": cards[0][0]} if cards else {}, "embedding model"
+    weights = os.path.getsize(path)
+    try:
+        meta = read_gguf_metadata(path)
+        kv = kv_cache_bytes(meta, context, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16"))
+    except Exception as error:
+        return {"device": cards[0][0]}, f"metadata unreadable ({error}); primary GPU"
+    # Margin calibrated on the RTX 4070 SUPER: qwen2.5-14b (8.4 GiB weights,
+    # 1.7 GiB q4_0 KV at 32k) runs fully on the card using 10.0 GiB.
+    need = weights + kv + GIB // 2 + weights // 50
+    capacities = [(name, (total - RESERVE_MIB) << 20) for name, total in cards]
+    note = f"weights {weights / GIB:.1f} GiB + KV {kv / GIB:.1f} GiB at ctx {context} = {need / GIB:.1f} GiB"
+    if need <= capacities[0][1] or len(cards) == 1:
+        return {"device": cards[0][0]}, note + f" -> {cards[0][0]}"
+    if need <= sum(c for _, c in capacities):
+        names = ",".join(n for n, _ in capacities)
+        cached = load_calibration().get(calibration_key(model, path, cards))
+        if cached:
+            return ({"device": names, "tensor-split": cached["tensor_split"], "n-gpu-layers": "99", "fit": "off"},
+                    note + f" -> split {names} ({cached['tensor_split']}, calibrated {cached['tg']:.1f} tok/s)")
+        split = split_candidates(need, capacities)[0]
+        return {"device": names, "tensor-split": split, "n-gpu-layers": "99", "fit": "off"}, note + f" -> split {names} ({split}, uncalibrated)"
+    # Fits nowhere: fill every GPU with as many layers as fit and leave only
+    # the rest to the CPU. System RAM is 10-20x slower than VRAM, so each GB
+    # kept off the CPU matters (29 GB 27B: 2.2 tok/s on one card with spill,
+    # 5.6 with both cards full).
+    layers = int(meta.get(f"{meta.get('general.architecture', '')}.block_count", 0) or 0)
+    if layers <= 0:
+        return {"device": cards[0][0]}, note + f" -> {cards[0][0]} with CPU spill (exceeds all GPUs)"
+    per_layer = weights / (layers + 1)
+    budget = sum(c for _, c in capacities) - kv - GIB // 2 - per_layer
+    gpu_layers = max(0, min(layers, int(budget // per_layer)))
+    names = ",".join(n for n, _ in capacities)
+    gpu_need = int(gpu_layers * per_layer + kv + GIB // 2)
+    cached = load_calibration().get(calibration_key(model, path, cards))
+    split = cached["tensor_split"] if cached else split_candidates(gpu_need, capacities)[0]
+    return ({"device": names, "tensor-split": split, "n-gpu-layers": str(gpu_layers), "fit": "off"},
+            note + f" -> {gpu_layers}/{layers} layers on {names} ({split}{', calibrated' if cached else ''}), rest on the CPU")
+
+
+def split_candidates(need, capacities):
+    """tensor-split values from "fill the primary GPU" to proportional to VRAM."""
+    primary, rest = capacities[0][1], capacities[1:]
+    rest_total = sum(c for _, c in rest)
+    shares = [min(0.97, primary / need) * k for k in (1.0, 0.9, 0.8, 0.7)]
+    shares.append(primary / (primary + rest_total))
+    out = []
+    for share in shares:
+        if need * (1 - share) > rest_total:
+            continue
+        parts = [round(share * 100)] + [max(1, round((1 - share) * 100 * c / rest_total)) for _, c in rest]
+        value = ",".join(str(p) for p in parts)
+        if value not in out:
+            out.append(value)
+    return out or [",".join(str(max(1, round(c / GIB))) for _, c in capacities)]
+
+
+def calibration_key(model, path, cards):
+    stat = os.stat(path)
+    return "|".join([model, str(stat.st_size), str(int(stat.st_mtime)), ";".join(f"{n}:{t}" for n, t in cards)])
+
+
+def load_calibration():
+    try:
+        with open(CALIBRATION) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def calibrate(base, cards, context):
+    bench = os.path.join(os.path.dirname(SERVER), "llama-bench")
+    results = load_calibration()
+    for model, path in models().items():
+        placed, note = placement(model, path, base, cards, context)
+        if "tensor-split" not in placed:
+            continue
+        weights = os.path.getsize(path)
+        capacities = [(name, (total - RESERVE_MIB) << 20) for name, total in cards]
+        try:
+            meta = read_gguf_metadata(path)
+            options = base[model] if base.has_section(model) else {}
+            need = weights + kv_cache_bytes(meta, context, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16")) + GIB // 2 + weights // 50
+        except Exception:
+            continue
+        tried = []
+        gpu_layers = placed.get("n-gpu-layers", "99")
+        if gpu_layers != "99":
+            layers = int(meta.get(f"{meta.get('general.architecture', '')}.block_count", 0) or 1)
+            need = int(int(gpu_layers) * weights / (layers + 1) + (need - weights))
+        for split in split_candidates(need, capacities):
+            command = [bench, "-m", path, "-dev", placed["device"].replace(",", "/"), "-ts", split.replace(",", "/"),
+                       "-ngl", gpu_layers, "-fa", "1", "-p", "128", "-n", "64", "-r", "1", "-o", "json"]
+            try:
+                out = subprocess.run(command, capture_output=True, text=True, timeout=900).stdout
+                runs = json.loads(out[out.index("["):]) if "[" in out else []
+            except Exception:
+                runs = []
+            tg = next((r.get("avg_ts", 0) for r in runs if r.get("n_gen", 0) > 0), 0)
+            pp = next((r.get("avg_ts", 0) for r in runs if r.get("n_prompt", 0) > 0 and r.get("n_gen", 0) == 0), 0)
+            tried.append({"tensor_split": split, "tg": tg, "pp": pp})
+            print(f"{model}: tensor-split {split}: {tg:.1f} tok/s generation, {pp:.0f} tok/s prompt", flush=True)
+        best = max(tried, key=lambda r: (round(r["tg"], 0), r["pp"]), default=None)
+        if best and best["tg"] > 0:
+            results[calibration_key(model, path, cards)] = dict(best, tried=tried)
+            print(f"{model}: chose {best['tensor_split']}", flush=True)
+    os.makedirs(os.path.dirname(CALIBRATION), exist_ok=True)
+    tmp = CALIBRATION + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(results, f, indent=1)
+    os.replace(tmp, CALIBRATION)
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv
+    base = configparser.ConfigParser(interpolation=None, strict=False)
+    base.optionxform = str
+    if os.path.exists(BASE):
+        base.read(BASE)
+    context = int(os.environ.get("LLAMA_CTX_SIZE") or 32768)
+    cards = devices()
+    if "--calibrate" in sys.argv:
+        calibrate(base, cards, context)
+        return
+    lines = ["; Generated by vram-llama-placement before each llama-server start.",
+             "; Edit %s instead; its settings always win." % BASE,
+             "; GPUs: " + (", ".join(f"{n} {t} MiB" for n, t in cards) or "none found"), ""]
+    # "placement" is this tool's own key; llama-server would reject it.
+    sections = {s: {k: v for k, v in base[s].items() if k != "placement"} for s in base.sections()}
+    for model, path in models().items():
+        placed, note = placement(model, path, base, cards, context)
+        merged = dict(placed)
+        merged.update(sections.pop(model, {}))
+        lines += [f"; {note}", f"[{model}]"] + [f"{k} = {v}" for k, v in merged.items()] + [""]
+    for model, options in sections.items():
+        lines += [f"[{model}]"] + [f"{k} = {v}" for k, v in options.items()] + [""]
+    text = "\n".join(lines)
+    if dry_run:
+        print(text)
+        return
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, OUT)
+
+
+if __name__ == "__main__":
+    main()
