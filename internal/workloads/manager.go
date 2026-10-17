@@ -6827,7 +6827,15 @@ func (m *Manager) recordProviderSuccess(target Target) {
 // an adapter, persists the failed-target cooldown, and caps total attempts.
 func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Workload, target Target, failure error) bool {
 	retryAt, retryable := m.recordProviderFailure(target, failure)
-	if !retryable || !workload.Request.Recoverable || workload.ExecutionAttempts >= 4 {
+	notLoaded := backendModelNotLoaded(failure)
+	if notLoaded {
+		// The runtime dropped a model the LB recorded as resident (unloaded or
+		// crashed outside the LB). Nothing ran, so any request may retry at
+		// once; marking the model cold makes admission load it again.
+		m.markModelNotResident(ctx, target, workloadModel(workload))
+		retryAt, retryable = time.Now().UTC(), true
+	}
+	if !retryable || !workload.Request.Recoverable && !notLoaded || workload.ExecutionAttempts >= 4 {
 		return false
 	}
 	latest, err := m.store.GetWorkload(ctx, workload.Request.ID)
@@ -6865,6 +6873,48 @@ func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Wor
 	m.audit(ctx, latest.Request.OwnerID, latest.Request.ID, "workload.provider_fallback", "warn", map[string]any{"failed_target": target.ID, "retry_after": retryAt, "attempt": latest.ExecutionAttempts, "error": failure.Error()})
 	m.signal()
 	return true
+}
+
+// backendModelNotLoaded reports llama.cpp's rejection of a request for a
+// model that is not loaded (its router answers 400 before running anything).
+func backendModelNotLoaded(failure error) bool {
+	var backend *BackendError
+	return errors.As(failure, &backend) && backend.Status == 400 && strings.Contains(backend.Message, "model is not loaded")
+}
+
+func workloadModel(workload *domain.Workload) string {
+	var body struct {
+		Model string `json:"model"`
+	}
+	_ = json.Unmarshal(workload.Request.Payload, &body)
+	return body.Model
+}
+
+// markModelNotResident records a hot model as cold after the runtime proved
+// it absent, through the residency revision CAS.
+func (m *Manager) markModelNotResident(ctx context.Context, target Target, model string) {
+	if model == "" || !target.SupportsModelLifecycle {
+		return
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		residency, err := m.store.GetModelResidency(ctx, target.ID, model)
+		if err != nil || residency.ObservedTier != domain.ResidencyHotVRAM {
+			return
+		}
+		expected := residency.Revision
+		residency.ObservedTier = domain.ResidencyColdDisk
+		if normalizeErr := normalizeResidencyTier(residency, residency.ObservedTier, residency.WarmModelBytes, residency.WarmModelBytesVerified); normalizeErr != nil {
+			return
+		}
+		residency.LastError = "runtime reported the model not loaded"
+		residency.UpdatedAt = time.Now().UTC()
+		residency.TargetGeneration = m.targetGeneration(target.ID)
+		residency.ExecutionFingerprint = targetExecutionFingerprint(m.targetByID(target.ID))
+		if _, casErr := m.store.CompareAndSwapModelResidency(ctx, residency, expected); casErr == nil {
+			m.log.Info("model was not loaded on its runtime; marked cold", "target", target.ID, "model", model)
+			return
+		}
+	}
 }
 
 func (m *Manager) availableSlots(target Target) int {

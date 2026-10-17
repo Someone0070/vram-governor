@@ -2276,3 +2276,34 @@ func TestReclaimForeignLifecycleTargetHonoursOnlyFreshBusyCounters(t *testing.T)
 		}
 	}
 }
+
+// A completed load outranks an advertisement that omits the model only
+// briefly; afterwards the node's report wins, so a model unloaded or crashed
+// outside the LB is no longer treated as resident forever.
+func TestFencedHotTransitionOutranksOmissionOnlyBriefly(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	target := Target{ID: "router", Adapter: "llamacpp", Enabled: true}
+	identity := strings.Join([]string{target.ID, target.Adapter, target.RuntimeProtocol, target.CapabilityVersion, target.ModelFingerprint}, "|")
+	put := func(id string, tier domain.ResidencyTier, finished time.Time) {
+		t.Helper()
+		row := &domain.ResidencyTransition{ID: id, IdempotencyKey: id, TargetID: target.ID, Model: "model", FromTier: domain.ResidencyColdDisk, ToTier: tier,
+			Status: domain.ResidencyTransitionSucceeded, ObservedTier: tier, ObservedFence: 3, RuntimeIdentity: identity, CreatedAt: finished, FinishedAt: &finished}
+		if _, created, err := backing.CreateResidencyTransition(ctx, row); err != nil || !created {
+			t.Fatalf("insert %s: created=%v err=%v", id, created, err)
+		}
+	}
+	put("old-load", domain.ResidencyHotVRAM, time.Now().Add(-10*time.Minute))
+	if mgr.hasFencedHotTransition(ctx, target, "model") {
+		t.Fatal("a load from ten minutes ago still outranks the node's report")
+	}
+	put("fresh-load", domain.ResidencyHotVRAM, time.Now().Add(-10*time.Second))
+	if !mgr.hasFencedHotTransition(ctx, target, "model") {
+		t.Fatal("a just-finished load must survive an advertisement collected before it")
+	}
+	put("unload", domain.ResidencyColdDisk, time.Now().Add(-5*time.Second))
+	if mgr.hasFencedHotTransition(ctx, target, "model") {
+		t.Fatal("an older load outranked the latest (unload) transition")
+	}
+}

@@ -476,20 +476,33 @@ func (m *Manager) observeTargetResidency(ctx context.Context, target Target) boo
 // is merely lagging an exact, signed lifecycle result. A durable hot row by
 // itself is not proof: after a restart or physical removal, reusing it would
 // permit a cold start and skip the required load/recheck.
+// fencedHotGrace is how long a completed load outranks an advertisement that
+// omits the model: an advertisement collected just before the load finished
+// must not undo it. Nodes re-advertise every 30 s, so after a few cycles the
+// omission is authoritative (the model was unloaded or its process died).
+var fencedHotGrace = 90 * time.Second
+
 func (m *Manager) hasFencedHotTransition(ctx context.Context, target Target, model string) bool {
 	transitions, err := m.store.ListResidencyTransitions(ctx, -1)
 	if err != nil {
 		return false
 	}
+	// Only the latest finished transition counts. Any hot load in the past
+	// used to count forever, so a model unloaded or crashed outside the LB
+	// stayed "hot" and every request for it failed with "model is not loaded".
+	var latest *domain.ResidencyTransition
 	for _, transition := range transitions {
-		if transition == nil || transition.TargetID != target.ID || transition.Model != model || transition.ToTier != domain.ResidencyHotVRAM || transition.FinishedAt == nil {
+		if transition == nil || transition.TargetID != target.ID || transition.Model != model || transition.FinishedAt == nil {
 			continue
 		}
-		if validateAuthoritativeTransitionEvidence(transition, target, model, domain.ResidencyHotVRAM) == nil {
-			return true
+		if latest == nil || transition.FinishedAt.After(*latest.FinishedAt) {
+			latest = transition
 		}
 	}
-	return false
+	if latest == nil || latest.ToTier != domain.ResidencyHotVRAM || time.Since(*latest.FinishedAt) > fencedHotGrace {
+		return false
+	}
+	return validateAuthoritativeTransitionEvidence(latest, target, model, domain.ResidencyHotVRAM) == nil
 }
 
 func (m *Manager) observeTargetResidencyLocked(ctx context.Context, target Target) bool {

@@ -6989,3 +6989,36 @@ func TestFreedAcceleratorGoesToHigherPriorityAcrossTargets(t *testing.T) {
 		}()
 	}
 }
+
+// llama.cpp answers 400 "model is not loaded" when a model the LB recorded
+// as resident is gone (unloaded or crashed outside the LB). Nothing ran, so
+// even a non-recoverable request is requeued, and the model is marked cold
+// so admission loads it again instead of failing every request.
+func TestModelNotLoadedRequeuesAndMarksModelCold(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	m := NewManager(quietLogger(), backing, time.Second)
+	target := Target{ID: "router", Adapter: "llamacpp", Enabled: true, SupportsModelLifecycle: true}
+	m.RegisterTarget(target)
+	if _, err := backing.UpsertModelResidency(ctx, &domain.ModelResidency{TargetID: target.ID, Model: "m", Policy: domain.ResidencyAuto, DesiredTier: domain.ResidencyHotVRAM, ObservedTier: domain.ResidencyHotVRAM}); err != nil {
+		t.Fatal(err)
+	}
+	w := &domain.Workload{Request: domain.WorkloadRequest{ID: "chat", OwnerID: "o", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"m"}`)}, Status: domain.WorkloadRunning}
+	if _, _, err := backing.CreateWorkload(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	failure := &BackendError{TargetID: target.ID, Status: 400, Message: `llama backend returned 400: {"error":{"code":400,"message":"model is not loaded"}}`}
+	if !m.retryProviderFailure(ctx, w, target, failure) {
+		t.Fatal("a not-loaded rejection was not retried")
+	}
+	if latest, _ := backing.GetWorkload(ctx, "chat"); latest.Status != domain.WorkloadQueued {
+		t.Fatalf("workload status %s, want queued", latest.Status)
+	}
+	if row, _ := backing.GetModelResidency(ctx, target.ID, "m"); row.ObservedTier != domain.ResidencyColdDisk {
+		t.Fatalf("model still recorded %s", row.ObservedTier)
+	}
+	other := &BackendError{TargetID: target.ID, Status: 400, Message: "llama backend returned 400: bad request"}
+	if m.retryProviderFailure(ctx, w, target, other) {
+		t.Fatal("an ordinary 400 was retried")
+	}
+}
