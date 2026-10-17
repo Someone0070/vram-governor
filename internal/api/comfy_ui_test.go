@@ -231,3 +231,39 @@ func TestComfyUICookieRequestsNeedTheirOwnOrigin(t *testing.T) {
 		t.Fatalf("ComfyUI got %d prompts, want 1", len(fake.prompts))
 	}
 }
+
+// On the trusted LAN the ComfyUI app needs no token; elsewhere it does, and
+// state-changing requests still need this origin.
+func TestComfyUILANBrowsersNeedNoToken(t *testing.T) {
+	srv, fake, done := comfyUITestServer(t)
+	defer done()
+	srv.cfg.ComfyUI.LANCredential = "alice"
+	request := func(method, path, remote, origin string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(`{"prompt":{"1":{"class_type":"SaveImage","inputs":{}}},"client_id":"b"}`))
+		req.RemoteAddr = remote
+		req.Header.Set("Accept", "text/html")
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := request(http.MethodGet, "/comfy/api/object_info", "127.0.0.1:5000", ""); code != http.StatusOK {
+		t.Fatalf("LAN browser refused: %d", code)
+	}
+	if code := request(http.MethodGet, "/comfy/api/object_info", "203.0.113.9:5000", ""); code != http.StatusFound {
+		t.Fatalf("outside browser not sent to login: %d", code)
+	}
+	if code := request(http.MethodPost, "/comfy/api/prompt", "127.0.0.1:5000", "https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-site POST from a LAN browser accepted: %d", code)
+	}
+	if code := request(http.MethodPost, "/comfy/api/prompt", "127.0.0.1:5000", "http://example.com"); code != http.StatusOK {
+		t.Fatalf("same-origin LAN POST refused: %d", code)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.prompts) != 1 {
+		t.Fatalf("ComfyUI got %d prompts, want 1", len(fake.prompts))
+	}
+}

@@ -53,6 +53,9 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 	}
 	p, ok := s.authenticate(r)
 	if !ok {
+		p, ok = s.comfyUILANPrincipal(r)
+	}
+	if !ok {
 		if r.Method == http.MethodGet && strings.Contains(r.Header.Get("Accept"), "text/html") {
 			http.Redirect(w, r, comfyUIPrefix+"/login", http.StatusFound)
 			return
@@ -107,6 +110,20 @@ func comfyUIBlocked(route string) bool {
 		}
 	}
 	return false
+}
+
+// comfyUILANPrincipal signs in browsers on the trusted home network without
+// a token, as the configured credential.
+func (s *Server) comfyUILANPrincipal(r *http.Request) (Principal, bool) {
+	if s.cfg.ComfyUI.LANCredential == "" || !s.adminRemoteAllowed(r) {
+		return Principal{}, false
+	}
+	for _, credential := range s.credentials {
+		if credential.principal.ID == s.cfg.ComfyUI.LANCredential {
+			return credential.principal, true
+		}
+	}
+	return Principal{}, false
 }
 
 func (s *Server) comfyUIProxy(path string) http.Handler {

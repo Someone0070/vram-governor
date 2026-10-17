@@ -43,9 +43,12 @@ type Config struct {
 	// ComfyUI serves the ComfyUI web app at /comfy/: the page and its
 	// read-only API come from Upstream, while queueing goes through the
 	// scheduler pinned to TargetID (a workloads target with comfy_ui: true).
+	// LANCredential, when set, signs browsers from auth.admin_private_cidrs
+	// in as that credential without a token.
 	ComfyUI struct {
-		Upstream string `yaml:"upstream"`
-		TargetID string `yaml:"target_id"`
+		Upstream      string `yaml:"upstream"`
+		TargetID      string `yaml:"target_id"`
+		LANCredential string `yaml:"lan_credential"`
 	} `yaml:"comfy_ui"`
 	Workloads struct {
 		LeaseTTLSeconds                int                          `yaml:"lease_ttl_seconds"`
