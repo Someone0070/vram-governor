@@ -193,6 +193,48 @@ def placement(model, path, base, cards, context):
             note + f" -> {gpu_layers}/{layers} layers on {names} ({split}{', calibrated' if cached else ''}), rest on the CPU")
 
 
+FIT_CACHE = os.environ.get("VG_LLAMA_FIT_CACHE", "/var/lib/vram-governor/llama-fit-cache.json")
+
+
+def fitted_context(path, device, slots, options, cards, context=None):
+    """llama.cpp's own answer for one device: (n_ctx, n_gpu_layers) or None.
+
+    llama-fit-params knows the real footprint (compute buffers, per-slot
+    recurrent state) and keeps every layer on the GPU (-ngl -1) when it can;
+    with the context left unset it picks the largest one that fits. Cached
+    per model file, card set and settings.
+    """
+    binary = os.path.join(os.path.dirname(SERVER), "llama-fit-params")
+    if not os.path.exists(binary):
+        return None
+    stat = os.stat(path)
+    args = ["-m", path, "-dev", device, "-np", str(slots), "-fa", "on"]
+    for key, flag in (("cache-type-k", "-ctk"), ("cache-type-v", "-ctv")):
+        if options.get(key):
+            args += [flag, options[key]]
+    if context:
+        args += ["-c", str(context)]
+    key = "|".join([path, str(stat.st_size), str(int(stat.st_mtime)), ";".join(f"{n}:{t}" for n, t in cards)] + args[2:])
+    try:
+        with open(FIT_CACHE) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    if key not in cache:
+        try:
+            out = subprocess.run([binary] + args, capture_output=True, text=True, timeout=120).stdout
+            match = re.search(r"-c (\d+) -ngl (-?\d+)", out)
+            cache[key] = [int(match.group(1)), int(match.group(2))] if match else None
+        except Exception:
+            return None
+        os.makedirs(os.path.dirname(FIT_CACHE), exist_ok=True)
+        tmp = FIT_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f)
+        os.replace(tmp, FIT_CACHE)
+    return tuple(cache[key]) if cache[key] else None
+
+
 def context_pool(model, path, placed, base, cards):
     """Shared context pool for a placed model: (pool_tokens, slots, max_request).
 
@@ -214,10 +256,30 @@ def context_pool(model, path, placed, base, cards):
     margin = GIB // 2 + weights // 50
     layers = int(meta.get(f"{arch}.block_count", 0) or 0)
     gpu_layers = int(placed.get("n-gpu-layers", "99"))
+    if len(names) == 1:
+        # One device: llama.cpp sizes the pool itself (the estimate below
+        # missed per-slot state: a 4B pool sized to 210k tokens with 8 slots
+        # made auto-fit move layers to the CPU, 104 -> 38 tok/s).
+        fitted = fitted_context(path, names[0], slots, options, cards)
+        if fitted and fitted[1] == -1:
+            pool = fitted[0]
+            if pool >= trained:
+                bigger = fitted_context(path, names[0], slots, options, cards, context=trained * slots)
+                if bigger and bigger[1] == -1:
+                    pool = trained * slots
+            pool -= pool % 256
+            slots = max(1, min(slots, pool // 2048))
+            return pool, slots, min(trained, pool), {}
+        if fitted:
+            # Not every layer fits even at the smallest context: use
+            # llama.cpp's own layer count and context for the CPU spill.
+            pool = max(2048, min(fitted[0], 16384))
+            return pool, 2, min(trained, pool), {"n-gpu-layers": str(fitted[1])}
     single_spill = len(names) == 1 and weights + margin > capacities.get(names[0], 0)
     if layers and gpu_layers < layers or single_spill:
         # Partly on the CPU: keep the KV small, it competes with the layers.
         pool, slots = min(trained, 16384), 2
+        return pool, slots, min(trained, pool), {}
     elif len(names) > 1:
         shares = [float(x) for x in placed["tensor-split"].split(",")]
         total = sum(shares)
@@ -231,7 +293,7 @@ def context_pool(model, path, placed, base, cards):
     if pool < 2048:
         pool = 2048
     slots = max(1, min(slots, pool // 2048))
-    return pool, slots, min(trained, pool)
+    return pool, slots, min(trained, pool), {}
 
 
 def split_candidates(need, capacities):
@@ -327,8 +389,9 @@ def main():
     for model, path in models().items():
         placed, note = placement(model, path, base, cards, MIN_CONTEXT)
         try:
-            pool, slots, max_request = context_pool(model, path, placed, base, cards)
+            pool, slots, max_request, extra = context_pool(model, path, placed, base, cards)
             placed.update({"ctx-size": str(pool), "parallel": str(slots), "kv-unified": "1"})
+            placed.update(extra)
             pools[model] = {"pool_tokens": pool, "slots": slots, "max_request_tokens": max_request}
             note += f"; pool {pool} tokens, {slots} slots, up to {max_request} per request"
         except Exception as error:

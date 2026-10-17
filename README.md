@@ -370,6 +370,8 @@ binding in the private `governor` object:
 }
 ```
 
+On targets with per-model context pools (see `deploy/llama-placement`), `GET /v1/models` reports each model's per-request maximum as `governor.max_context_tokens`; requests reserve `context_tokens` (never less than the prompt itself) plus `max_tokens` from the model's pool, wait when it is full, and get HTTP 400 `context_length_exceeded` beyond the maximum.
+
 `context_tokens` is the bounded input/prompt budget; the scheduler adds the
 maximum output budget before testing a target's limit. `sticky` binds the same
 owner, adapter, and placement key to its previously selected target, and waits

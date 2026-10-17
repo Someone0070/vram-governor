@@ -16,6 +16,28 @@ model's size and KV-cache shape from its GGUF metadata:
 RX 6900 XT on this X99 board (no Resizable BAR, 256 MiB CPU-visible VRAM) and
 put its share in system RAM (0.5 tok/s instead of 20).
 
+## Context pools
+
+Each model also gets one shared context pool (llama.cpp's unified KV cache)
+instead of fixed slots: `ctx-size` is the pool, `parallel` the number of
+concurrent requests, `kv-unified = 1`. Requests draw tokens from the pool, so
+many short chats run side by side while one long-context job can use most of
+it. The pools are written to `/etc/vram-governor/llama-model-pools.json`; the
+node agent advertises them (`model_pools_file`) and the controller admits a
+request if its context (`governor.context_tokens`, at least ~4 bytes of
+payload per token, plus `max_tokens` or 2048) fits the model's per-request
+maximum and the pool's unreserved tokens. A request beyond the per-request
+maximum gets HTTP 400 `context_length_exceeded`; a full pool makes it wait.
+
+Single-GPU pools come from `llama-fit-params` (llama.cpp's own projection,
+cached in `/var/lib/vram-governor/llama-fit-cache.json`): the largest context
+that keeps every layer on the GPU with 1 GiB free. An estimate that missed the
+per-slot state (4B, 210k tokens, 8 slots) made llama.cpp move layers to the
+CPU: 104 -> 38 tok/s. Split models use the tool's estimate with auto-fit off
+(llama.cpp's fit refuses a fixed tensor split), so a wrong pool fails the load
+instead of slowing it down. The router command line must not set
+`--ctx-size`/`--parallel`: they override every model's preset.
+
 Hand-written settings (embedding mode, KV-cache types, `placement = single`
 to keep a model on the primary GPU, ...) go in
 `/etc/vram-governor/llama-presets.base.ini` and always win; the router reads
@@ -34,7 +56,7 @@ rsync -a --exclude build /root/llama.cpp/ /root/llama.cpp-mixed/
 cd /root/llama.cpp-mixed
 cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DGGML_CUDA_FA=ON -DGGML_VULKAN=ON \
   -DCMAKE_CUDA_ARCHITECTURES="86;89" -DGGML_NATIVE=ON -DLLAMA_CURL=OFF
-cmake --build build -j8 --target llama-server llama-bench
+cmake --build build -j8 --target llama-server llama-bench llama-fit-params
 ```
 
 The AMD card must be visible in the container (`/dev/dri`, `/dev/kfd`, cgroup
