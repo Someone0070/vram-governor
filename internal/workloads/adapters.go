@@ -568,11 +568,12 @@ func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadReque
 	}
 	if a.kind == "llama" {
 		// Local requests reserve context from the model's shared pool, where
-		// one token per byte (3-4x too many) would starve concurrency. Clients
+		// one token per byte (3-4x too many) would starve concurrency; ~4 bytes per
+		// token is typical (an underestimate is caught by the overflow retry). Clients
 		// that know better send governor.context_tokens and max_tokens.
 		// A declared budget below what the prompt itself needs would
 		// overbook the pool ("Context size has been exceeded").
-		if estimated := len(req.Payload)/3 + 1; contextTokens < estimated {
+		if estimated := len(req.Payload)/4 + 1; contextTokens < estimated {
 			contextTokens = estimated
 		}
 		if maxOutput <= 0 {

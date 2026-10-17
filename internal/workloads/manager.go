@@ -4943,6 +4943,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 
 	var blockers []string
 	loadFailures := 0
+	contextTooLarge := 0
 	// Codes are recorded where the cause is known; blockers without an entry
 	// fall back to ClassifyBlocker when the decision is built.
 	blockerCodes := map[string]domain.AdmissionBlocker{}
@@ -5194,6 +5195,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			if req.ContextTokens > pool.MaxRequestTokens {
 				unlockAdmission()
 				blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, fmt.Sprintf("%s: %s accepts at most %d context tokens per request, %d required", target.ID, req.Model, pool.MaxRequestTokens, req.ContextTokens)))
+				contextTooLarge++
 				continue
 			}
 		} else if req.ContextTokens > 0 && target.ContextLimit > 0 && req.ContextTokens > target.ContextLimit {
@@ -5759,7 +5761,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		codes = append(codes, code)
 	}
 	blockerCode := dominantBlockerCode(codes)
-	permanentlyBlocked := loadFailures > 0
+	// A model's per-request maximum is fixed: a request beyond it on every
+	// route would only wait until its deadline.
+	permanentlyBlocked := loadFailures > 0 || contextTooLarge > 0
 	for _, code := range codes {
 		permanentlyBlocked = permanentlyBlocked && code == domain.BlockerRuntimeUnsupported
 	}
