@@ -597,12 +597,28 @@ func validateAdapterAdvertisementJSON(raw []byte) error {
 		"runtime_profiles": {}, "active_runtime_profile": {}, "supports_runtime_profile_switch": {},
 		"capability_version": {}, "capability_revision": {}, "capability_generation": {}, "capabilities": {}, "capacity": {},
 		"max_accelerators_per_workload": {}, "model_capacity_observations": {}, "checkpoint_proof": {},
+		"model_pools": {},
 	})
 	if err != nil {
 		return err
 	}
 	if err := validateNonNullFields(fields, "adapter advertisement"); err != nil {
 		return err
+	}
+	if raw := fields["model_pools"]; raw != nil {
+		var pools map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &pools); err != nil || pools == nil {
+			return fmt.Errorf("adapter advertisement model_pools must be an object")
+		}
+		for model, pool := range pools {
+			poolFields, err := strictObjectFields(pool, "model pool "+model, map[string]struct{}{"pool_tokens": {}, "slots": {}, "max_request_tokens": {}})
+			if err != nil {
+				return err
+			}
+			if err := validateNonNullFields(poolFields, "model pool "+model); err != nil {
+				return err
+			}
+		}
 	}
 	if raw := fields["capabilities"]; raw != nil {
 		if err := validateResidencyCapabilitiesJSON(raw); err != nil {

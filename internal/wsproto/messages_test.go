@@ -353,3 +353,21 @@ func TestParseLlamaModelsPlainRouterAndMixed(t *testing.T) {
 		t.Fatal("strict router parser accepted entries without status")
 	}
 }
+
+// Model pools travel in the strictly validated adapter advertisement: a
+// known shape is accepted, unknown or null pool fields are not.
+func TestAdapterAdvertisementAcceptsOnlyCanonicalModelPools(t *testing.T) {
+	valid := `{"id":"a","adapter":"llamacpp","endpoint":"http://x","models":["m"],"model_pools":{"m":{"pool_tokens":40000,"slots":4,"max_request_tokens":32768}}}`
+	if err := validateAdapterAdvertisementJSON([]byte(valid)); err != nil {
+		t.Fatalf("valid pools refused: %v", err)
+	}
+	for _, bad := range []string{
+		`{"id":"a","adapter":"llamacpp","endpoint":"http://x","model_pools":{"m":{"pool_tokens":1,"slots":1,"max_request_tokens":1,"extra":1}}}`,
+		`{"id":"a","adapter":"llamacpp","endpoint":"http://x","model_pools":{"m":{"pool_tokens":null,"slots":1,"max_request_tokens":1}}}`,
+		`{"id":"a","adapter":"llamacpp","endpoint":"http://x","model_pools":[1]}`,
+	} {
+		if err := validateAdapterAdvertisementJSON([]byte(bad)); err == nil {
+			t.Fatalf("accepted %s", bad)
+		}
+	}
+}
