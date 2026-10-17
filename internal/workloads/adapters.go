@@ -1547,6 +1547,11 @@ func (a *HTTPAdapter) ReclaimAcceleratorObserved(ctx context.Context, target Tar
 	if a.kind != "comfy" || target.RuntimeProtocol != managedComfyProtocol {
 		return ResidencyObservation{}, ErrUnsupported
 	}
+	// Resolve the identity first: no side effect for a result we could not accept.
+	identity, _, err := canonicalResidencyIdentity(target, "runtime-cache", false)
+	if err != nil {
+		return ResidencyObservation{}, err
+	}
 	payload, _ := json.Marshal(map[string]int64{"fencing_token": fencingToken})
 	result, status, _, err := a.request(ctx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/reclaim", target.Authorization, payload)
 	if err != nil {
@@ -1564,10 +1569,6 @@ func (a *HTTPAdapter) ReclaimAcceleratorObserved(ctx context.Context, target Tar
 	}
 	if observed.Model != "runtime-cache" || observed.Tier != string(domain.ResidencyColdDisk) || observed.FencingToken != fencingToken || fencingToken <= 0 {
 		return ResidencyObservation{}, fmt.Errorf("harness reclaim result lacks the transition's fence or a cold tier")
-	}
-	identity, _, err := canonicalResidencyIdentity(target, "runtime-cache", false)
-	if err != nil {
-		return ResidencyObservation{}, err
 	}
 	return ResidencyObservation{TargetID: target.ID, Model: "runtime-cache", RuntimeIdentity: identity, Tier: domain.ResidencyColdDisk, FencingToken: uint64(fencingToken)}, nil
 }

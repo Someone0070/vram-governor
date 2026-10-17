@@ -862,7 +862,13 @@ func canonicalResidencyIdentity(target Target, model string, warm bool) (string,
 			return "", "", adapterError(ResidencyBlockerCapabilityUnavailable, "offload_model", target, model, "", 0, "verified warm-RAM runtime capability is unavailable", false, nil)
 		}
 	}
-	if !warm {
+	if !warm && model == "runtime-cache" {
+		// A runtime's whole GPU cache (managed ComfyUI) is reclaimed, not a
+		// model loaded or unloaded: that needs the reclaim capability.
+		if target.CapabilityRevision != domain.CapabilityContractVersion || target.Capabilities.Version != domain.CapabilityContractVersion || !(target.Capabilities.SupportsAcceleratorReclaim || target.SupportsAcceleratorReclaim) {
+			return "", "", adapterError(ResidencyBlockerRuntimeUnsupported, "reclaim", target, model, "", 0, "runtime reclaim capability is unavailable", false, nil)
+		}
+	} else if !warm {
 		if target.CapabilityRevision != domain.CapabilityContractVersion || target.Capabilities.Version != domain.CapabilityContractVersion || !target.Capabilities.SupportsModelLifecycle {
 			return "", "", adapterError(ResidencyBlockerRuntimeUnsupported, "lifecycle", target, model, "", 0, "runtime lifecycle capability is unavailable", false, nil)
 		}

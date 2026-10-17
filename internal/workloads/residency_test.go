@@ -2307,3 +2307,47 @@ func TestFencedHotTransitionOutranksOmissionOnlyBriefly(t *testing.T) {
 		t.Fatal("an older load outranked the latest (unload) transition")
 	}
 }
+
+// An LLM taking the GPU reclaims the managed ComfyUI's cache through the
+// harness, which measures the post-state; the transition is accepted with
+// the lease's fence, and a retry under a new lease is a new reclaim.
+func TestManagedComfyReclaimUsesTheHarnessObservation(t *testing.T) {
+	ctx := context.Background()
+	var fences []int64
+	harness := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/reclaim" {
+			http.NotFound(w, r)
+			return
+		}
+		var body struct {
+			FencingToken int64 `json:"fencing_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fences = append(fences, body.FencingToken)
+		_ = json.NewEncoder(w).Encode(map[string]any{"model": "runtime-cache", "tier": "cold_disk", "fencing_token": body.FencingToken})
+	}))
+	defer harness.Close()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Second)
+	mgr.RegisterAdapter(NewHTTPAdapter("comfy", "comfy", harness.Client()))
+	selected := Target{ID: "llm", Adapter: "llamacpp", AcceleratorID: "gpu", Enabled: true}
+	managed := Target{ID: "managed", Adapter: "comfy", RuntimeProtocol: managedComfyProtocol, Endpoint: harness.URL, AcceleratorID: "gpu", Enabled: true,
+		CapabilityVersion: "managed-comfy-v1", CapabilityRevision: domain.CapabilityContractVersion, SupportsAcceleratorReclaim: true,
+		Capabilities: domain.ResidencyCapabilities{Version: domain.CapabilityContractVersion, SupportsAcceleratorReclaim: true}}
+	mgr.RegisterTarget(selected)
+	mgr.RegisterTarget(managed)
+	work := &domain.Workload{Request: domain.WorkloadRequest{ID: "chat", OwnerID: "o"}}
+	for _, fence := range []int64{5, 6} {
+		ids, err := mgr.reclaimForeignTargets(ctx, selected, work, &domain.AcceleratorLease{AcceleratorID: "gpu", WorkloadID: "chat", FencingToken: fence})
+		if err != nil || len(ids) != 1 {
+			t.Fatalf("fence %d: ids=%v err=%v", fence, ids, err)
+		}
+		transition, err := backing.GetResidencyTransition(ctx, ids[0])
+		if err != nil || transition.Status != domain.ResidencyTransitionSucceeded || transition.ObservedFence != fence {
+			t.Fatalf("fence %d: transition %+v err=%v", fence, transition, err)
+		}
+	}
+	if len(fences) != 2 || fences[0] != 5 || fences[1] != 6 {
+		t.Fatalf("harness saw fences %v", fences)
+	}
+}

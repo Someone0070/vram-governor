@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -2139,7 +2140,9 @@ func (m *Manager) transitionRuntimeCache(ctx context.Context, reclaimer Accelera
 		return nil, fmt.Errorf("transition target changed before dispatch")
 	}
 	transition := &domain.ResidencyTransition{
-		ID: newID("rtr"), IdempotencyKey: reason + ":" + workload.Request.ID + ":" + target.ID + ":runtime-cache",
+		// Keyed per lease: a retry under a new fence is a new reclaim (the old
+		// key with new arguments was refused and blocked the request).
+		ID: newID("rtr"), IdempotencyKey: reason + ":" + workload.Request.ID + ":" + target.ID + ":runtime-cache:" + leaseFenceKey(lease),
 		TargetID: target.ID, AcceleratorID: target.AcceleratorID, Model: "runtime-cache",
 		FromTier: domain.ResidencyHotVRAM, ToTier: domain.ResidencyColdDisk,
 		Reason: reason, RequestedBy: workload.Request.OwnerID, WorkloadID: workload.Request.ID,
@@ -3056,4 +3059,11 @@ func (m *Manager) runtimeQueueCountersStale(target Target) bool {
 	advertised := m.targetAdvertisedAt[target.ID]
 	m.mu.RUnlock()
 	return active == 0 && !released.IsZero() && !advertised.IsZero() && advertised.Before(released)
+}
+
+func leaseFenceKey(lease *domain.AcceleratorLease) string {
+	if lease == nil {
+		return "no-lease"
+	}
+	return strconv.FormatInt(lease.FencingToken, 10)
 }
