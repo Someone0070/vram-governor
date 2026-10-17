@@ -2164,7 +2164,11 @@ func (m *Manager) transitionRuntimeCache(ctx context.Context, reclaimer Accelera
 	transitionCtx, cancel := context.WithTimeout(ctx, m.residency.TransitionTimeout)
 	defer cancel()
 	var observation ResidencyObservation
-	if control, nodeID, ok := m.nodeControlForTarget(transitionCtx, target); ok {
+	if observer, ok := reclaimer.(AcceleratorReclaimObserver); ok && target.RuntimeProtocol == managedComfyProtocol {
+		// The managed harness measures the post-state itself; the node agent
+		// only knows native ComfyUI, whose /free reports nothing.
+		observation, err = observer.ReclaimAcceleratorObserved(transitionCtx, target, transition.FencingToken)
+	} else if control, nodeID, ok := m.nodeControlForTarget(transitionCtx, target); ok {
 		identity, _, identityErr := canonicalResidencyIdentity(target, "runtime-cache", false)
 		if identityErr != nil {
 			err = identityErr

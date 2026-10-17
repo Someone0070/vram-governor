@@ -1540,6 +1540,38 @@ func (a *HTTPAdapter) ReclaimAccelerator(ctx context.Context, target Target) err
 	return nil
 }
 
+// ReclaimAcceleratorObserved frees the managed harness's ComfyUI GPU cache
+// and returns the harness's measured post-state, bound to the transition's
+// fence. Native ComfyUI cannot do this: its /free reports nothing.
+func (a *HTTPAdapter) ReclaimAcceleratorObserved(ctx context.Context, target Target, fencingToken int64) (ResidencyObservation, error) {
+	if a.kind != "comfy" || target.RuntimeProtocol != managedComfyProtocol {
+		return ResidencyObservation{}, ErrUnsupported
+	}
+	payload, _ := json.Marshal(map[string]int64{"fencing_token": fencingToken})
+	result, status, _, err := a.request(ctx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/reclaim", target.Authorization, payload)
+	if err != nil {
+		return ResidencyObservation{}, fmt.Errorf("observation_unavailable: harness reclaim transport: %w", err)
+	}
+	var observed struct {
+		Model        string `json:"model"`
+		Tier         string `json:"tier"`
+		FencingToken int64  `json:"fencing_token"`
+		Error        string `json:"error"`
+	}
+	_ = json.Unmarshal(result, &observed)
+	if status < 200 || status >= 300 {
+		return ResidencyObservation{}, fmt.Errorf("harness reclaim returned %d: %s", status, observed.Error)
+	}
+	if observed.Model != "runtime-cache" || observed.Tier != string(domain.ResidencyColdDisk) || observed.FencingToken != fencingToken || fencingToken <= 0 {
+		return ResidencyObservation{}, fmt.Errorf("harness reclaim result lacks the transition's fence or a cold tier")
+	}
+	identity, _, err := canonicalResidencyIdentity(target, "runtime-cache", false)
+	if err != nil {
+		return ResidencyObservation{}, err
+	}
+	return ResidencyObservation{TargetID: target.ID, Model: "runtime-cache", RuntimeIdentity: identity, Tier: domain.ResidencyColdDisk, FencingToken: uint64(fencingToken)}, nil
+}
+
 func isOllamaTarget(target Target) bool {
 	for _, argument := range target.RuntimeArgs {
 		if strings.Contains(strings.ToLower(argument), "ollama") {

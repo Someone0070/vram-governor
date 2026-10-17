@@ -229,6 +229,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /system_stats", s.handleDiscovery)
 	mux.HandleFunc("POST /upload/image", s.handleProxy)
 	mux.HandleFunc("GET /view", s.handleProxy)
+	mux.HandleFunc("POST /v1/reclaim", s.handleReclaim)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != s.options.Authorization {
 			writeState(w, http.StatusUnauthorized, stateResponse{State: "failed", Error: "unauthorized"})
