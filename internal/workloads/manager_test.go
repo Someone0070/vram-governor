@@ -7084,3 +7084,25 @@ func TestModelContextPoolAdmitsByTokens(t *testing.T) {
 	done.Store(first.Request.ID, true)
 	waitFor("second running once first finished", func() bool { return latest(second).Status == domain.WorkloadRunning })
 }
+
+// A shared context pool that overflowed generated nothing: the request is
+// requeued (even non-recoverable work) with twice its reservation.
+func TestContextPoolOverflowRequeuesWithALargerReservation(t *testing.T) {
+	ctx := context.Background()
+	backing := store.NewMemoryStore()
+	m := NewManager(quietLogger(), backing, time.Second)
+	target := Target{ID: "router", Adapter: "llamacpp", Enabled: true}
+	m.RegisterTarget(target)
+	w := &domain.Workload{Request: domain.WorkloadRequest{ID: "chat", OwnerID: "o", Adapter: "llamacpp", Payload: json.RawMessage(`{"model":"m"}`), Bounds: domain.WorkloadBounds{ContextTokens: 15000}}, Status: domain.WorkloadRunning}
+	if _, _, err := backing.CreateWorkload(ctx, w); err != nil {
+		t.Fatal(err)
+	}
+	failure := &BackendError{TargetID: target.ID, Status: 500, Message: `llama backend returned 500: {"error":{"code":500,"message":"Context size has been exceeded.","type":"server_error"}}`}
+	if !m.retryProviderFailure(ctx, w, target, failure) {
+		t.Fatal("a pool overflow was not retried")
+	}
+	latest, _ := backing.GetWorkload(ctx, "chat")
+	if latest.Status != domain.WorkloadQueued || latest.Request.Bounds.ContextTokens != 30000 {
+		t.Fatalf("status %s, reservation %d; want queued with 30000", latest.Status, latest.Request.Bounds.ContextTokens)
+	}
+}

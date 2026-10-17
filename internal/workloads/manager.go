@@ -6859,6 +6859,12 @@ func (m *Manager) recordProviderSuccess(target Target) {
 func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Workload, target Target, failure error) bool {
 	retryAt, retryable := m.recordProviderFailure(target, failure)
 	notLoaded := backendModelNotLoaded(failure)
+	overflow := backendContextExceeded(failure)
+	if overflow {
+		// The shared context pool overflowed before anything was generated:
+		// retry with twice the reservation so admission leaves more room.
+		retryAt, retryable = time.Now().UTC(), true
+	}
 	if notLoaded {
 		// The runtime dropped a model the LB recorded as resident (unloaded or
 		// crashed outside the LB). Nothing ran, so any request may retry at
@@ -6866,7 +6872,7 @@ func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Wor
 		m.markModelNotResident(ctx, target, workloadModel(workload))
 		retryAt, retryable = time.Now().UTC(), true
 	}
-	if !retryable || !workload.Request.Recoverable && !notLoaded || workload.ExecutionAttempts >= 4 {
+	if !retryable || !workload.Request.Recoverable && !notLoaded && !overflow || workload.ExecutionAttempts >= 4 {
 		return false
 	}
 	latest, err := m.store.GetWorkload(ctx, workload.Request.ID)
@@ -6877,6 +6883,13 @@ func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Wor
 		latest.TargetRetryAfter = make(map[string]time.Time)
 	}
 	latest.TargetRetryAfter[target.ID] = retryAt
+	if overflow {
+		reserved := latest.Request.Bounds.ContextTokens
+		if reserved <= 0 {
+			reserved = len(latest.Request.Payload)/3 + 1
+		}
+		latest.Request.Bounds.ContextTokens = reserved * 2
+	}
 	latest.Status = domain.WorkloadQueued
 	latest.Decision = domain.AdmissionDecision{Admitted: false, Blocker: target.ID + ": transient provider failure; selecting fallback", Confidence: .8, Alternatives: []string{failure.Error()}}
 	latest.Plan = nil
@@ -6911,6 +6924,13 @@ func (m *Manager) retryProviderFailure(ctx context.Context, workload *domain.Wor
 func backendModelNotLoaded(failure error) bool {
 	var backend *BackendError
 	return errors.As(failure, &backend) && backend.Status == 400 && strings.Contains(backend.Message, "model is not loaded")
+}
+
+// backendContextExceeded reports llama.cpp's refusal when a shared context
+// pool had no room left for the request.
+func backendContextExceeded(failure error) bool {
+	var backend *BackendError
+	return errors.As(failure, &backend) && strings.Contains(backend.Message, "Context size has been exceeded")
 }
 
 func workloadModel(workload *domain.Workload) string {

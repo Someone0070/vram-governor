@@ -570,8 +570,10 @@ func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadReque
 		// Local requests reserve context from the model's shared pool, where
 		// one token per byte (3-4x too many) would starve concurrency. Clients
 		// that know better send governor.context_tokens and max_tokens.
-		if contextTokens <= 0 {
-			contextTokens = len(req.Payload)/3 + 1
+		// A declared budget below what the prompt itself needs would
+		// overbook the pool ("Context size has been exceeded").
+		if estimated := len(req.Payload)/3 + 1; contextTokens < estimated {
+			contextTokens = estimated
 		}
 		if maxOutput <= 0 {
 			maxOutput = defaultReservedOutputTokens
