@@ -194,3 +194,40 @@ func TestReservedComfyUITargetTakesOnlyPinnedWork(t *testing.T) {
 		t.Fatalf("unpinned work ran on the reserved UI target: %v", fake.prompts)
 	}
 }
+
+// The ComfyUI app uses the browser session cookie and cannot send the LB's
+// X-CSRF-Token: a same-origin Origin header is required instead.
+func TestComfyUICookieRequestsNeedTheirOwnOrigin(t *testing.T) {
+	srv, fake, done := comfyUITestServer(t)
+	defer done()
+	login := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(login, httptest.NewRequest(http.MethodPost, "/auth/session", strings.NewReader(`{"token":"alice-token","kind":"ui"}`)))
+	cookies := login.Result().Cookies()
+	if login.Code != http.StatusOK || len(cookies) == 0 {
+		t.Fatalf("login: %d", login.Code)
+	}
+	post := func(origin string) int {
+		req := httptest.NewRequest(http.MethodPost, "/comfy/api/prompt", strings.NewReader(`{"prompt":{"1":{"class_type":"SaveImage","inputs":{}}},"client_id":"b"}`))
+		req.AddCookie(cookies[0])
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		rec := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := post(""); code != http.StatusForbidden {
+		t.Fatalf("cookie POST without Origin: %d", code)
+	}
+	if code := post("https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cookie POST from another origin: %d", code)
+	}
+	if code := post("http://example.com"); code != http.StatusOK {
+		t.Fatalf("same-origin cookie POST refused: %d", code)
+	}
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.prompts) != 1 {
+		t.Fatalf("ComfyUI got %d prompts, want 1", len(fake.prompts))
+	}
+}

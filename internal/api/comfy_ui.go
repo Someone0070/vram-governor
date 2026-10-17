@@ -64,14 +64,15 @@ func (s *Server) handleComfyUI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "comfy:read scope required"})
 		return
 	}
-	// The session cookie is SameSite=Strict; state-changing requests and the
-	// websocket must also come from this origin.
+	// Cookie requests skip the X-CSRF-Token check (the ComfyUI app cannot
+	// send it): state-changing ones and the websocket must carry this
+	// origin. Browsers always send Origin there; bearer clients need not.
 	if r.Method != http.MethodGet && r.Method != http.MethodHead || strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		if origin := r.Header.Get("Origin"); origin != "" {
-			if parsed, err := url.Parse(origin); err != nil || parsed.Host != r.Host {
-				writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request refused"})
-				return
-			}
+		origin := r.Header.Get("Origin")
+		cookieAuth := r.Header.Get("Authorization") == ""
+		if cookieAuth && origin == "" || origin != "" && !sameOrigin(origin, r.Host) {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "cross-origin request refused"})
+			return
 		}
 	}
 	route := path
@@ -359,4 +360,9 @@ func newUUID() string {
 	b[6] = b[6]&0x0f | 0x40
 	b[8] = b[8]&0x3f | 0x80
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+func sameOrigin(origin, host string) bool {
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Host == host
 }

@@ -308,7 +308,9 @@ func (s *Server) securityMiddleware(next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUpgradeRequired, map[string]string{"error": "https_required"})
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && r.URL.Path != "/auth/session" {
+		// The ComfyUI app cannot send X-CSRF-Token; /comfy/ requires a
+		// same-origin Origin header for cookie requests instead.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && r.URL.Path != "/auth/session" && !strings.HasPrefix(r.URL.Path, comfyUIPrefix+"/") {
 			if session, found := s.browserSessionForRequest(r); found && subtle.ConstantTimeCompare([]byte(digestSecret(r.Header.Get("X-CSRF-Token"))), []byte(session.CSRFHash)) != 1 {
 				writeJSON(w, http.StatusForbidden, map[string]string{"error": "csrf_validation_failed"})
 				return
