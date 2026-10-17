@@ -32,6 +32,7 @@ func (s *Server) workloadsUnavailable(w http.ResponseWriter) bool {
 }
 
 func (s *Server) prepareRequest(r *http.Request, p Principal, req *domain.WorkloadRequest) error {
+	req.PinnedTargetID = ""
 	if !allowsAdapter(p, req.Adapter) {
 		return fmt.Errorf("adapter %q is not allowed", req.Adapter)
 	}

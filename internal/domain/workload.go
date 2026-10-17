@@ -132,6 +132,9 @@ type WorkloadRequest struct {
 	Payload                json.RawMessage         `json:"payload,omitempty"`
 	ArtifactRefs           []string                `json:"artifact_refs,omitempty"`
 	ItemID                 string                  `json:"item_id"`
+	// PinnedTargetID restricts placement to one target. It is set by the
+	// controller itself (the LB-hosted ComfyUI); client requests cannot set it.
+	PinnedTargetID string `json:"pinned_target_id,omitempty"`
 	OperationVersion       string                  `json:"operation_version"`
 	IdempotencyKey         string                  `json:"idempotency_key"`
 	QoS                    QoSClass                `json:"qos"`

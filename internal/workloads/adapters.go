@@ -709,7 +709,12 @@ func (a *HTTPAdapter) Start(ctx context.Context, req domain.WorkloadRequest, pla
 		return nil, &BackendError{TargetID: target.ID, Retryable: true, RetryAfter: 5 * time.Second, Message: a.kind + " transport failed: " + err.Error(), Cause: err}
 	}
 	if status < 200 || status >= 300 {
-		message := fmt.Sprintf("%s backend returned %d: %s", a.kind, status, truncate(result, 512))
+		limit := 512
+		if a.kind == "comfy" && target.ComfyUI {
+			// The web UI marks the failing nodes from Comfy's node_errors.
+			limit = 64 << 10
+		}
+		message := fmt.Sprintf("%s backend returned %d: %s", a.kind, status, truncate(result, limit))
 		return nil, &BackendError{TargetID: target.ID, Status: status, Retryable: status == http.StatusTooManyRequests || status == http.StatusRequestTimeout || status >= 500, RetryAfter: parseRetryAfter(headers.Get("Retry-After")), Message: message}
 	}
 	h := &domain.ExecutionHandle{StartedAt: startedAt.wall.UTC()}
@@ -722,7 +727,11 @@ func (a *HTTPAdapter) Start(ctx context.Context, req domain.WorkloadRequest, pla
 			return nil, fmt.Errorf("invalid Comfy submission response")
 		}
 		h.ExternalID = accepted.PromptID
-		go a.observeComfyWebSocket(ctx, target, comfyClientID, accepted.PromptID)
+		if !target.ComfyUI {
+			// Comfy keeps one socket per client id: the web UI's browser owns
+			// it, and Observe polls history instead.
+			go a.observeComfyWebSocket(ctx, target, comfyClientID, accepted.PromptID)
+		}
 	} else {
 		h.Opaque = append(json.RawMessage(nil), result...)
 		h.Performance = a.measuredPerformance(startedAt, a.clockNow(), clockSample{}, result, "gateway_wall_clock")

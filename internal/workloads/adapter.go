@@ -114,6 +114,10 @@ type Target struct {
 	MinResidency                 time.Duration                               `json:"min_residency,omitempty" yaml:"-"`
 	Cloud                        bool                                        `json:"cloud" yaml:"cloud"`
 	Enabled                      bool                                        `json:"enabled" yaml:"enabled"`
+	// ComfyUI marks a native ComfyUI that serves the LB-hosted web UI. Only
+	// requests pinned to it run there, and it never opens its own websocket
+	// with the browser's client id (that would take the browser's events).
+	ComfyUI bool `json:"comfy_ui,omitempty" yaml:"comfy_ui"`
 	Authorization                string                                      `json:"-" yaml:"authorization"`
 	InputCentsPerMTok            int64                                       `json:"input_cents_per_million_tokens,omitempty" yaml:"input_cents_per_million_tokens"`
 	OutputCentsPerMTok           int64                                       `json:"output_cents_per_million_tokens,omitempty" yaml:"output_cents_per_million_tokens"`

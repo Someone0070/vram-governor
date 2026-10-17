@@ -4959,6 +4959,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		if target.Adapter != w.Request.Adapter {
 			continue
 		}
+		if w.Request.PinnedTargetID != "" && target.ID != w.Request.PinnedTargetID || target.ComfyUI && w.Request.PinnedTargetID != target.ID {
+			continue
+		}
 		if !targetSupportsDisruption(adapter, target, w.Request.Disruption) {
 			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, target.ID+": disruption policy unsupported by runtime protocol"))
 			continue
@@ -5020,6 +5023,11 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		}
 		missingRequiredModel := ""
 		for _, model := range req.RequiredModels {
+			// The web UI's ComfyUI checks its own models and nodes and reports
+			// failures to the browser (node_errors) more precisely than the LB.
+			if target.ComfyUI {
+				break
+			}
 			if !containsString(target.Models, model) {
 				missingRequiredModel = model
 				break
@@ -5033,7 +5041,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			blockers = append(blockers, coded(domain.BlockerCapacity, fmt.Sprintf("%s: model accelerator limit %d reached", target.ID, limit)))
 			continue
 		}
-		if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) {
+		if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) && !target.ComfyUI {
 			comfySchemaGeneration := m.targetGeneration(target.ID)
 			var schemaErr error
 			comfyProof, schemaErr = m.ComfySchema(ctx, target, comfySchemaGeneration, w.Request)
@@ -5055,7 +5063,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			}
 			target = updated
 		}
-		if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) {
+		if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) && !target.ComfyUI {
 			comfySchemaGeneration := m.targetGeneration(target.ID)
 			latestDigest, schemaErr := m.ComfySchema(ctx, target, comfySchemaGeneration, w.Request)
 			if schemaErr != nil || !comfySchemaProofMatches(comfyProof, latestDigest) {
@@ -9409,7 +9417,7 @@ func (m *Manager) execute(ctx context.Context, id string, target Target, reserva
 		return
 	}
 	target = currentTarget
-	if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) {
+	if target.Adapter == "comfy" && builtInComfyHTTPAdapter(adapter) && !target.ComfyUI {
 		latestProof, schemaErr := m.ComfySchema(runCtx, target, reservation.targetGeneration, w.Request)
 		if schemaErr != nil || !comfySchemaProofMatches(reservation.comfySchemaProof, latestProof) {
 			m.failAfterReservation(ctx, w, reservation, "Comfy workflow schema changed before backend start")

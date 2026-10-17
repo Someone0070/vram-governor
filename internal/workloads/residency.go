@@ -2010,6 +2010,12 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 		if foreign.ID == selected.ID || foreign.AcceleratorID != selected.AcceleratorID || m.targetActiveCount(foreign.ID) > 0 {
 			continue
 		}
+		if (selected.ComfyUI || foreign.ComfyUI) && strings.EqualFold(selected.Adapter, "comfy") && strings.EqualFold(foreign.Adapter, "comfy") {
+			// The web UI target fronts the same ComfyUI process as the managed
+			// harness on its accelerator; ComfyUI manages VRAM between its own
+			// jobs, and freeing its cache would reload every model each run.
+			continue
+		}
 		if foreign.QueueRunning > 0 || foreign.QueuePending > 0 {
 			// Busy counters arrive with periodic node advertisements. Counters
 			// published before the LB's last release on that target are stale

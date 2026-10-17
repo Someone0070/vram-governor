@@ -40,6 +40,13 @@ type Config struct {
 		CommandSigningSecretEnv string             `yaml:"command_signing_secret_env"`
 	} `yaml:"auth"`
 
+	// ComfyUI serves the ComfyUI web app at /comfy/: the page and its
+	// read-only API come from Upstream, while queueing goes through the
+	// scheduler pinned to TargetID (a workloads target with comfy_ui: true).
+	ComfyUI struct {
+		Upstream string `yaml:"upstream"`
+		TargetID string `yaml:"target_id"`
+	} `yaml:"comfy_ui"`
 	Workloads struct {
 		LeaseTTLSeconds                int                          `yaml:"lease_ttl_seconds"`
 		DefaultMaxAcceleratorsPerModel int                          `yaml:"default_max_accelerators_per_model"`
@@ -681,6 +688,8 @@ type WorkloadTargetConfig struct {
 	PredictedSlowdown          float64                      `yaml:"predicted_slowdown"`
 	MaxSlowdown                float64                      `yaml:"max_slowdown"`
 	SafetyCritical             bool                         `yaml:"safety_critical"`
+	// ComfyUI marks the native ComfyUI behind the LB-hosted web UI (/comfy/).
+	ComfyUI bool `yaml:"comfy_ui"`
 	Provider                   string                       `yaml:"provider"`
 	Quarantined                bool                         `yaml:"quarantined"`
 }
