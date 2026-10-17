@@ -316,6 +316,7 @@ Generate a credential digest, for example:
 | Creator Studio | `/api/v1/capabilities`, capability-oriented `/api/v1/workloads`, `/api/v1/workloads/batch`, `/api/v1/batches/{id}`, session working-set hints |
 | OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`, human chat at `/chat/` |
 | ComfyUI | `/prompt`, `/ws`, `/history`, `/history/{id}`, `/queue`, `/upload/image`, `/view` |
+| ComfyUI web app | `/comfy/` (sign in with a UI token): the real ComfyUI interface with live previews and progress; Queue Prompt is scheduled by the LB (`comfy_ui` config block + a `comfy_ui: true` target) |
 | Node | `/ws/node`, node engine/profile reporting |
 | System agent | `/api/agent/v1/incidents/*`, escalation/proposals, `/api/agent/v1/events` |
 | Operator | `/admin/`, overview, residency controls, durable signed node commands |
