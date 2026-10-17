@@ -92,13 +92,15 @@ Generation is bound by memory bandwidth: every token reads all weights once,
 VRAM at ~500-900 GB/s, the X99's DDR4 at ~40-50 GB/s. A few GB left on the
 CPU dominate, which is why the tool fills every GPU before the CPU.
 
-Known problems with the mixed split (why calibration exists, and why
-`qwen3.8-27b-uncensored-q6_k` is pinned with `placement = single`):
+Split ratios matter: some run at half speed or less (13.5 GB at 42:58:
+15.7 tok/s; 16.8 GB at 54:46: 12.0; 27B Q6 at 50:50: 10.1 vs 18.7-19.0 at
+46:54, 42:58 and 37:63), different per model. `--calibrate` (llama-bench)
+picks the ratio; with the pool settings in the presets, llama-server matches
+the benchmark (27B Q6 at 46:54: 18.7 tok/s on repeated loads and after
+swapping from other models through the LB). An earlier 9.7 tok/s came from
+the router's global `--ctx-size`/`--parallel` overriding the presets.
 
-- Some split ratios run at half speed or less (13.5 GB at 42:58: 15.7 tok/s;
-  16.8 GB at 54:46: 12.0), different per model. llama-bench calibration
-  catches most, but the Q6 model ran at 9.7 tok/s in llama-server with a
-  ratio that benchmarked at 19.0: the server's context settings matter.
-- Loaded right after another model, the AMD card's share once landed in
-  system RAM (GTT) instead of VRAM: 0.6 tok/s. The Vulkan backend falls back
-  silently; llama.cpp's auto-fit causes the same, hence `fit = off`.
+The amdgpu memory counters do not tell a good load from a bad one on this
+board: with the 6900 XT's share running at full speed, both
+`mem_info_vram_used` and the process's `drm-memory-vram` read 0 and the
+share shows up as GTT. Check tokens per second instead.

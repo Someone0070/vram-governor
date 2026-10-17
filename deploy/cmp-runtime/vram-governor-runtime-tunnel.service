@@ -1,8 +1,9 @@
 [Unit]
 Description=Encrypted CMP runtime tunnels to the VRAM Governor controller
 After=network-online.target comfy-harness.service llama-server.service
-Wants=network-online.target
-Requires=comfy-harness.service llama-server.service
+Wants=network-online.target comfy-harness.service llama-server.service
+# Wants, not Requires: a llama-server or harness restart must not take the
+# tunnels down (the whole node dropped off the controller until a manual start).
 
 [Service]
 Type=simple
