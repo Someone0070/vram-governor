@@ -1445,7 +1445,13 @@ func writeOpenAIBusy(w http.ResponseWriter, row *domain.Workload) {
 	if len(decision.Alternatives) > 0 {
 		message += ": " + strings.Join(decision.Alternatives, "; ")
 	}
-	body := map[string]any{"error": map[string]any{"message": message, "type": errorType, "code": string(code), "workload_id": row.Request.ID}, "admission": decision, "retry_after_seconds": retrySeconds}
+	errorCode := string(code)
+	if row.Status == domain.WorkloadRejected && strings.Contains(decision.Blocker, "context tokens per request") {
+		// What OpenAI clients expect for a prompt too long for the model.
+		status, errorType, errorCode, message = http.StatusBadRequest, "invalid_request_error", "context_length_exceeded", decision.Blocker
+		w.Header().Del("Retry-After")
+	}
+	body := map[string]any{"error": map[string]any{"message": message, "type": errorType, "code": errorCode, "workload_id": row.Request.ID}, "admission": decision, "retry_after_seconds": retrySeconds}
 	if decision.NotificationID != "" {
 		body["notification_id"] = decision.NotificationID
 	}

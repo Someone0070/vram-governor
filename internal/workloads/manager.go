@@ -5776,6 +5776,16 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	if len(blockers) > 0 {
 		primaryBlocker = blockers[primaryBlockerIndex(codes, blockerCode)]
 	}
+	if contextTooLarge > 0 && permanentlyBlocked {
+		// The size limit is the actionable cause, not "model unavailable" on
+		// routes that never had the model.
+		for _, blocker := range blockers {
+			if strings.Contains(blocker, "context tokens per request") {
+				primaryBlocker = blocker
+				break
+			}
+		}
+	}
 	w.Decision = domain.AdmissionDecision{Admitted: false, Blocker: primaryBlocker, BlockerCode: blockerCode, EstimatedStart: &estimatedStart, EstimatedEnd: &estimatedEnd, Confidence: estimateConfidence, Alternatives: blockers}
 	if protectedUntil != nil {
 		// A min_residency window is a known instant, not a statistical guess:
