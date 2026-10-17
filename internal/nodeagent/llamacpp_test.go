@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -364,6 +365,50 @@ func TestDiscoverLlamaCPPRouterUsesResidentModelForMonitoring(t *testing.T) {
 	}
 	if !advertisement.CapabilitiesVerified || advertisement.ContextLimit != 32768 || advertisement.Slots != 2 {
 		t.Fatalf("router-scoped monitoring was not verified: %+v", advertisement)
+	}
+}
+
+func TestDiscoverLlamaCPPVersionIgnoresLoadedModelPoolSize(t *testing.T) {
+	pools := filepath.Join(t.TempDir(), "pools.json")
+	if err := os.WriteFile(pools, []byte(`{"small": {"pool_tokens": 186368, "slots": 8, "max_request_tokens": 186368}, "big": {"pool_tokens": 30208, "slots": 4, "max_request_tokens": 30208}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	discover := func(loaded string, ctx, slots int) wsproto.AdapterAdvertisement {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/v1/models":
+				data := []any{}
+				for _, id := range []string{"small", "big"} {
+					status := "unloaded"
+					if id == loaded {
+						status = "loaded"
+					}
+					data = append(data, map[string]any{"id": id, "status": status})
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+			case "/slots":
+				out := []any{}
+				for i := 0; i < slots; i++ {
+					out = append(out, map[string]any{"n_ctx": ctx, "is_processing": false})
+				}
+				_ = json.NewEncoder(w).Encode(out)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+		advertisement, err := DiscoverLlamaCPP(context.Background(), "node-a", LlamaCPPServerConfig{Endpoint: server.URL, RouterManaged: true, ModelPoolsFile: pools})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return advertisement
+	}
+	small, big := discover("small", 186368, 8), discover("big", 30208, 4)
+	if small.Version != big.Version {
+		t.Fatalf("a model swap changed the runtime version (%s -> %s): commands sent before the next advertisement are rejected", small.Version, big.Version)
+	}
+	if len(small.ModelPools) != 2 {
+		t.Fatalf("pools not advertised: %+v", small.ModelPools)
 	}
 }
 

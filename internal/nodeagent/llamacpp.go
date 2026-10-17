@@ -130,16 +130,26 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	// discovered Ollama protocol can execute the mutation path below.
 	supportsLifecycle := cfg.RouterManaged || ollamaDetected
 	modelHash := sha256.Sum256(modelMaterial)
+	modelPools := readModelPools(cfg.ModelPoolsFile, models)
+	// With per-model pools the loaded model's /slots context differs from
+	// model to model; the pool table is the runtime identity instead, or the
+	// version changed on every swap and the controller's next commands were
+	// rejected until the following advertisement.
+	identityContext, identitySlots := contextLimit, slots
+	if routerDetected && len(modelPools) > 0 {
+		identityContext, identitySlots = 0, 0
+	}
 	capabilityMaterial, _ := json.Marshal(struct {
-		Models               []string `json:"models"`
-		ModelHash            string   `json:"model_hash"`
-		ContextLimit         int      `json:"context_limit"`
-		Slots                int      `json:"slots"`
-		CapacitySource       string   `json:"capacity_source"`
-		CapabilitiesVerified bool     `json:"capabilities_verified"`
-		RuntimeArgs          []string `json:"runtime_args"`
-		MeasurementSchema    string   `json:"measurement_schema"`
-	}{models, hex.EncodeToString(modelHash[:]), contextLimit, slots, "", false, cfg.RuntimeArgs, "runtime-envelope-v2"})
+		Models               []string                     `json:"models"`
+		ModelHash            string                       `json:"model_hash"`
+		ContextLimit         int                          `json:"context_limit"`
+		Slots                int                          `json:"slots"`
+		CapacitySource       string                       `json:"capacity_source"`
+		CapabilitiesVerified bool                         `json:"capabilities_verified"`
+		RuntimeArgs          []string                     `json:"runtime_args"`
+		MeasurementSchema    string                       `json:"measurement_schema"`
+		ModelPools           map[string]wsproto.ModelPool `json:"model_pools,omitempty"`
+	}{models, hex.EncodeToString(modelHash[:]), identityContext, identitySlots, "", false, cfg.RuntimeArgs, "runtime-envelope-v2", modelPools})
 	// Capacity provenance (configured fallback vs runtime /slots) changes
 	// whenever a router loads or unloads a model; it is measurement metadata,
 	// not runtime identity, so it is excluded from the capability version.
@@ -178,7 +188,7 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	return wsproto.AdapterAdvertisement{
 		ID: id, Adapter: "llamacpp", Endpoint: publicEndpoint,
 		AcceleratorIndex: cfg.AcceleratorIndex, Models: models, ResidentModels: residentModels,
-		ModelPools:       readModelPools(cfg.ModelPoolsFile, models),
+		ModelPools:       modelPools,
 		Version:          "llamacpp-" + hex.EncodeToString(capabilityHash[:8]),
 		ModelFingerprint: hex.EncodeToString(modelHash[:]), ContextLimit: contextLimit, Slots: slots,
 		CapacitySource: capacitySource, CapabilitiesVerified: verified, RuntimeArgs: append([]string(nil), cfg.RuntimeArgs...),
