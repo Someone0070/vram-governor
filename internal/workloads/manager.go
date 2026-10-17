@@ -384,6 +384,9 @@ func (m *Manager) CurrentlyAvailableSlotsForModel(ctx context.Context, target Ta
 	m.placementMu.Lock()
 	defer m.placementMu.Unlock()
 	slots := target.Slots
+	if pool, pooled := modelPool(target, model); pooled {
+		slots = pool.Slots
+	}
 	if slots <= 0 {
 		slots = 1
 	}
@@ -5187,7 +5190,13 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 				continue
 			}
 		}
-		if req.ContextTokens > 0 && target.ContextLimit > 0 && req.ContextTokens > target.ContextLimit {
+		if pool, pooled := modelPool(target, req.Model); pooled {
+			if req.ContextTokens > pool.MaxRequestTokens {
+				unlockAdmission()
+				blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, fmt.Sprintf("%s: %s accepts at most %d context tokens per request, %d required", target.ID, req.Model, pool.MaxRequestTokens, req.ContextTokens)))
+				continue
+			}
+		} else if req.ContextTokens > 0 && target.ContextLimit > 0 && req.ContextTokens > target.ContextLimit {
 			unlockAdmission()
 			blockers = append(blockers, coded(domain.BlockerRuntimeUnsupported, fmt.Sprintf("%s: context limit %d is below required %d", target.ID, target.ContextLimit, req.ContextTokens)))
 			continue
@@ -6578,6 +6587,28 @@ func (m *Manager) notePassWaiter(acceleratorID string, priority int) {
 	}
 }
 
+// modelPool reports the model's own context pool on target, if it has one.
+func modelPool(target Target, model string) (ModelPool, bool) {
+	pool, ok := target.ModelPools[model]
+	return pool, ok && model != "" && pool.PoolTokens > 0 && pool.Slots > 0 && pool.MaxRequestTokens > 0
+}
+
+// poolFullLocked explains why tokens more context would overfill the pool
+// (the context reserved by requests already placed on the target), or "".
+// Callers hold placementMu.
+func (m *Manager) poolFullLocked(targetID string, pool ModelPool, tokens int) string {
+	reserved := 0
+	for _, active := range m.activePlacements {
+		if active.targetID == targetID {
+			reserved += active.contextTokens
+		}
+	}
+	if reserved > 0 && reserved+tokens > pool.PoolTokens {
+		return fmt.Sprintf("context pool is full: %d of %d tokens reserved, %d more needed", reserved, pool.PoolTokens, tokens)
+	}
+	return ""
+}
+
 func (m *Manager) principalActiveCount(ctx context.Context, principalID, excludeWorkloadID string) int {
 	if principalID == "" {
 		return 0
@@ -7238,6 +7269,10 @@ func (m *Manager) reserveTarget(ctx context.Context, target Target, workload *do
 		}
 	}
 	slots := target.Slots
+	pool, pooled := modelPool(target, requirements.Model)
+	if pooled {
+		slots = pool.Slots
+	}
 	if slots <= 0 {
 		slots = 1
 	}
@@ -7309,6 +7344,14 @@ func (m *Manager) reserveTarget(ctx context.Context, target Target, workload *do
 			targetFence.RUnlock()
 			m.residencyAdmissionMu.Unlock()
 			return nil, false, "all execution slots are busy", nil
+		}
+		if pooled {
+			if reason := m.poolFullLocked(target.ID, pool, requirements.ContextTokens); reason != "" {
+				m.placementMu.Unlock()
+				targetFence.RUnlock()
+				m.residencyAdmissionMu.Unlock()
+				return nil, false, reason, nil
+			}
 		}
 		if requirements.Model != "" && target.AcceleratorID != "" && !target.Cloud {
 			activeAccelerators := make(map[string]struct{})
@@ -7410,6 +7453,19 @@ func (m *Manager) reserveTarget(ctx context.Context, target Target, workload *do
 			return nil, false, "target facts changed during accelerator lease acquisition", nil
 		}
 		m.placementMu.Lock()
+		poolReason := ""
+		if pooled {
+			poolReason = m.poolFullLocked(target.ID, pool, requirements.ContextTokens)
+		}
+		if poolReason != "" {
+			m.placementMu.Unlock()
+			targetFence.Unlock()
+			m.residencyAdmissionMu.Unlock()
+			if rollbackErr := m.rollbackAcceleratorLease(context.Background(), lease, workloadID); rollbackErr != nil {
+				return nil, false, "accelerator lease publication requires reconciliation", rollbackErr
+			}
+			return nil, false, poolReason, nil
+		}
 		if m.targetActive[target.ID] >= slots || m.targetLeases[target.ID] != nil {
 			m.placementMu.Unlock()
 			targetFence.Unlock()

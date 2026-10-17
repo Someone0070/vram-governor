@@ -193,6 +193,10 @@ type LlamaCPPServerConfig struct {
 	RouterManaged       bool                   `yaml:"router_managed"`
 	MaxResidentModels   int                    `yaml:"max_resident_models"`
 	RuntimeProfiles     []RuntimeProfileConfig `yaml:"runtime_profiles"`
+	// ModelPoolsFile is the JSON map {model: {pool_tokens, slots,
+	// max_request_tokens}} written by vram-llama-placement; read on every
+	// discovery and advertised so the controller admits by context tokens.
+	ModelPoolsFile string `yaml:"model_pools_file"`
 }
 
 // RuntimeProfileConfig binds a public capacity mode to one fixed local

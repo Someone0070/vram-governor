@@ -41,6 +41,10 @@ BASE = os.environ.get("VG_LLAMA_PRESETS_BASE", "/etc/vram-governor/llama-presets
 OUT = os.environ.get("VG_LLAMA_PRESETS", "/etc/vram-governor/llama-presets.ini")
 SERVER = os.environ.get("VG_LLAMA_SERVER", "/root/llama.cpp-mixed/build/bin/llama-server")
 RESERVE_MIB = int(os.environ.get("VG_LLAMA_RESERVE_MIB", "512"))
+POOLS = os.environ.get("VG_LLAMA_POOLS", "/etc/vram-governor/llama-model-pools.json")
+# Placement only needs room for this much context; the pool then takes all
+# VRAM left on the chosen GPUs.
+MIN_CONTEXT = int(os.environ.get("VG_LLAMA_MIN_CONTEXT", "8192"))
 CALIBRATION = os.environ.get("VG_LLAMA_CALIBRATION", "/var/lib/vram-governor/llama-placement-calibration.json")
 CACHE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
 GIB = 1 << 30
@@ -189,6 +193,47 @@ def placement(model, path, base, cards, context):
             note + f" -> {gpu_layers}/{layers} layers on {names} ({split}{', calibrated' if cached else ''}), rest on the CPU")
 
 
+def context_pool(model, path, placed, base, cards):
+    """Shared context pool for a placed model: (pool_tokens, slots, max_request).
+
+    The pool is every byte the model's GPUs have left after its weights and
+    the working margin, in tokens of this model's KV cache (llama.cpp
+    unified KV: requests draw tokens from one pool instead of fixed slots).
+    For a split model the pool is bounded by whichever GPU fills first, since
+    each GPU holds the KV of its own layers.
+    """
+    options = base[model] if base.has_section(model) else {}
+    meta = read_gguf_metadata(path)
+    arch = meta.get("general.architecture", "")
+    trained = int(meta.get(f"{arch}.context_length", 0) or 32768)
+    weights = os.path.getsize(path)
+    per_token = max(1, kv_cache_bytes(meta, 1, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16")))
+    slots = 8 if weights < 6 * GIB else 4
+    names = placed.get("device", cards[0][0] if cards else "").split(",")
+    capacities = {name: (total - RESERVE_MIB) << 20 for name, total in cards}
+    margin = GIB // 2 + weights // 50
+    layers = int(meta.get(f"{arch}.block_count", 0) or 0)
+    gpu_layers = int(placed.get("n-gpu-layers", "99"))
+    single_spill = len(names) == 1 and weights + margin > capacities.get(names[0], 0)
+    if layers and gpu_layers < layers or single_spill:
+        # Partly on the CPU: keep the KV small, it competes with the layers.
+        pool, slots = min(trained, 16384), 2
+    elif len(names) > 1:
+        shares = [float(x) for x in placed["tensor-split"].split(",")]
+        total = sum(shares)
+        shares = [x / total for x in shares]
+        pool_bytes = min(capacities.get(n, 0) / share - weights - margin for n, share in zip(names, shares) if share > 0)
+        pool = int(pool_bytes / per_token)
+    else:
+        pool = int((capacities.get(names[0], 0) - weights - margin) / per_token)
+    pool = min(pool, trained * slots)
+    pool -= pool % 256
+    if pool < 2048:
+        pool = 2048
+    slots = max(1, min(slots, pool // 2048))
+    return pool, slots, min(trained, pool)
+
+
 def split_candidates(need, capacities):
     """tensor-split values from "fill the primary GPU" to proportional to VRAM."""
     primary, rest = capacities[0][1], capacities[1:]
@@ -278,8 +323,16 @@ def main():
              "; GPUs: " + (", ".join(f"{n} {t} MiB" for n, t in cards) or "none found"), ""]
     # "placement" is this tool's own key; llama-server would reject it.
     sections = {s: {k: v for k, v in base[s].items() if k != "placement"} for s in base.sections()}
+    pools = {}
     for model, path in models().items():
-        placed, note = placement(model, path, base, cards, context)
+        placed, note = placement(model, path, base, cards, MIN_CONTEXT)
+        try:
+            pool, slots, max_request = context_pool(model, path, placed, base, cards)
+            placed.update({"ctx-size": str(pool), "parallel": str(slots), "kv-unified": "1"})
+            pools[model] = {"pool_tokens": pool, "slots": slots, "max_request_tokens": max_request}
+            note += f"; pool {pool} tokens, {slots} slots, up to {max_request} per request"
+        except Exception as error:
+            note += f"; no context pool ({error})"
         merged = dict(placed)
         merged.update(sections.pop(model, {}))
         lines += [f"; {note}", f"[{model}]"] + [f"{k} = {v}" for k, v in merged.items()] + [""]
@@ -288,11 +341,13 @@ def main():
     text = "\n".join(lines)
     if dry_run:
         print(text)
+        print(json.dumps(pools, indent=1))
         return
-    tmp = OUT + ".tmp"
-    with open(tmp, "w") as f:
-        f.write(text)
-    os.replace(tmp, OUT)
+    for target, content in ((OUT, text), (POOLS, json.dumps(pools, indent=1) + "\n")):
+        tmp = target + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(content)
+        os.replace(tmp, target)
 
 
 if __name__ == "__main__":

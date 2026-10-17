@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -177,6 +178,7 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	return wsproto.AdapterAdvertisement{
 		ID: id, Adapter: "llamacpp", Endpoint: publicEndpoint,
 		AcceleratorIndex: cfg.AcceleratorIndex, Models: models, ResidentModels: residentModels,
+		ModelPools:       readModelPools(cfg.ModelPoolsFile, models),
 		Version:          "llamacpp-" + hex.EncodeToString(capabilityHash[:8]),
 		ModelFingerprint: hex.EncodeToString(modelHash[:]), ContextLimit: contextLimit, Slots: slots,
 		CapacitySource: capacitySource, CapabilitiesVerified: verified, RuntimeArgs: append([]string(nil), cfg.RuntimeArgs...),
@@ -494,4 +496,31 @@ func routerProfileContextLimit(profiles []RuntimeProfileConfig, contextLimit, sl
 		return match
 	}
 	return contextLimit
+}
+
+// readModelPools returns the configured context pools of the models this
+// runtime advertises; a missing or invalid file advertises none (the
+// controller then falls back to the target's context limit and slots).
+func readModelPools(path string, models []string) map[string]wsproto.ModelPool {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var pools map[string]wsproto.ModelPool
+	if json.Unmarshal(data, &pools) != nil {
+		return nil
+	}
+	out := make(map[string]wsproto.ModelPool)
+	for _, model := range models {
+		if pool, ok := pools[model]; ok && pool.PoolTokens > 0 && pool.Slots > 0 && pool.MaxRequestTokens > 0 {
+			out[model] = pool
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }

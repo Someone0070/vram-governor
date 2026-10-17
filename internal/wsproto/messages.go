@@ -879,6 +879,10 @@ type AdapterAdvertisement struct {
 	// remains a compatibility summary; controllers must consume this identity-
 	// bound record before admitting native checkpoint preemption.
 	CheckpointProof checkpointRuntime.CheckpointCapabilityProof `json:"checkpoint_proof,omitempty"`
+
+	// ModelPools is each model's shared context pool, as configured on the
+	// node (llama.cpp unified KV cache): see workloads.ModelPool.
+	ModelPools map[string]ModelPool `json:"model_pools,omitempty"`
 }
 
 // RuntimeProfileAdvertisement is a finite, node-allowlisted capacity mode for
@@ -1296,4 +1300,11 @@ func CommandSigningMaterialForOwnedStop(command CommandPayload) ([]byte, error) 
 // envelope HMAC input to the separate fixed root broker validator.
 func CommandSigningMaterialForPlanRelaunch(command CommandPayload) ([]byte, error) {
 	return commandSigningMaterial(command)
+}
+
+// ModelPool is a model's context capacity on a runtime.
+type ModelPool struct {
+	PoolTokens       int `json:"pool_tokens"`
+	Slots            int `json:"slots"`
+	MaxRequestTokens int `json:"max_request_tokens"`
 }

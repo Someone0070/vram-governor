@@ -666,7 +666,10 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 			entry.Governor.TargetCount++
 			entry.Governor.Resident = entry.Governor.Resident || stringPresent(target.ResidentModels, model)
 			entry.Governor.LifecycleCapable = entry.Governor.LifecycleCapable || target.SupportsModelLifecycle
-			if target.ContextLimit > 0 {
+			if pool, pooled := target.ModelPools[model]; pooled && pool.MaxRequestTokens > entry.Governor.MaxContextTokens {
+				entry.Governor.MaxContextTokens = pool.MaxRequestTokens
+			}
+			if _, pooled := target.ModelPools[model]; !pooled && target.ContextLimit > 0 {
 				if target.ContextLimit > entry.Governor.MaxContextTokens {
 					entry.Governor.MaxContextTokens = target.ContextLimit
 				}

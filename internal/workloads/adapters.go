@@ -531,6 +531,10 @@ func (a *HTTPAdapter) Validate(ctx context.Context, req domain.WorkloadRequest) 
 	return nil
 }
 
+// defaultReservedOutputTokens is the output a local request reserves from its
+// model's context pool when it sets no max_tokens.
+const defaultReservedOutputTokens = 2048
+
 func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadRequest) (Requirements, error) {
 	var body struct {
 		Model               string   `json:"model"`
@@ -557,10 +561,21 @@ func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadReque
 		}
 	}
 	contextTokens := req.Bounds.ContextTokens
-	if contextTokens <= 0 && (a.kind == "llama" || a.kind == "openrouter") {
+	if contextTokens <= 0 && a.kind == "openrouter" {
 		// Without tokenizer access, one token per payload byte is a safe upper
-		// bound for admission and cloud budget reservation.
+		// bound for cloud budget reservation.
 		contextTokens = len(req.Payload)
+	}
+	if a.kind == "llama" {
+		// Local requests reserve context from the model's shared pool, where
+		// one token per byte (3-4x too many) would starve concurrency. Clients
+		// that know better send governor.context_tokens and max_tokens.
+		if contextTokens <= 0 {
+			contextTokens = len(req.Payload)/3 + 1
+		}
+		if maxOutput <= 0 {
+			maxOutput = defaultReservedOutputTokens
+		}
 	}
 	return Requirements{
 		Model:               body.Model,

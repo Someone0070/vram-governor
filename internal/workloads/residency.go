@@ -1212,6 +1212,9 @@ func (m *Manager) checkResidentCapacityExcluding(ctx context.Context, target Tar
 		}
 	}
 	slots := target.Slots
+	if pool, pooled := modelPool(target, requested); pooled {
+		slots = pool.Slots
+	}
 	if slots <= 0 {
 		slots = 1
 	}

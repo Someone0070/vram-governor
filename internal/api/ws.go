@@ -850,6 +850,7 @@ func (s *Server) applyAdapterPlans(nodeID string, plans []registrationAdapterPla
 			ID: targetID, NodeID: nodeID, Adapter: advertised.Adapter, Endpoint: advertised.Endpoint,
 			AcceleratorID: acceleratorID, AcceleratorVRAMMB: acceleratorVRAMMB,
 			Models: advertised.Models, ResidentModels: advertised.ResidentModels, CustomNodes: advertised.CustomNodes,
+			ModelPools:   advertisedModelPools(advertised.ModelPools),
 			ContextLimit: advertised.ContextLimit, Slots: advertised.Slots, CapabilityGeneration: advertised.CapabilityGeneration,
 			CapabilityVersion: plan.runtimeIdentity, RuntimeIdentity: plan.runtimeIdentity, CapabilityRevision: plan.capabilityRevision, Capabilities: plan.capabilities, Capacity: advertised.Capacity, MaxAcceleratorsPerWorkload: plan.maxAccelerators, ModelFingerprint: advertised.ModelFingerprint,
 			CapacitySource: advertised.CapacitySource, CapacityVerified: advertised.CapabilitiesVerified,
@@ -1397,4 +1398,17 @@ func systemTelemetryFromWire(system wsproto.SystemTelemetry) domain.SystemTeleme
 		NetworkAddresses: append([]string(nil), system.NetworkAddresses...), NetworkRXBPS: system.NetworkRXBPS, NetworkTXBPS: system.NetworkTXBPS,
 		UptimeSeconds: system.UptimeSeconds, SampledAt: system.SampledAt,
 	}
+}
+
+func advertisedModelPools(advertised map[string]wsproto.ModelPool) map[string]workloads.ModelPool {
+	if len(advertised) == 0 {
+		return nil
+	}
+	pools := make(map[string]workloads.ModelPool, len(advertised))
+	for model, pool := range advertised {
+		if pool.PoolTokens > 0 && pool.Slots > 0 && pool.MaxRequestTokens > 0 {
+			pools[model] = workloads.ModelPool{PoolTokens: pool.PoolTokens, Slots: pool.Slots, MaxRequestTokens: pool.MaxRequestTokens}
+		}
+	}
+	return pools
 }

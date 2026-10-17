@@ -114,10 +114,6 @@ type Target struct {
 	MinResidency                 time.Duration                               `json:"min_residency,omitempty" yaml:"-"`
 	Cloud                        bool                                        `json:"cloud" yaml:"cloud"`
 	Enabled                      bool                                        `json:"enabled" yaml:"enabled"`
-	// ComfyUI marks a native ComfyUI that serves the LB-hosted web UI. Only
-	// requests pinned to it run there, and it never opens its own websocket
-	// with the browser's client id (that would take the browser's events).
-	ComfyUI bool `json:"comfy_ui,omitempty" yaml:"comfy_ui"`
 	Authorization                string                                      `json:"-" yaml:"authorization"`
 	InputCentsPerMTok            int64                                       `json:"input_cents_per_million_tokens,omitempty" yaml:"input_cents_per_million_tokens"`
 	OutputCentsPerMTok           int64                                       `json:"output_cents_per_million_tokens,omitempty" yaml:"output_cents_per_million_tokens"`
@@ -141,6 +137,15 @@ type Target struct {
 	Provider                     string                                      `json:"provider,omitempty" yaml:"provider"`
 	Quarantined                  bool                                        `json:"quarantined" yaml:"quarantined"`
 	CheckpointProof              checkpointRuntime.CheckpointCapabilityProof `json:"checkpoint_proof,omitempty" yaml:"-"`
+
+	// ComfyUI marks a native ComfyUI that serves the LB-hosted web UI. Only
+	// requests pinned to it run there, and it never opens its own websocket
+	// with the browser's client id (that would take the browser's events).
+	ComfyUI bool `json:"comfy_ui,omitempty" yaml:"comfy_ui"`
+	// ModelPools gives each model its own shared context pool (llama.cpp
+	// unified KV cache): requests reserve tokens from it instead of owning a
+	// fixed slot size. A model listed here ignores ContextLimit and Slots.
+	ModelPools map[string]ModelPool `json:"model_pools,omitempty" yaml:"-"`
 }
 
 // RuntimeCapacityProfile is a client-visible, finite context/concurrency mode.
@@ -287,4 +292,12 @@ func containsString(values []string, wanted string) bool {
 		}
 	}
 	return false
+}
+
+// ModelPool is one model's context capacity on a runtime: PoolTokens shared
+// by up to Slots concurrent requests, each at most MaxRequestTokens.
+type ModelPool struct {
+	PoolTokens       int `json:"pool_tokens"`
+	Slots            int `json:"slots"`
+	MaxRequestTokens int `json:"max_request_tokens"`
 }

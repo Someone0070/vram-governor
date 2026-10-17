@@ -7022,3 +7022,65 @@ func TestModelNotLoadedRequeuesAndMarksModelCold(t *testing.T) {
 		t.Fatal("an ordinary 400 was retried")
 	}
 }
+
+// poolAdapter is a gated adapter whose requests name a model and a context
+// size ({"model": "m", "ctx": 6000}).
+type poolAdapter struct{ gatedAdapter }
+
+func (poolAdapter) Requirements(_ context.Context, req domain.WorkloadRequest) (Requirements, error) {
+	var body struct {
+		Model string `json:"model"`
+		Ctx   int    `json:"ctx"`
+	}
+	_ = json.Unmarshal(req.Payload, &body)
+	return Requirements{Model: body.Model, ContextTokens: body.Ctx, AcceleratorRequired: true}, nil
+}
+
+// Requests reserve tokens from the model's shared context pool: several fit
+// side by side, one that does not fit waits, and one larger than the model
+// allows per request is refused outright.
+func TestModelContextPoolAdmitsByTokens(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := &sync.Map{}
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	mgr.RegisterAdapter(poolAdapter{gatedAdapter{name: "llm", done: done}})
+	mgr.RegisterTarget(Target{ID: "router", Adapter: "llm", AcceleratorID: "gpu-0", Slots: 1, ContextLimit: 1024, Enabled: true,
+		Models: []string{"m"}, ModelPools: map[string]ModelPool{"m": {PoolTokens: 10000, Slots: 4, MaxRequestTokens: 8000}}})
+	mgr.Start(ctx)
+	submit := func(item string, tokens int) *domain.Workload {
+		w, _, err := mgr.Submit(ctx, domain.WorkloadRequest{OwnerID: "o", Adapter: "llm", ItemID: item, Payload: json.RawMessage(fmt.Sprintf(`{"model":"m","ctx":%d}`, tokens))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return w
+	}
+	latest := func(w *domain.Workload) *domain.Workload { got, _ := mgr.Get(ctx, w.Request.ID); return got }
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for !cond() {
+			if time.Now().After(deadline) {
+				t.Fatalf("timed out waiting for %s", what)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	tooBig := submit("too-big", 9000)
+	waitFor("oversized request refused", func() bool {
+		w := latest(tooBig)
+		return w.Status == domain.WorkloadRejected || w.Status == domain.WorkloadWaiting && strings.Contains(w.Decision.Blocker, "at most 8000")
+	})
+	_ = mgr.Cancel(ctx, tooBig.Request.ID, "o", false)
+	first := submit("first", 6000)
+	waitFor("first running", func() bool { return latest(first).Status == domain.WorkloadRunning })
+	second := submit("second", 5000)
+	waitFor("second waiting for pool room", func() bool { return strings.Contains(latest(second).Decision.Blocker, "context pool is full") })
+	third := submit("third", 3000)
+	waitFor("third running beside first", func() bool { return latest(third).Status == domain.WorkloadRunning })
+	if latest(second).Status == domain.WorkloadRunning {
+		t.Fatal("second overfilled the pool")
+	}
+	done.Store(first.Request.ID, true)
+	waitFor("second running once first finished", func() bool { return latest(second).Status == domain.WorkloadRunning })
+}
