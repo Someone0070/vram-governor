@@ -140,6 +140,12 @@ func (s *streamSSEState) process(block []byte) ([]byte, bool) {
 	if s == nil || s.done {
 		return nil, true
 	}
+	if sseBlockEndsResponse(block) {
+		// The Responses API has no [DONE]: its last event is
+		// response.completed (or failed/incomplete), forwarded unchanged.
+		s.done = true
+		return block, true
+	}
 	if sseBlockHasDone(block) {
 		s.done = true
 		// Canonicalize the terminal marker so every public stream has exactly
@@ -174,6 +180,25 @@ func (s *streamSSEState) process(block []byte) ([]byte, bool) {
 		block = s.stripAssistantPrefix(block)
 	}
 	return block, false
+}
+
+func sseBlockEndsResponse(block []byte) bool {
+	for _, line := range bytes.Split(block, []byte("\n")) {
+		trimmed := strings.TrimSpace(string(line))
+		if !strings.HasPrefix(trimmed, "data:") {
+			continue
+		}
+		var event struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))), &event) == nil {
+			switch event.Type {
+			case "response.completed", "response.failed", "response.incomplete":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func sseBlockHasDone(block []byte) bool {
@@ -505,6 +530,12 @@ func (a *HTTPAdapter) Validate(ctx context.Context, req domain.WorkloadRequest) 
 			}
 			break
 		}
+		if req.WorkloadType == WorkloadTypeResponses {
+			if body.Input == nil {
+				return fmt.Errorf("responses payload requires input")
+			}
+			break
+		}
 		if len(body.Messages) == 0 && body.Prompt == nil {
 			return fmt.Errorf("LLM payload requires messages or prompt")
 		}
@@ -540,6 +571,7 @@ func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadReque
 		Model               string   `json:"model"`
 		MaxTokens           int      `json:"max_tokens"`
 		MaxCompletionTokens int      `json:"max_completion_tokens"`
+		MaxOutputTokens     int      `json:"max_output_tokens"`
 		RequiredCustomNodes []string `json:"required_custom_nodes"`
 	}
 	_ = json.Unmarshal(req.Payload, &body)
@@ -554,10 +586,9 @@ func (a *HTTPAdapter) Requirements(ctx context.Context, req domain.WorkloadReque
 		}
 	}
 	maxOutput := req.Bounds.MaxOutput
-	if maxOutput <= 0 {
-		maxOutput = body.MaxCompletionTokens
+	for _, declared := range []int{body.MaxCompletionTokens, body.MaxTokens, body.MaxOutputTokens} {
 		if maxOutput <= 0 {
-			maxOutput = body.MaxTokens
+			maxOutput = declared
 		}
 	}
 	contextTokens := req.Bounds.ContextTokens
@@ -671,12 +702,18 @@ const WorkloadTypeEmbeddings = "llm.embeddings"
 // WorkloadTypeCompletion marks legacy OpenAI /v1/completions requests.
 const WorkloadTypeCompletion = "llm.completion"
 
+// WorkloadTypeResponses marks OpenAI Responses API requests; llama.cpp serves
+// /v1/responses natively.
+const WorkloadTypeResponses = "llm.responses"
+
 func llmPath(req domain.WorkloadRequest) string {
 	switch req.WorkloadType {
 	case WorkloadTypeEmbeddings:
 		return "/v1/embeddings"
 	case WorkloadTypeCompletion:
 		return "/v1/completions"
+	case WorkloadTypeResponses:
+		return "/v1/responses"
 	}
 	return "/v1/chat/completions"
 }

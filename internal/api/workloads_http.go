@@ -453,6 +453,12 @@ func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 	s.serveOpenAIInference(w, r, workloads.WorkloadTypeCompletion)
 }
 
+// handleResponses serves the OpenAI Responses API (input/instructions in,
+// response object or response.* events out), forwarded to the runtime.
+func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
+	s.serveOpenAIInference(w, r, workloads.WorkloadTypeResponses)
+}
+
 // handleEmbeddings serves POST /v1/embeddings through the same admission,
 // residency and queueing path as chat; the adapter forwards it to the
 // runtime's /v1/embeddings.
@@ -481,6 +487,7 @@ func (s *Server) serveOpenAIInference(w http.ResponseWriter, r *http.Request, wo
 		Stream              bool   `json:"stream"`
 		MaxTokens           int    `json:"max_tokens"`
 		MaxCompletionTokens int    `json:"max_completion_tokens"`
+		MaxOutputTokens     int    `json:"max_output_tokens"`
 		Governor            struct {
 			Adapter         string                 `json:"adapter"`
 			Egress          domain.EgressPolicy    `json:"egress"`
@@ -511,6 +518,9 @@ func (s *Server) serveOpenAIInference(w http.ResponseWriter, r *http.Request, wo
 	maxOutput := envelope.MaxCompletionTokens
 	if maxOutput == 0 {
 		maxOutput = envelope.MaxTokens
+	}
+	if maxOutput == 0 {
+		maxOutput = envelope.MaxOutputTokens
 	}
 	placementKey := envelope.Governor.PlacementKey
 	if placementKey == "" {

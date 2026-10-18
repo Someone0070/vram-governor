@@ -590,3 +590,49 @@ func TestControllerAdapterNodeReadinessAndSingleCardCeiling(t *testing.T) {
 		t.Fatalf("expected one-card ceiling blocker, got %v", err)
 	}
 }
+
+func TestResponsesStreamEndsAtResponseCompleted(t *testing.T) {
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			t.Errorf("responses request went to %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
+		_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"))
+	}))
+	defer backend.Close()
+	adapter := NewHTTPAdapter("llamacpp", "llama", backend.Client())
+	request := domain.WorkloadRequest{ID: "responses-stream", WorkloadType: WorkloadTypeResponses, Payload: json.RawMessage(`{"model":"model","input":"hi","stream":true}`)}
+	var mu sync.Mutex
+	var body []byte
+	handle, err := adapter.startLiveStream(context.Background(), request, nil, Target{ID: "target", Endpoint: backend.URL}, request.Payload, func(chunk []byte) error {
+		mu.Lock()
+		body = append(body, chunk...)
+		mu.Unlock()
+		return nil
+	}, nil, -1, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		observation, observeErr := adapter.Observe(context.Background(), request, nil, handle, Target{ID: "target", Endpoint: backend.URL})
+		if observeErr != nil {
+			t.Fatalf("a Responses stream without [DONE] must not fail: %v", observeErr)
+		}
+		if observation.Status == domain.WorkloadSucceeded {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("responses stream did not complete")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	got := string(body)
+	mu.Unlock()
+	if !strings.Contains(got, "response.completed") || strings.Contains(got, "[DONE]") {
+		t.Fatalf("responses events were not forwarded unchanged: %q", got)
+	}
+}
