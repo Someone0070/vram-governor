@@ -422,6 +422,41 @@ def main():
         runs[model].append((config, measured))
         report(model, config, measured)
         prefetch.done(path)
+    # phase 3: refine scans of models that need both GPUs. A coarse grid can
+    # step over a narrow good window (Gemma 4 26B: 52:48 read prompts at 180
+    # tok/s, 56:44 at 2180, 62:38 did not load); probe halfway between the
+    # best ratio and each neighbour, failed loads included.
+    for model, path, options, mtp, single, splits in work:
+        if single or len(splits) < 3:
+            continue
+        for _ in range(3):
+            scanned = sorted((share_of(c, primary), m) for c, m in runs[model] if c.get("tensor-split"))
+            good = [(s_, m) for s_, m in scanned if m]
+            if not good:
+                break
+            best_index = max(range(len(scanned)), key=lambda i: (scanned[i][1]["pp"] * scanned[i][1]["tg1"]) if scanned[i][1] else -1)
+            best_share = scanned[best_index][0]
+            probes = []
+            for neighbour in (best_index - 1, best_index + 1):
+                if 0 <= neighbour < len(scanned):
+                    middle = round((best_share + scanned[neighbour][0]) / 2, 2)
+                    if all(abs(middle - s_) > 0.015 for s_, _ in scanned):
+                        probes.append(middle)
+            if not probes:
+                break
+            improved = False
+            for share in probes:
+                config = {"device": f"{primary},{second}", "tensor-split": f"{round(share * 100)},{100 - round(share * 100)}"}
+                prefetch.ahead([path])
+                measured = run_config(model, path, config, options, mtp, 8095)
+                runs[model].append((config, measured))
+                report(model, config, measured)
+                best = scanned[best_index][1]
+                if measured and measured["pp"] * measured["tg1"] > best["pp"] * best["tg1"] * 1.1:
+                    improved = True
+            if not improved:
+                break
+        prefetch.unpin(path)
     # fit, choose, confirm
     results = P.load_calibration()
     print("\n| model | chosen | pool | slots | gen 1 stream | prompt | jobs/min (predicted) | confirmed |\n|---|---|---|---|---|---|---|---|", flush=True)
