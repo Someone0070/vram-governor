@@ -2039,7 +2039,9 @@ func (m *Manager) UpdateAcceleratorCapacity(acceleratorID string, vramTotalMB in
 		target, found := m.targets[id]
 		pendingKey := m.runtimeProfileTransitionTarget[id]
 		pending := pendingKey != "" && m.runtimeProfileTransitions[pendingKey] != nil && !m.runtimeProfileTransitions[pendingKey].projected
-		if found && !pending && target.AcceleratorID == acceleratorID && target.AcceleratorVRAMMB != vramTotalMB {
+		// A target spanning several GPUs keeps the total registered for all
+		// of them; one GPU's telemetry would shrink it to that card.
+		if found && !pending && target.AcceleratorID == acceleratorID && len(target.CompanionAcceleratorIDs) == 0 && target.AcceleratorVRAMMB != vramTotalMB {
 			previous := target
 			target.AcceleratorVRAMMB = vramTotalMB
 			generationErr = m.replaceTargetLocked(target)
