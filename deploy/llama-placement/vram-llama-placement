@@ -280,7 +280,9 @@ def sweep_key(model, path, cards):
 def sweep_placed(record):
     if record.get("tensor-split"):
         return {"device": record["device"], "tensor-split": record["tensor-split"], "n-gpu-layers": "99", "fit": "off"}
-    return {"device": record["device"]}
+    # Measured with every layer on the GPU and auto-fit off; auto-fit could
+    # otherwise move layers to the CPU at the measured pool.
+    return {"device": record["device"], "n-gpu-layers": "99", "fit": "off"}
 
 
 FIT_CACHE = os.environ.get("VG_LLAMA_FIT_CACHE", "/var/lib/vram-governor/llama-fit-cache.json")
