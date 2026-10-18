@@ -190,6 +190,22 @@ def models():
     return out
 
 
+def mmproj_path(path):
+    """The vision projector next to a model's weights, if any."""
+    folder = os.path.dirname(path)
+    if os.path.realpath(folder) == os.path.realpath(MODELS_DIR):
+        return None
+    found = sorted(f for f in os.listdir(folder) if f.endswith(".gguf") and "mmproj" in f.lower())
+    return os.path.join(folder, found[0]) if found else None
+
+
+def needs_measured_pool(path, placed, mtp):
+    """Pools no estimate gets right: MTP drafts, split models (fit is off, so
+    a wrong pool aborts the load) and vision models (projector and image
+    buffers: Qwen3-VL-30B and Gemma 4 26B ran out of CUDA memory)."""
+    return bool(mtp) or "," in placed.get("device", "") or mmproj_path(path) is not None
+
+
 def mmproj_bytes(path):
     """Size of a vision projector next to the weights (it loads on the primary GPU)."""
     folder = os.path.dirname(path)
@@ -299,7 +315,12 @@ def context_pool(model, path, placed, base, cards):
     arch = meta.get("general.architecture", "")
     trained = int(meta.get(f"{arch}.context_length", 0) or 32768)
     weights = os.path.getsize(path)
-    per_token = max(1, kv_cache_bytes(meta, 1, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16")))
+    # Growth per token, measured between two sizes: sliding-window layers
+    # stop growing at their window and are a fixed cost (fixed_kv), so
+    # dividing the free bytes by the 1-token cost understated Gemma 4's pool.
+    kv_at = lambda tokens: kv_cache_bytes(meta, tokens, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16"))
+    per_token = max(1, (kv_at(65536) - kv_at(32768)) // 32768)
+    fixed_kv = max(0, kv_at(32768) - per_token * 32768)
     slots = 8 if weights < 6 * GIB else 4
     names = placed.get("device", cards[0][0] if cards else "").split(",")
     capacities = {name: (total - RESERVE_MIB) << 20 for name, total in cards}
@@ -337,10 +358,10 @@ def context_pool(model, path, placed, base, cards):
         shares = [float(x) for x in placed["tensor-split"].split(",")]
         total = sum(shares)
         shares = [x / total for x in shares]
-        pool_bytes = min(capacities.get(n, 0) / share - weights - margin for n, share in zip(names, shares) if share > 0)
+        pool_bytes = min(capacities.get(n, 0) / share - weights - margin for n, share in zip(names, shares) if share > 0) - fixed_kv
         pool = int(pool_bytes / per_token)
     else:
-        pool = int((capacities.get(names[0], 0) - weights - margin) / per_token)
+        pool = int((capacities.get(names[0], 0) - weights - margin - fixed_kv) / per_token)
     pool = min(pool, trained * slots)
     pool -= pool % 256
     if pool < 2048:
@@ -357,14 +378,14 @@ def with_mtp(model, path, placed, base, cards, pool, slots, max_request, extra):
     """Apply the calibrated MTP pool, if this model has one."""
     options = base[model] if base.has_section(model) else {}
     mtp = mtp_settings(read_gguf_metadata(path), os.path.getsize(path), options)
-    if not mtp or extra or placed.get("n-gpu-layers", "99") != "99":
+    if not needs_measured_pool(path, placed, mtp) or extra or placed.get("n-gpu-layers", "99") != "99":
         return pool, slots, max_request, extra, ""
     cached = load_calibration().get(mtp_key(model, path, cards, placed))
     if not cached:
-        return pool, slots, max_request, extra, "; MTP uncalibrated (run --calibrate)"
+        return pool, slots, max_request, extra, "; MTP uncalibrated (run --calibrate)" if mtp else "; pool not measured (run --calibrate)"
     pool = min(pool, cached["pool"])
     slots = max(1, min(slots, pool // 2048))
-    return pool, slots, min(max_request, pool), dict(extra, **mtp), "; MTP"
+    return pool, slots, min(max_request, pool), dict(extra, **mtp), "; MTP, measured pool" if mtp else "; measured pool"
 
 
 def split_candidates(need, capacities):
@@ -438,18 +459,23 @@ def calibrate(base, cards, context):
                 r["pool"] = context_pool(model, path, dict(placed, **{"tensor-split": r["tensor_split"]}), base, cards)[0]
             except Exception:
                 r["pool"] = 0
-        best = max((r for r in tried if r["tg"] >= fastest * 0.95), key=lambda r: (r["pool"], r["tg"]), default=None)
+        # Prompt speed counts too: 27B Q5 at 42:58 generated at full speed but
+        # read prompts at 45 tok/s instead of 402.
+        quickest_prompt = max((r["pp"] for r in tried), default=0)
+        best = max((r for r in tried if r["tg"] >= fastest * 0.95 and r["pp"] >= quickest_prompt * 0.7), key=lambda r: (r["pool"], r["tg"]), default=None)
         if best and best["tg"] > 0:
             results[calibration_key(model, path, cards)] = dict(best, tried=tried)
             print(f"{model}: chose {best['tensor_split']}", flush=True)
     save_calibration(results)
-    # MTP pools, measured with the real server (on the split just chosen).
+    # Pools measured with the real server (on the split just chosen).
     for model, path in models().items():
         options = base[model] if base.has_section(model) else {}
-        mtp = mtp_settings(read_gguf_metadata(path), os.path.getsize(path), options)
-        if not mtp:
+        if options.get("embeddings") in ("1", "true", "on"):
             continue
+        mtp = mtp_settings(read_gguf_metadata(path), os.path.getsize(path), options)
         placed, _ = placement(model, path, base, cards, MIN_CONTEXT)
+        if not needs_measured_pool(path, placed, mtp):
+            continue
         pool, slots, _, extra = context_pool(model, path, placed, base, cards)
         if extra or placed.get("n-gpu-layers", "99") != "99":
             continue
@@ -501,10 +527,30 @@ def save_calibration(results):
     os.replace(tmp, CALIBRATION)
 
 
+def _test_image():
+    import base64
+    import zlib
+    width = height = 256
+    rows = b"".join(b"\x00" + b"".join(bytes([(x * 7) % 256, (y * 5) % 256, 128]) for x in range(width)) for y in range(height))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+
+
+TEST_IMAGE = _test_image()
+
+
 def loads_on_gpus(path, preset, options):
     """Start llama-server with these preset keys: healthy with every layer on the GPUs?"""
     # -lv 4: the "offloaded N/M layers" line is debug-level output.
     args = [SERVER, "-m", path, "--host", "127.0.0.1", "--port", "8098", "--no-webui", "-fa", "on", "-lv", "4"]
+    projector = mmproj_path(path)
+    if projector:
+        # The router loads the projector too; its buffers count.
+        args += ["--mmproj", projector]
     merged = dict(preset)
     merged.update({k: v for k, v in options.items() if k not in OWN_KEYS})
     for key, value in merged.items():
@@ -532,8 +578,13 @@ def loads_on_gpus(path, preset, options):
             # MTP allocates more on its first draft: a pool that loads can
             # still run out of memory on the first request (27B Q6 at 35584).
             body = json.dumps({"prompt": "Count from one to twenty in words:", "n_predict": 48}).encode()
+            endpoint = "/completion"
+            if projector:
+                # Encoding an image allocates the projector's compute buffers.
+                body = json.dumps({"messages": [{"role": "user", "content": [{"type": "text", "text": "Describe this image."}, {"type": "image_url", "image_url": {"url": TEST_IMAGE}}]}], "max_tokens": 48}).encode()
+                endpoint = "/v1/chat/completions"
             try:
-                request = urllib.request.Request("http://127.0.0.1:8098/completion", data=body, headers={"Content-Type": "application/json"})
+                request = urllib.request.Request("http://127.0.0.1:8098" + endpoint, data=body, headers={"Content-Type": "application/json"})
                 healthy = urllib.request.urlopen(request, timeout=300).status == 200 and proc.poll() is None
             except Exception:
                 healthy = False

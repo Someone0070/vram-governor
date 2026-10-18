@@ -4943,6 +4943,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 
 	var blockers []string
 	loadFailures := 0
+	loadFailureBlocker := ""
 	contextTooLarge := 0
 	// Codes are recorded where the cause is known; blockers without an entry
 	// fall back to ClassifyBlocker when the decision is built.
@@ -5178,6 +5179,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 				if failures >= modelLoadFailFastAfter {
 					code = domain.BlockerRuntimeUnsupported
 					loadFailures++
+					loadFailureBlocker = target.ID + ": " + reason
 				}
 				blockers = append(blockers, coded(code, target.ID+": "+reason))
 				continue
@@ -5775,6 +5777,11 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 	primaryBlocker := "no eligible capacity"
 	if len(blockers) > 0 {
 		primaryBlocker = blockers[primaryBlockerIndex(codes, blockerCode)]
+	}
+	if loadFailureBlocker != "" && permanentlyBlocked && contextTooLarge == 0 {
+		// The route that has the model failed to load it; other routes merely
+		// lack the model, which is not the actionable cause.
+		primaryBlocker = loadFailureBlocker
 	}
 	if contextTooLarge > 0 && permanentlyBlocked {
 		// The size limit is the actionable cause, not "model unavailable" on
