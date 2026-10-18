@@ -111,18 +111,16 @@ func postOpenAIChat(t *testing.T, gateway *httptest.Server, body string) (int, o
 	return resp.StatusCode, decoded
 }
 
-func TestOpenAIFailFastUnservedModelIsRuntimeUnsupported(t *testing.T) {
+func TestOpenAIUnservedModelIsModelNotFound(t *testing.T) {
 	credential := CredentialConfig{ID: "client", Token: "client-token", OwnerID: "owner", Plane: "api", Scopes: []string{"inference:submit"}, Adapters: []string{"llamacpp"}, MaxPriority: 10, EgressPolicy: "local_only"}
 	_, gateway := newOpenAIBlockerGateway(t, credential, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("backend must not be called for an unserved model")
 	}))
+	// OpenAI clients treat a misspelled model as a 404 model_not_found, not a
+	// retryable capacity problem.
 	status, body := postOpenAIChat(t, gateway, `{"model":"not-served","messages":[{"role":"user","content":"x"}],"governor":{"context_tokens":256}}`)
-	if status != http.StatusServiceUnavailable || body.Error.Code != string(domain.BlockerRuntimeUnsupported) {
+	if status != http.StatusNotFound || body.Error.Code != "model_not_found" || !strings.Contains(body.Error.Message, "not-served") {
 		t.Fatalf("status=%d body=%+v", status, body)
-	}
-	// fail_fast keeps the generic first line but the real cause survives.
-	if body.Admission.Blocker != "no eligible capacity (fail_fast)" || len(body.Admission.Alternatives) == 0 || !strings.Contains(body.Admission.Alternatives[0], "model unavailable") {
-		t.Fatalf("real blocker was not preserved: %+v", body.Admission)
 	}
 }
 

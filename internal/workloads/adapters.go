@@ -668,9 +668,15 @@ func (a *HTTPAdapter) Plan(ctx context.Context, req domain.WorkloadRequest, targ
 // LLM admission and residency but use the runtime's embeddings route.
 const WorkloadTypeEmbeddings = "llm.embeddings"
 
+// WorkloadTypeCompletion marks legacy OpenAI /v1/completions requests.
+const WorkloadTypeCompletion = "llm.completion"
+
 func llmPath(req domain.WorkloadRequest) string {
-	if req.WorkloadType == WorkloadTypeEmbeddings {
+	switch req.WorkloadType {
+	case WorkloadTypeEmbeddings:
 		return "/v1/embeddings"
+	case WorkloadTypeCompletion:
+		return "/v1/completions"
 	}
 	return "/v1/chat/completions"
 }
@@ -931,7 +937,7 @@ func (a *HTTPAdapter) StartStream(ctx context.Context, req domain.WorkloadReques
 	if err != nil {
 		return nil, err
 	}
-	backendRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/chat/completions", bytes.NewReader(payload))
+	backendRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+llmPath(req), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
@@ -1200,7 +1206,7 @@ func (a *HTTPAdapter) startLiveStream(ctx context.Context, req domain.WorkloadRe
 	a.recordCheckpointExecution(h, req, plan, target)
 	startup := make(chan error, 1)
 	go func() {
-		backendRequest, requestErr := http.NewRequestWithContext(runCtx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+"/v1/chat/completions", bytes.NewReader(payload))
+		backendRequest, requestErr := http.NewRequestWithContext(runCtx, http.MethodPost, strings.TrimRight(target.Endpoint, "/")+llmPath(req), bytes.NewReader(payload))
 		if requestErr == nil {
 			backendRequest.Header.Set("Content-Type", "application/json")
 			backendRequest.Header.Set("Accept", "text/event-stream")
@@ -1723,7 +1729,13 @@ func (a *HTTPAdapter) Observe(ctx context.Context, req domain.WorkloadRequest, p
 			a.clearCheckpointBinding(h)
 			return Observation{}, runErr
 		}
-		h.Opaque = output
+		// A streamed run's output is the raw SSE text, not JSON: storing it as
+		// the handle's json.RawMessage made the terminal workload row
+		// unmarshalable, so PostgreSQL never recorded the stream as finished.
+		// The stream's handle keeps its own binding document instead.
+		if json.Valid(output) {
+			h.Opaque = output
+		}
 		if performance != nil {
 			copy := *performance
 			h.Performance = &copy

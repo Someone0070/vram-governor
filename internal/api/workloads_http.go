@@ -446,6 +446,13 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	s.serveOpenAIInference(w, r, "llm.chat")
 }
 
+// handleCompletions serves the legacy text-completion API (prompt in,
+// choices[].text out); the adapter forwards it to the runtime's
+// /v1/completions.
+func (s *Server) handleCompletions(w http.ResponseWriter, r *http.Request) {
+	s.serveOpenAIInference(w, r, workloads.WorkloadTypeCompletion)
+}
+
 // handleEmbeddings serves POST /v1/embeddings through the same admission,
 // residency and queueing path as chat; the adapter forwards it to the
 // runtime's /v1/embeddings.
@@ -463,8 +470,11 @@ func (s *Server) serveOpenAIInference(w http.ResponseWriter, r *http.Request, wo
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 8<<20))
 	if err != nil || !json.Valid(body) {
-		writeJSON(w, 400, map[string]string{"error": "invalid JSON body"})
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "request body is not valid JSON", "invalid_request_error", "invalid_json")
 		return
+	}
+	if workloadType == "llm.chat" {
+		body = enforceJSONObjectFormat(body)
 	}
 	var envelope struct {
 		Model               string `json:"model"`
@@ -528,12 +538,20 @@ func (s *Server) serveOpenAIInference(w http.ResponseWriter, r *http.Request, wo
 	}
 	req := domain.WorkloadRequest{Plane: domain.PlaneOpenAI, Adapter: adapter, WorkloadType: workloadType, Payload: body, QoS: domain.QoSInteractive, Priority: priority, QueuePolicy: queuePolicy, Disruption: disruption, InterruptionConsent: envelope.Governor.InterruptionConsent, Egress: envelope.Governor.Egress, Bounds: domain.WorkloadBounds{ContextTokens: envelope.Governor.ContextTokens, MaxOutput: maxOutput}, PlacementKey: placementKey, PlacementPolicy: placementPolicy, InteractiveStream: envelope.Stream, Recoverable: envelope.Governor.Recoverable, PreemptionBudget: envelope.Governor.PreemptionBudget}
 	if err := s.prepareRequest(r, p, &req); err != nil {
-		writeJSON(w, 403, map[string]string{"error": err.Error()})
+		writeOpenAIErrorCode(w, http.StatusForbidden, err.Error(), "permission_error", "request_not_allowed")
+		return
+	}
+	if envelope.Model == "" {
+		writeOpenAIErrorCode(w, http.StatusBadRequest, "you must provide a model parameter", "invalid_request_error", "missing_model")
+		return
+	}
+	if !s.openAIModelExists(p, envelope.Model) {
+		writeOpenAIErrorCode(w, http.StatusNotFound, fmt.Sprintf("the model %q does not exist; GET /v1/models lists the available models", envelope.Model), "invalid_request_error", "model_not_found")
 		return
 	}
 	row, _, err := s.workloads.Submit(r.Context(), req)
 	if err != nil {
-		writeJSON(w, 400, map[string]string{"error": err.Error()})
+		writeOpenAIErrorCode(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_request")
 		return
 	}
 	if (row.Status == domain.WorkloadWaiting || row.Status == domain.WorkloadQueued) && queuePolicy == domain.QueueWait && disruption != domain.DisruptionCheckpointable {
@@ -731,7 +749,56 @@ func (s *Server) handleOpenAIModels(w http.ResponseWriter, r *http.Request) {
 		models = append(models, *entry)
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	if wanted := r.PathValue("model"); wanted != "" {
+		for _, model := range models {
+			if model.ID == wanted {
+				writeJSON(w, http.StatusOK, model)
+				return
+			}
+		}
+		writeOpenAIErrorCode(w, http.StatusNotFound, fmt.Sprintf("the model %q does not exist", wanted), "invalid_request_error", "model_not_found")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": models})
+}
+
+// openAIModelExists reports whether any route this principal may use serves
+// model, so a typo gets OpenAI's 404 model_not_found instead of a scheduler
+// admission blocker.
+func (s *Server) openAIModelExists(p Principal, model string) bool {
+	for _, target := range s.workloads.Targets() {
+		if !target.Enabled || target.Quarantined || !allowsAdapter(p, target.Adapter) {
+			continue
+		}
+		for _, served := range target.Models {
+			if served == model || served == "*" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// enforceJSONObjectFormat rewrites response_format {"type":"json_object"}
+// as a schema for any object: llama.cpp only constrains output for
+// json_schema, and thinking models otherwise answer with fenced markdown.
+func enforceJSONObjectFormat(body []byte) []byte {
+	var request map[string]json.RawMessage
+	if json.Unmarshal(body, &request) != nil {
+		return body
+	}
+	var format struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(request["response_format"], &format) != nil || format.Type != "json_object" {
+		return body
+	}
+	request["response_format"] = json.RawMessage(`{"type":"json_schema","json_schema":{"name":"json_object","schema":{"type":"object"}}}`)
+	rewritten, err := json.Marshal(request)
+	if err != nil {
+		return body
+	}
+	return rewritten
 }
 
 func runtimeProfilePresent(values []workloads.RuntimeCapacityProfile, wanted workloads.RuntimeCapacityProfile) bool {
@@ -924,9 +991,9 @@ func (s *Server) comfyRow(w http.ResponseWriter, r *http.Request, p Principal, p
 }
 
 const (
-	comfyHistoryMaxInputBytes = 8 << 20
+	comfyHistoryMaxInputBytes  = 8 << 20
 	comfyHistoryMaxOutputBytes = 16 << 20
-	comfyHistoryMaxRows = 500
+	comfyHistoryMaxRows        = 500
 )
 
 var errComfyHistoryTooLarge = errors.New("Comfy history exceeds public response bounds")

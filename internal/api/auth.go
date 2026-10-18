@@ -350,11 +350,22 @@ func allowsAdapter(p Principal, adapter string) bool {
 
 func (s *Server) requirePrincipal(w http.ResponseWriter, r *http.Request, scope string) (Principal, bool) {
 	p, ok := s.authenticate(r)
+	// OpenAI SDKs read error.message/error.code; the console reads the flat
+	// error string, so only the OpenAI-compatible routes change shape.
+	openAI := strings.HasPrefix(r.URL.Path, "/v1/")
 	if !ok {
+		if openAI {
+			writeOpenAIErrorCode(w, http.StatusUnauthorized, "missing or invalid API key", "invalid_request_error", "invalid_api_key")
+			return Principal{}, false
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return Principal{}, false
 	}
 	if !hasScope(p, scope) || !planeAllowsScope(p, scope) {
+		if openAI {
+			writeOpenAIErrorCode(w, http.StatusForbidden, "this API key lacks the "+scope+" scope", "permission_error", "insufficient_scope")
+			return Principal{}, false
+		}
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "insufficient_scope", "required_scope": scope})
 		return Principal{}, false
 	}

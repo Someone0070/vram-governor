@@ -221,3 +221,7 @@ func (s *Server) cancelImageWorkloads(ids []string, owner string) {
 func writeOpenAIError(w http.ResponseWriter, status int, message, kind string) {
 	writeJSON(w, status, map[string]any{"error": map[string]string{"message": message, "type": kind}})
 }
+
+func writeOpenAIErrorCode(w http.ResponseWriter, status int, message, kind, code string) {
+	writeJSON(w, status, map[string]any{"error": map[string]any{"message": message, "type": kind, "code": code, "param": nil}})
+}

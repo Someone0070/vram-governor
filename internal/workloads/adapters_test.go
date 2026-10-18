@@ -241,6 +241,11 @@ func TestLiveStreamStitchesRepeatedPrefixAndCanonicalizesDone(t *testing.T) {
 	if !strings.Contains(got, "tool_calls") || !strings.Contains(got, "prompt_tokens") {
 		t.Fatalf("valid tool/usage events were not preserved: %q", got)
 	}
+	// PostgreSQL stores the workload row as JSON; raw SSE in the handle made
+	// every finished stream unpersistable (stuck "running").
+	if _, marshalErr := json.Marshal(handle); marshalErr != nil {
+		t.Fatalf("completed stream handle is not JSON-serializable: %v", marshalErr)
+	}
 }
 
 func TestLiveStreamMissingDoneIsVisibleFailure(t *testing.T) {

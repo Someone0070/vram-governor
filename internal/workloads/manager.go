@@ -8858,6 +8858,13 @@ func (m *Manager) RunStream(ctx context.Context, id string, emit func([]byte) er
 	for {
 		row, streamErr := m.executeStreamSegment(segment.ctx, id, segment.target, segment.reservation, session)
 		if !errors.Is(streamErr, errStreamPreempted) {
+			if streamErr != nil {
+				status := ""
+				if row != nil {
+					status = string(row.Status)
+				}
+				m.log.Warn("interactive stream ended with error", "workload_id", id, "status", status, "error", streamErr)
+			}
 			return row, streamErr
 		}
 		// The backend segment was checkpointed and its physical reservation was
