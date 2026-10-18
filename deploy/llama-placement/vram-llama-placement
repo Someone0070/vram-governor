@@ -93,7 +93,7 @@ def read_gguf_metadata(path):
                     return None
                 fmt = scalar[inner]
                 size = struct.calcsize(fmt)
-                if inner in (0, 1, 2, 3, 4, 5, 10, 11) and count <= 4096:
+                if inner in (0, 1, 2, 3, 4, 5, 7, 10, 11) and count <= 4096:
                     return [struct.unpack(fmt, f.read(size))[0] for _ in range(count)]
                 f.seek(size * count, io.SEEK_CUR)
                 return None
@@ -127,6 +127,23 @@ def kv_cache_bytes(meta, context, k_type, v_type):
         per_layer = per_layer[::max(1, int(interval))]
     k = CACHE_BYTES.get(k_type, 2.0)
     v = CACHE_BYTES.get(v_type, 2.0)
+    window = int(get("attention.sliding_window", 0) or 0)
+    pattern = get("attention.sliding_window_pattern")
+    if window and isinstance(pattern, list) and len(pattern) >= len(per_layer):
+        # Sliding-window layers (Gemma 4: five of every six) cache only the
+        # window per sequence, with their own (smaller) head sizes; reading
+        # every layer as full attention put Gemma 4 31B at 13 GiB of KV for
+        # 8k tokens.
+        swa_key = get("attention.key_length_swa") or head_dim
+        swa_value = get("attention.value_length_swa") or value_dim
+        swa_tokens = min(context, window * 4 + 512)
+        total = 0
+        for index, heads in enumerate(per_layer):
+            if pattern[index]:
+                total += heads * (swa_key * k + swa_value * v) * swa_tokens
+            else:
+                total += heads * (head_dim * k + value_dim * v) * context
+        return int(total)
     return int(sum(h * (head_dim * k + value_dim * v) for h in per_layer) * context)
 
 
@@ -167,10 +184,18 @@ def models():
         if entry.endswith(".gguf"):
             out[entry[:-5]] = path
         elif os.path.isdir(path):
-            weights = [f for f in sorted(os.listdir(path)) if f.endswith(".gguf") and not f.startswith("mmproj")]
+            weights = [f for f in sorted(os.listdir(path)) if f.endswith(".gguf") and "mmproj" not in f.lower()]
             if weights:
                 out[entry] = os.path.join(path, weights[0])
     return out
+
+
+def mmproj_bytes(path):
+    """Size of a vision projector next to the weights (it loads on the primary GPU)."""
+    folder = os.path.dirname(path)
+    if os.path.realpath(folder) == os.path.realpath(MODELS_DIR):
+        return 0
+    return sum(os.path.getsize(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".gguf") and "mmproj" in f.lower())
 
 
 def placement(model, path, base, cards, context):
@@ -187,7 +212,7 @@ def placement(model, path, base, cards, context):
         return {"device": cards[0][0]}, f"metadata unreadable ({error}); primary GPU"
     # Margin calibrated on the RTX 4070 SUPER: qwen2.5-14b (8.4 GiB weights,
     # 1.7 GiB q4_0 KV at 32k) runs fully on the card using 10.0 GiB.
-    need = weights + kv + GIB // 2 + weights // 50
+    need = weights + kv + GIB // 2 + weights // 50 + mmproj_bytes(path)
     capacities = [(name, (total - RESERVE_MIB) << 20) for name, total in cards]
     note = f"weights {weights / GIB:.1f} GiB + KV {kv / GIB:.1f} GiB at ctx {context} = {need / GIB:.1f} GiB"
     if need <= capacities[0][1] or len(cards) == 1:
@@ -278,6 +303,8 @@ def context_pool(model, path, placed, base, cards):
     slots = 8 if weights < 6 * GIB else 4
     names = placed.get("device", cards[0][0] if cards else "").split(",")
     capacities = {name: (total - RESERVE_MIB) << 20 for name, total in cards}
+    if cards:
+        capacities[cards[0][0]] -= mmproj_bytes(path)
     margin = GIB // 2 + weights // 50
     layers = int(meta.get(f"{arch}.block_count", 0) or 0)
     gpu_layers = int(placed.get("n-gpu-layers", "99"))
@@ -402,7 +429,16 @@ def calibrate(base, cards, context):
             pp = next((r.get("avg_ts", 0) for r in runs if r.get("n_prompt", 0) > 0 and r.get("n_gen", 0) == 0), 0)
             tried.append({"tensor_split": split, "tg": tg, "pp": pp})
             print(f"{model}: tensor-split {split}: {tg:.1f} tok/s generation, {pp:.0f} tok/s prompt", flush=True)
-        best = max(tried, key=lambda r: (round(r["tg"], 0), r["pp"]), default=None)
+        # Ratios within 5% of the fastest are equivalent for generation; of
+        # those, keep the one that leaves the largest context pool (filling
+        # the primary GPU first left Qwen3-VL-30B 2k tokens of context).
+        fastest = max((r["tg"] for r in tried), default=0)
+        for r in tried:
+            try:
+                r["pool"] = context_pool(model, path, dict(placed, **{"tensor-split": r["tensor_split"]}), base, cards)[0]
+            except Exception:
+                r["pool"] = 0
+        best = max((r for r in tried if r["tg"] >= fastest * 0.95), key=lambda r: (r["pool"], r["tg"]), default=None)
         if best and best["tg"] > 0:
             results[calibration_key(model, path, cards)] = dict(best, tried=tried)
             print(f"{model}: chose {best['tensor_split']}", flush=True)
