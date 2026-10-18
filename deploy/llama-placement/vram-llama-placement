@@ -34,7 +34,16 @@ and keeps the largest pool that still loads entirely on the GPUs; a model
 without a calibrated MTP pool runs without MTP. `mtp = off` in the base file
 disables it for a model.
 
-usage: vram-llama-placement [--dry-run | --calibrate]
+--sweep measures every chat/vision model on every placement it fits (each
+GPU alone and several splits, including ones weighted to the second card):
+the largest pool that loads with its projector and answers an image, the
+slots that pool supports, and single-stream and all-slots throughput
+(llama-batched-bench). It keeps the placement with the highest all-slots
+throughput whose single-stream speed is within 25% and prompt speed within
+50% of the best; the generated presets then use it. Run with llama-server
+stopped (hours for a full model set).
+
+usage: vram-llama-placement [--dry-run | --calibrate | --sweep [model ...]]
 """
 
 import configparser
@@ -220,6 +229,10 @@ def placement(model, path, base, cards, context):
         return {"device": cards[0][0]}, "placement = single (base file) -> " + cards[0][0]
     if options.get("embeddings") in ("1", "true", "on") or not cards:
         return {"device": cards[0][0]} if cards else {}, "embedding model"
+    swept = load_calibration().get(sweep_key(model, path, cards))
+    if swept:
+        return sweep_placed(swept), (f"swept: {swept['device']}{' ' + swept['tensor-split'] if swept.get('tensor-split') else ''}, "
+                                     f"{swept['tg1']:.0f} tok/s single, {swept['tgN']:.0f} tok/s at {swept['slots']} slots")
     weights = os.path.getsize(path)
     try:
         meta = read_gguf_metadata(path)
@@ -257,6 +270,16 @@ def placement(model, path, base, cards, context):
     split = cached["tensor_split"] if cached else split_candidates(gpu_need, capacities)[0]
     return ({"device": names, "tensor-split": split, "n-gpu-layers": str(gpu_layers), "fit": "off"},
             note + f" -> {gpu_layers}/{layers} layers on {names} ({split}{', calibrated' if cached else ''}), rest on the CPU")
+
+
+def sweep_key(model, path, cards):
+    return "sweep|" + calibration_key(model, path, cards)
+
+
+def sweep_placed(record):
+    if record.get("tensor-split"):
+        return {"device": record["device"], "tensor-split": record["tensor-split"], "n-gpu-layers": "99", "fit": "off"}
+    return {"device": record["device"]}
 
 
 FIT_CACHE = os.environ.get("VG_LLAMA_FIT_CACHE", "/var/lib/vram-governor/llama-fit-cache.json")
@@ -519,6 +542,111 @@ def calibrate(base, cards, context):
         save_calibration(results)
 
 
+def batched_throughput(path, preset, options, slots):
+    """(single-stream gen tok/s, all-slots gen tok/s, prompt tok/s) via llama-batched-bench."""
+    bench = os.path.join(os.path.dirname(SERVER), "llama-batched-bench")
+    args = [bench, "-m", path, "-dev", preset["device"], "-ngl", "99", "-fa", "on", "-c", preset["ctx-size"], "--kv-unified",
+            "-npp", "512", "-ntg", "128", "-npl", "1" if slots == 1 else f"1,{slots}"]
+    if preset.get("tensor-split"):
+        args += ["-ts", preset["tensor-split"].replace(",", "/")]
+    for key, flag in (("cache-type-k", "-ctk"), ("cache-type-v", "-ctv")):
+        if options.get(key):
+            args += [flag, options[key]]
+    try:
+        out = subprocess.run(args, capture_output=True, text=True, timeout=1800).stdout
+    except Exception:
+        return 0.0, 0.0, 0.0
+    rows = {}
+    for line in out.splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 10 and cells[2].isdigit():
+            rows[int(cells[2])] = (float(cells[5]), float(cells[7]))
+    single = rows.get(1, (0.0, 0.0))
+    return single[1], rows.get(slots, single)[1], single[0]
+
+
+def sweep_candidates(model, path, base, cards):
+    """Placements to try: each GPU alone where the model fits, then splits."""
+    options = base[model] if base.has_section(model) else {}
+    weights = os.path.getsize(path)
+    meta = read_gguf_metadata(path)
+    need = weights + kv_cache_bytes(meta, MIN_CONTEXT, options.get("cache-type-k", "f16"), options.get("cache-type-v", "f16")) + GIB // 2 + weights // 50 + mmproj_bytes(path)
+    capacities = [(name, (total - RESERVE_MIB) << 20) for name, total in cards]
+    if options.get("placement") == "single":
+        capacities = capacities[:1]
+    out = [{"device": name} for name, capacity in capacities if need <= capacity]
+    if len(capacities) > 1 and need <= sum(c for _, c in capacities):
+        total = sum(c for _, c in capacities)
+        proportional = capacities[0][1] / total
+        shares = []
+        for share in (proportional + 0.1, proportional, proportional - 0.1, proportional - 0.2):
+            share = round(share, 2)
+            # each GPU must hold its share of the weights plus some room
+            if 0.05 <= share <= 0.95 and weights * share < capacities[0][1] - GIB and weights * (1 - share) < sum(c for _, c in capacities[1:]) - GIB:
+                shares.append(share)
+        previous = load_calibration().get(calibration_key(model, path, cards))
+        splits = [f"{round(s_ * 100)},{100 - round(s_ * 100)}" for s_ in shares]
+        if previous and previous["tensor_split"] not in splits:
+            splits.append(previous["tensor_split"])
+        names = ",".join(n for n, _ in capacities)
+        out += [{"device": names, "tensor-split": split, "n-gpu-layers": "99", "fit": "off"} for split in dict.fromkeys(splits)]
+    return out
+
+
+def sweep(base, cards, only):
+    results = load_calibration()
+    for model, path in models().items():
+        if only and model not in only:
+            continue
+        options = base[model] if base.has_section(model) else {}
+        if options.get("embeddings") in ("1", "true", "on"):
+            continue
+        meta = read_gguf_metadata(path)
+        mtp = mtp_settings(meta, os.path.getsize(path), options)
+        tried = []
+        for placed in sweep_candidates(model, path, base, cards):
+            label = placed["device"] + (" " + placed["tensor-split"] if placed.get("tensor-split") else "")
+            estimate, slots, _, extra = context_pool(model, path, placed, base, cards)
+            if extra:
+                print(f"{model} [{label}]: would spill to the CPU, skipped", flush=True)
+                continue
+
+            def fits(size):
+                preset = dict(placed, **mtp)
+                preset.update({"ctx-size": str(size), "parallel": str(max(1, min(8, size // 8192))), "kv-unified": "1"})
+                return loads_on_gpus(path, preset, options)
+
+            low, high, best = 8192, max(8192, estimate), 0
+            if fits(high):
+                best = high
+            else:
+                while high - low >= 4096:
+                    size = (low + high) // 2 // 256 * 256
+                    if fits(size):
+                        low = size
+                    else:
+                        high = size
+                best = low if low > 8192 or fits(low) else 0
+            pool = max(8192, int(best * 0.9) // 256 * 256) if best else 0
+            if not pool or not fits(pool):
+                print(f"{model} [{label}]: does not load", flush=True)
+                continue
+            slots = max(1, min(8, pool // 8192))
+            tg1, tgn, pp = batched_throughput(path, dict(placed, **{"ctx-size": str(pool)}), options, slots)
+            row = dict(placed, pool=pool, slots=slots, tg1=tg1, tgN=tgn, pp=pp)
+            tried.append(row)
+            print(f"{model} [{label}]: pool {pool}, {slots} slots, {tg1:.1f} tok/s single, {tgn:.1f} tok/s at {slots} slots, prompt {pp:.0f} tok/s", flush=True)
+        if not tried:
+            continue
+        best_single = max(r["tg1"] for r in tried)
+        best_prompt = max(r["pp"] for r in tried)
+        eligible = [r for r in tried if r["tg1"] >= best_single * 0.75 and r["pp"] >= best_prompt * 0.5] or tried
+        winner = max(eligible, key=lambda r: (r["tgN"], r["pool"]))
+        results[sweep_key(model, path, cards)] = dict(winner, tried=tried)
+        save_calibration(results)
+        print(f"{model}: chose {winner['device']} {winner.get('tensor-split', '')} (pool {winner['pool']}, {winner['slots']} slots, {winner['tgN']:.0f} tok/s total)", flush=True)
+
+
 def save_calibration(results):
     os.makedirs(os.path.dirname(CALIBRATION), exist_ok=True)
     tmp = CALIBRATION + ".tmp"
@@ -611,6 +739,9 @@ def main():
     if "--calibrate" in sys.argv:
         calibrate(base, cards, context)
         return
+    if "--sweep" in sys.argv:
+        sweep(base, cards, [a for a in sys.argv[1:] if not a.startswith("--")])
+        return
     lines = ["; Generated by vram-llama-placement before each llama-server start.",
              "; Edit %s instead; its settings always win." % BASE,
              "; GPUs: " + (", ".join(f"{n} {t} MiB" for n, t in cards) or "none found"), ""]
@@ -619,8 +750,16 @@ def main():
     for model, path in models().items():
         placed, note = placement(model, path, base, cards, MIN_CONTEXT)
         try:
-            pool, slots, max_request, extra = context_pool(model, path, placed, base, cards)
-            pool, slots, max_request, extra, mtp_note = with_mtp(model, path, placed, base, cards, pool, slots, max_request, extra)
+            swept = load_calibration().get(sweep_key(model, path, cards))
+            if swept:
+                meta = read_gguf_metadata(path)
+                trained = int(meta.get(f"{meta.get('general.architecture', '')}.context_length", 0) or 32768)
+                mtp = mtp_settings(meta, os.path.getsize(path), base[model] if base.has_section(model) else {})
+                pool, slots, max_request, extra = swept["pool"], swept["slots"], min(trained, swept["pool"]), dict(mtp)
+                mtp_note = "; MTP" if mtp else ""
+            else:
+                pool, slots, max_request, extra = context_pool(model, path, placed, base, cards)
+                pool, slots, max_request, extra, mtp_note = with_mtp(model, path, placed, base, cards, pool, slots, max_request, extra)
             placed.update({"ctx-size": str(pool), "parallel": str(slots), "kv-unified": "1"})
             placed.update(extra)
             pools[model] = {"pool_tokens": pool, "slots": slots, "max_request_tokens": max_request}
