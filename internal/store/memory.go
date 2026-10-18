@@ -134,7 +134,7 @@ func (m *MemoryStore) CreateLLMCheckpointOperation(_ context.Context, op *LLMChe
 		if sameLLMCheckpointIdentity(existing, prepared) {
 			return cloneLLMCheckpointOperation(existing), false, nil
 		}
-		return nil, false, ErrLLMCheckpointConflict
+		return nil, false, fmt.Errorf("%w: id exists with another identity", ErrLLMCheckpointConflict)
 	}
 	key := prepared.OwnerID + "\x00" + prepared.IdempotencyKey
 	if id := m.llmCheckpointKeys[key]; id != "" {
@@ -142,11 +142,11 @@ func (m *MemoryStore) CreateLLMCheckpointOperation(_ context.Context, op *LLMChe
 		if sameLLMCheckpointIdentity(existing, prepared) {
 			return cloneLLMCheckpointOperation(existing), false, nil
 		}
-		return nil, false, ErrLLMCheckpointConflict
+		return nil, false, fmt.Errorf("%w: idempotency key used by another operation", ErrLLMCheckpointConflict)
 	}
 	for _, existing := range m.llmCheckpointOps {
 		if existing.TargetID == prepared.TargetID && existing.AcceleratorID == prepared.AcceleratorID && existing.SlotID >= 0 && existing.SlotID == prepared.SlotID && llmCheckpointHoldsSlot(existing.Phase) && llmCheckpointHoldsSlot(prepared.Phase) {
-			return nil, false, ErrLLMCheckpointConflict
+			return nil, false, fmt.Errorf("%w: slot %d held by operation %s (%s)", ErrLLMCheckpointConflict, existing.SlotID, existing.ID, existing.Phase)
 		}
 	}
 	m.llmCheckpointOps[prepared.ID] = prepared
@@ -195,17 +195,20 @@ func (m *MemoryStore) UpdateLLMCheckpointOperation(_ context.Context, op *LLMChe
 		return nil, ErrNotFound
 	}
 	if current.Revision != expected {
-		return nil, ErrLLMCheckpointConflict
+		return nil, fmt.Errorf("%w: revision %d, expected %d", ErrLLMCheckpointConflict, current.Revision, expected)
 	}
-	if !llmCheckpointImmutableIdentityEqual(current, op) || !llmCheckpointTransitionAllowedFor(current, op) {
-		return nil, ErrLLMCheckpointConflict
+	if !llmCheckpointImmutableIdentityEqual(current, op) {
+		return nil, fmt.Errorf("%w: immutable identity changed", ErrLLMCheckpointConflict)
+	}
+	if !llmCheckpointTransitionAllowedFor(current, op) {
+		return nil, fmt.Errorf("%w: transition %s -> %s not allowed", ErrLLMCheckpointConflict, current.Phase, op.Phase)
 	}
 	for id, existing := range m.llmCheckpointOps {
 		if id == op.ID || existing.TargetID != op.TargetID || existing.AcceleratorID != op.AcceleratorID || existing.SlotID < 0 || op.SlotID < 0 || existing.SlotID != op.SlotID {
 			continue
 		}
 		if llmCheckpointHoldsSlot(existing.Phase) && llmCheckpointHoldsSlot(op.Phase) {
-			return nil, ErrLLMCheckpointConflict
+			return nil, fmt.Errorf("%w: slot %d held by operation %s (%s)", ErrLLMCheckpointConflict, existing.SlotID, existing.ID, existing.Phase)
 		}
 	}
 	copy := cloneLLMCheckpointOperation(op)

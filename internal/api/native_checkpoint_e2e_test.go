@@ -680,7 +680,13 @@ func nativeRunCheckpointedResumedStream(t *testing.T, fixture *nativeCheckpointF
 	saved, restored := fixture.backend.snapshotSaved, fixture.backend.snapshotRestored
 	fixture.backend.mu.Unlock()
 	if !saved || !restored {
-		t.Fatalf("public stream did not use checkpoint save/restore: saved=%v restored=%v", saved, restored)
+		rows, _ := fixture.backing.ListWorkloads(context.Background())
+		var states []string
+		for _, row := range rows {
+			states = append(states, fmt.Sprintf("%s %s err=%q blocker=%q", row.Request.OwnerID, row.Status, row.Error, row.Decision.Blocker))
+		}
+		ops, _ := fixture.backing.ListLLMCheckpointOperations(context.Background(), "victim-owner")
+		t.Fatalf("public stream did not use checkpoint save/restore: saved=%v restored=%v response=%q workloads=%v operations=%d", saved, restored, response, states, len(ops))
 	}
 	requests := fixture.backend.requestsSnapshot()
 	var initial, resumed *nativeBackendRequest

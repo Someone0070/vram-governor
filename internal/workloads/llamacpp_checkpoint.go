@@ -1371,54 +1371,67 @@ func (c *CheckpointCoordinator) persistOperation(ctx context.Context, command Ch
 		*op = created
 		return nil
 	}
-	// Every update must carry the complete immutable command identity.  A
-	// replay with a changed conversation/compensation binding is a conflict,
-	// not an opportunity to rewrite the original operation.
-	if current.ID != command.ID || current.IdempotencyKey != command.IdempotencyKey || current.OwnerID != command.OwnerID || current.WorkloadID != command.WorkloadID || current.WorkloadRevision != command.WorkloadRevision || current.Generation != command.Generation || current.Fence != command.Fence || current.RuntimeIdentity != command.RuntimeIdentity || current.ModelFingerprint != command.ModelFingerprint || current.ProfileFingerprint != command.ProfileFingerprint || current.ContextFingerprint != fmt.Sprintf("ctx:%d", command.ContextLimit) || current.ConversationID != command.ConversationID || current.ContinuationConversationID != command.ContinuationConversationID || current.CompensationOf != command.CompensationOf {
-		return ErrCheckpointConflict
+	// The manager records cleanup and recovery identity on the same row while
+	// a save or restore is in flight; a stale revision is retried against the
+	// fresh row instead of failing the restore (and its failure record).
+	for attempt := 0; ; attempt++ {
+		// Every update must carry the complete immutable command identity.  A
+		// replay with a changed conversation/compensation binding is a conflict,
+		// not an opportunity to rewrite the original operation.
+		if current.ID != command.ID || current.IdempotencyKey != command.IdempotencyKey || current.OwnerID != command.OwnerID || current.WorkloadID != command.WorkloadID || current.WorkloadRevision != command.WorkloadRevision || current.Generation != command.Generation || current.Fence != command.Fence || current.RuntimeIdentity != command.RuntimeIdentity || current.ModelFingerprint != command.ModelFingerprint || current.ProfileFingerprint != command.ProfileFingerprint || current.ContextFingerprint != fmt.Sprintf("ctx:%d", command.ContextLimit) || current.ConversationID != command.ConversationID || current.ContinuationConversationID != command.ContinuationConversationID || current.CompensationOf != command.CompensationOf {
+			return ErrCheckpointConflict
+		}
+		// PrepareOperation may have run before a node slot was assigned.  Its
+		// planned write is an idempotent assertion once the row has advanced and
+		// must never regress the durable lifecycle.
+		if phase == "planned" && current.Phase != "planned" {
+			return nil
+		}
+		// A live checkpointable stream records assigned/start before the scheduler
+		// later asks the coordinator to checkpoint that same operation. Reasserting
+		// the already durable assignment must not regress a started row back to the
+		// assignment ordinal; the node pause is the next physical phase.
+		if phase == "assigned" && current.Phase != "planned" && current.PhaseOrdinal >= phaseOrdinal {
+			return nil
+		}
+		if current.Phase == phase && current.PhaseOrdinal == phaseOrdinal && current.SnapshotName == snapshot && current.SavedTokens == saved && current.ReusedTokens == reused {
+			return nil
+		}
+		next := *current
+		next.Phase = phase
+		next.PhaseOrdinal = phaseOrdinal
+		next.ContinuationConversationID = command.ContinuationConversationID
+		next.Model = command.ModelFingerprint
+		next.NodeID = lease.NodeID
+		next.AcceleratorID = lease.AcceleratorID
+		next.TargetID = lease.TargetID
+		next.SlotID = lease.SlotID
+		next.SnapshotName = snapshot
+		if command.SnapshotDigest != "" {
+			next.SnapshotDigest = command.SnapshotDigest
+		}
+		next.PartialOutputHash = DigestOutput(partial.Prefix)
+		next.PartialOutputOffset = len(partial.Prefix)
+		next.PartialOutputContent = append([]byte(nil), partial.Prefix...)
+		next.PartialOutputUnsafeToolCall = partial.UnsafeToolCall
+		next.SavedTokens = saved
+		next.ReusedTokens = reused
+		next.WorkloadRevision = current.WorkloadRevision
+		updated, err := c.Operations.UpdateLLMCheckpointOperation(ctx, &next, current.Revision)
+		if err == nil {
+			*op = updated
+			return nil
+		}
+		if attempt >= 3 || !errors.Is(err, store.ErrLLMCheckpointConflict) {
+			return err
+		}
+		fresh, getErr := c.Operations.GetLLMCheckpointOperation(ctx, current.ID)
+		if getErr != nil || fresh.Revision == current.Revision {
+			return err
+		}
+		current = fresh
+		*op = fresh
 	}
-	// PrepareOperation may have run before a node slot was assigned.  Its
-	// planned write is an idempotent assertion once the row has advanced and
-	// must never regress the durable lifecycle.
-	if phase == "planned" && current.Phase != "planned" {
-		return nil
-	}
-	// A live checkpointable stream records assigned/start before the scheduler
-	// later asks the coordinator to checkpoint that same operation. Reasserting
-	// the already durable assignment must not regress a started row back to the
-	// assignment ordinal; the node pause is the next physical phase.
-	if phase == "assigned" && current.Phase != "planned" && current.PhaseOrdinal >= phaseOrdinal {
-		return nil
-	}
-	if current.Phase == phase && current.PhaseOrdinal == phaseOrdinal && current.SnapshotName == snapshot && current.SavedTokens == saved && current.ReusedTokens == reused {
-		return nil
-	}
-	next := *current
-	next.Phase = phase
-	next.PhaseOrdinal = phaseOrdinal
-	next.ContinuationConversationID = command.ContinuationConversationID
-	next.Model = command.ModelFingerprint
-	next.NodeID = lease.NodeID
-	next.AcceleratorID = lease.AcceleratorID
-	next.TargetID = lease.TargetID
-	next.SlotID = lease.SlotID
-	next.SnapshotName = snapshot
-	if command.SnapshotDigest != "" {
-		next.SnapshotDigest = command.SnapshotDigest
-	}
-	next.PartialOutputHash = DigestOutput(partial.Prefix)
-	next.PartialOutputOffset = len(partial.Prefix)
-	next.PartialOutputContent = append([]byte(nil), partial.Prefix...)
-	next.PartialOutputUnsafeToolCall = partial.UnsafeToolCall
-	next.SavedTokens = saved
-	next.ReusedTokens = reused
-	next.WorkloadRevision = current.WorkloadRevision
-	updated, err := c.Operations.UpdateLLMCheckpointOperation(ctx, &next, current.Revision)
-	if err != nil {
-		return err
-	}
-	*op = updated
-	return nil
 }
 
 type CheckpointMetadataState struct {
@@ -2335,11 +2348,22 @@ func (c *CheckpointCoordinator) restore(ctx context.Context, command CheckpointC
 		if operation == nil || c.Operations == nil {
 			return cause
 		}
-		failed := *operation
-		failed.Phase = "restore_failed"
-		failed.PhaseOrdinal = checkpointRecoveryOrdinal("restore_failed")
-		failed.Error = cause.Error()
-		if _, updateErr := c.Operations.UpdateLLMCheckpointOperation(context.Background(), &failed, operation.Revision); updateErr != nil {
+		var updateErr error
+		for attempt := 0; attempt < 4; attempt++ {
+			failed := *operation
+			failed.Phase = "restore_failed"
+			failed.PhaseOrdinal = checkpointRecoveryOrdinal("restore_failed")
+			failed.Error = cause.Error()
+			if _, updateErr = c.Operations.UpdateLLMCheckpointOperation(context.Background(), &failed, operation.Revision); updateErr == nil || !errors.Is(updateErr, store.ErrLLMCheckpointConflict) {
+				break
+			}
+			fresh, getErr := c.Operations.GetLLMCheckpointOperation(context.Background(), operation.ID)
+			if getErr != nil || fresh.Revision == operation.Revision {
+				break
+			}
+			operation = fresh
+		}
+		if updateErr != nil {
 			c.mu.Lock()
 			c.recoveryErr = fmt.Errorf("%w; restore failure record could not be persisted: %v", cause, updateErr)
 			c.mu.Unlock()
