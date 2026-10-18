@@ -38,9 +38,10 @@ disables it for a model.
 GPU alone and several splits, including ones weighted to the second card):
 the largest pool that loads with its projector and answers an image, the
 slots that pool supports, and single-stream and all-slots throughput
-(llama-batched-bench). It keeps the placement with the highest all-slots
-throughput whose single-stream speed is within 25% and prompt speed within
-50% of the best; the generated presets then use it. Run with llama-server
+(llama-batched-bench). It keeps the placement that finishes the most jobs
+per second with every slot busy (prompt reading included) whose
+single-stream speed is within 25% of the best; the generated presets then
+use it. Run with llama-server
 stopped (hours for a full model set).
 
 usage: vram-llama-placement [--dry-run | --calibrate | --sweep [model ...]]
@@ -543,10 +544,13 @@ def calibrate(base, cards, context):
 
 
 def batched_throughput(path, preset, options, slots):
-    """(single-stream gen tok/s, all-slots gen tok/s, prompt tok/s) via llama-batched-bench."""
+    """(single-stream gen tok/s, all-slots gen tok/s, prompt tok/s, jobs/s with
+    every slot busy) via llama-batched-bench, for 1024-token prompts with
+    192 generated tokens. Jobs per second counts prompt reading too: a split
+    that generates more in parallel can still finish fewer jobs."""
     bench = os.path.join(os.path.dirname(SERVER), "llama-batched-bench")
     args = [bench, "-m", path, "-dev", preset["device"], "-ngl", "99", "-fa", "on", "-c", preset["ctx-size"], "--kv-unified",
-            "-npp", "512", "-ntg", "128", "-npl", "1" if slots == 1 else f"1,{slots}"]
+            "-npp", "1024", "-ntg", "192", "-npl", "1" if slots == 1 else f"1,{slots}"]
     if preset.get("tensor-split"):
         args += ["-ts", preset["tensor-split"].replace(",", "/")]
     for key, flag in (("cache-type-k", "-ctk"), ("cache-type-v", "-ctv")):
@@ -555,14 +559,16 @@ def batched_throughput(path, preset, options, slots):
     try:
         out = subprocess.run(args, capture_output=True, text=True, timeout=1800).stdout
     except Exception:
-        return 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
     rows = {}
     for line in out.splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         if len(cells) == 10 and cells[2].isdigit():
-            rows[int(cells[2])] = (float(cells[5]), float(cells[7]))
-    single = rows.get(1, (0.0, 0.0))
-    return single[1], rows.get(slots, single)[1], single[0]
+            batch = int(cells[2])
+            rows[batch] = (float(cells[5]), float(cells[7]), batch / float(cells[8]) if float(cells[8]) else 0.0)
+    single = rows.get(1, (0.0, 0.0, 0.0))
+    full = rows.get(slots, single)
+    return single[1], full[1], single[0], full[2]
 
 
 def sweep_candidates(model, path, base, cards):
@@ -632,19 +638,21 @@ def sweep(base, cards, only):
                 print(f"{model} [{label}]: does not load", flush=True)
                 continue
             slots = max(1, min(8, pool // 8192))
-            tg1, tgn, pp = batched_throughput(path, dict(placed, **{"ctx-size": str(pool)}), options, slots)
-            row = dict(placed, pool=pool, slots=slots, tg1=tg1, tgN=tgn, pp=pp)
+            tg1, tgn, pp, jobs = batched_throughput(path, dict(placed, **{"ctx-size": str(pool)}), options, slots)
+            row = dict(placed, pool=pool, slots=slots, tg1=tg1, tgN=tgn, pp=pp, jobs=jobs)
             tried.append(row)
-            print(f"{model} [{label}]: pool {pool}, {slots} slots, {tg1:.1f} tok/s single, {tgn:.1f} tok/s at {slots} slots, prompt {pp:.0f} tok/s", flush=True)
+            print(f"{model} [{label}]: pool {pool}, {slots} slots, {tg1:.1f} tok/s single, {tgn:.1f} tok/s at {slots} slots, prompt {pp:.0f} tok/s, {jobs * 60:.1f} jobs/min", flush=True)
         if not tried:
             continue
+        # Most jobs finished per second with every slot busy (prompt reading
+        # included), as long as one request alone stays within 25% of the
+        # fastest single-stream placement.
         best_single = max(r["tg1"] for r in tried)
-        best_prompt = max(r["pp"] for r in tried)
-        eligible = [r for r in tried if r["tg1"] >= best_single * 0.75 and r["pp"] >= best_prompt * 0.5] or tried
-        winner = max(eligible, key=lambda r: (r["tgN"], r["pool"]))
+        eligible = [r for r in tried if r["tg1"] >= best_single * 0.75] or tried
+        winner = max(eligible, key=lambda r: (round(r["jobs"], 3), r["pool"]))
         results[sweep_key(model, path, cards)] = dict(winner, tried=tried)
         save_calibration(results)
-        print(f"{model}: chose {winner['device']} {winner.get('tensor-split', '')} (pool {winner['pool']}, {winner['slots']} slots, {winner['tgN']:.0f} tok/s total)", flush=True)
+        print(f"{model}: chose {winner['device']} {winner.get('tensor-split', '')} (pool {winner['pool']}, {winner['slots']} slots, {winner['jobs'] * 60:.1f} jobs/min)", flush=True)
 
 
 def save_calibration(results):
