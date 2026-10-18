@@ -51,7 +51,8 @@ func queryAMDGPUTelemetry(ctx context.Context, drmRoot string) ([]wsproto.Accele
 		pciID, _ := readSysfsString(filepath.Join(device, "device"))
 		name, _ := readSysfsString(filepath.Join(device, "product_name"))
 		if name == "" {
-			name = "AMD Radeon (" + pciID + ")"
+			revision, _ := readSysfsString(filepath.Join(device, "revision"))
+			name = amdMarketingName(pciID, revision)
 		}
 		kind := "driver_vram"
 		if strings.EqualFold(pciID, "0x1900") {
@@ -100,4 +101,20 @@ func readSysfsInt(path string) (int64, error) {
 		return 0, err
 	}
 	return strconv.ParseInt(value, 10, 64)
+}
+
+// amdMarketingName names cards whose driver exposes no product_name (desktop
+// Navi 21 boards report only the PCI id; the revision tells the models apart).
+func amdMarketingName(pciID, revision string) string {
+	if strings.EqualFold(pciID, "0x73bf") {
+		switch strings.ToLower(revision) {
+		case "0xc0":
+			return "AMD Radeon RX 6900 XT"
+		case "0xc1":
+			return "AMD Radeon RX 6800 XT"
+		case "0xc3":
+			return "AMD Radeon RX 6800"
+		}
+	}
+	return "AMD Radeon (" + pciID + ")"
 }

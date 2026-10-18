@@ -33,6 +33,17 @@ func QueryGPUTelemetry(ctx context.Context) ([]wsproto.AcceleratorTelemetry, err
 	if nvidiaErr == nil {
 		rows, err := parseNvidiaSMICSV(out.String())
 		if err != nil || len(rows) > 0 {
+			if err == nil {
+				// A mixed node (RTX 4070 SUPER + RX 6900 XT on CT200) splits
+				// models across both; report the AMD cards too, numbered after
+				// the NVIDIA ones so accelerator ids stay unique.
+				if amd, amdErr := queryAMDGPUTelemetry(ctx, "/sys/class/drm"); amdErr == nil {
+					for i := range amd {
+						amd[i].Index = len(rows) + i
+					}
+					rows = append(rows, amd...)
+				}
+			}
 			return rows, err
 		}
 	}
