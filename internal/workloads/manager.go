@@ -127,10 +127,11 @@ type Manager struct {
 	// passWaiters holds, per accelerator, the highest priority refused as
 	// busy during the current reconcile pass. Lower-priority work may not
 	// take that accelerator in the same pass, even if it frees up meanwhile.
-	passWaitersMu sync.Mutex
-	passWaiters   map[string]int
-	companions    companionLeases
-	speeds        learnedSpeeds
+	passWaitersMu   sync.Mutex
+	passWaiters     map[string]int
+	companions      companionLeases
+	speeds          learnedSpeeds
+	acceleratorVRAM map[string]int64 // last telemetry VRAM per GPU (guarded by mu)
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -2007,6 +2008,27 @@ func (m *Manager) invalidateTargetAtExhaustedGenerationLocked(targetID string, t
 // UpdateAcceleratorCapacity binds live physical inventory to every runtime
 // route exposing that accelerator. Runtime discovery and telemetry are
 // asynchronous, so this operation is safe to repeat on every telemetry tick.
+// targetVRAMLocked is a target's VRAM: its GPU's, or for a target spanning
+// several GPUs the sum of all of them once each has reported (0 until then).
+func (m *Manager) targetVRAMLocked(target Target, acceleratorID string, vramTotalMB int64) int64 {
+	accelerators := targetAccelerators(target)
+	if len(accelerators) <= 1 {
+		return vramTotalMB
+	}
+	var total int64
+	for _, id := range accelerators {
+		vram := m.acceleratorVRAM[id]
+		if id == acceleratorID {
+			vram = vramTotalMB
+		}
+		if vram <= 0 {
+			return 0
+		}
+		total += vram
+	}
+	return total
+}
+
 func (m *Manager) UpdateAcceleratorCapacity(acceleratorID string, vramTotalMB int64) {
 	if acceleratorID == "" || vramTotalMB <= 0 {
 		return
@@ -2014,10 +2036,16 @@ func (m *Manager) UpdateAcceleratorCapacity(acceleratorID string, vramTotalMB in
 	if _, err := checkedMiBToBytes(vramTotalMB, "accelerator_vram_mb"); err != nil {
 		return
 	}
+	m.mu.Lock()
+	if m.acceleratorVRAM == nil {
+		m.acceleratorVRAM = make(map[string]int64)
+	}
+	m.acceleratorVRAM[acceleratorID] = vramTotalMB
+	m.mu.Unlock()
 	m.mu.RLock()
 	targetIDs := make([]string, 0)
 	for id, target := range m.targets {
-		if target.AcceleratorID != acceleratorID || target.AcceleratorVRAMMB == vramTotalMB {
+		if !containsString(targetAccelerators(target), acceleratorID) || target.AcceleratorVRAMMB == m.targetVRAMLocked(target, acceleratorID, vramTotalMB) {
 			continue
 		}
 		targetIDs = append(targetIDs, id)
@@ -2039,11 +2067,12 @@ func (m *Manager) UpdateAcceleratorCapacity(acceleratorID string, vramTotalMB in
 		target, found := m.targets[id]
 		pendingKey := m.runtimeProfileTransitionTarget[id]
 		pending := pendingKey != "" && m.runtimeProfileTransitions[pendingKey] != nil && !m.runtimeProfileTransitions[pendingKey].projected
-		// A target spanning several GPUs keeps the total registered for all
-		// of them; one GPU's telemetry would shrink it to that card.
-		if found && !pending && target.AcceleratorID == acceleratorID && len(target.CompanionAcceleratorIDs) == 0 && target.AcceleratorVRAMMB != vramTotalMB {
+		// A target spanning several GPUs gets the sum of their reported VRAM
+		// (one GPU's telemetry alone would shrink it to that card).
+		wanted := m.targetVRAMLocked(target, acceleratorID, vramTotalMB)
+		if found && !pending && containsString(targetAccelerators(target), acceleratorID) && wanted > 0 && target.AcceleratorVRAMMB != wanted {
 			previous := target
-			target.AcceleratorVRAMMB = vramTotalMB
+			target.AcceleratorVRAMMB = wanted
 			generationErr = m.replaceTargetLocked(target)
 			if generationErr == nil {
 				changed = true
