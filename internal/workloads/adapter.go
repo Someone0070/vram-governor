@@ -304,4 +304,9 @@ type ModelPool struct {
 	PoolTokens       int `json:"pool_tokens"`
 	Slots            int `json:"slots"`
 	MaxRequestTokens int `json:"max_request_tokens"`
+	// Measured single-request speeds on this target (calibration); zero when
+	// unknown. With copies of a model on several GPUs the scheduler prefers
+	// the one that finishes the request soonest.
+	DecodeTPS float64 `json:"decode_tps,omitempty"`
+	PromptTPS float64 `json:"prompt_tps,omitempty"`
 }

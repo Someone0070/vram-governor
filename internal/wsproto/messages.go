@@ -611,7 +611,7 @@ func validateAdapterAdvertisementJSON(raw []byte) error {
 			return fmt.Errorf("adapter advertisement model_pools must be an object")
 		}
 		for model, pool := range pools {
-			poolFields, err := strictObjectFields(pool, "model pool "+model, map[string]struct{}{"pool_tokens": {}, "slots": {}, "max_request_tokens": {}})
+			poolFields, err := strictObjectFields(pool, "model pool "+model, map[string]struct{}{"pool_tokens": {}, "slots": {}, "max_request_tokens": {}, "decode_tps": {}, "prompt_tps": {}})
 			if err != nil {
 				return err
 			}
@@ -1323,7 +1323,9 @@ func CommandSigningMaterialForPlanRelaunch(command CommandPayload) ([]byte, erro
 
 // ModelPool is a model's context capacity on a runtime.
 type ModelPool struct {
-	PoolTokens       int `json:"pool_tokens"`
-	Slots            int `json:"slots"`
-	MaxRequestTokens int `json:"max_request_tokens"`
+	PoolTokens       int     `json:"pool_tokens"`
+	Slots            int     `json:"slots"`
+	MaxRequestTokens int     `json:"max_request_tokens"`
+	DecodeTPS        float64 `json:"decode_tps,omitempty"`
+	PromptTPS        float64 `json:"prompt_tps,omitempty"`
 }

@@ -129,7 +129,7 @@ type Manager struct {
 	// take that accelerator in the same pass, even if it frees up meanwhile.
 	passWaitersMu sync.Mutex
 	passWaiters   map[string]int
-	companions companionLeases
+	companions    companionLeases
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -4933,6 +4933,9 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		// context as the primary best-fit dimension; residency and transition
 		// cost remain tie-breakers. If that route is busy or otherwise
 		// incompatible, admission naturally spills to the next candidate.
+		if preference := poolSpeedPreference(targets[i], targets[j], w.Request, req); preference != 0 {
+			return preference < 0
+		}
 		if preference := contextProfilePreference(targets[i], targets[j], w.Request.Adapter, req); preference != 0 {
 			return preference < 0
 		}
@@ -5833,6 +5836,43 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 			m.enqueueNotification(ctx, w, "workload.rejected")
 		}
 	}
+}
+
+// poolSpeedPreference orders two targets that both hold the requested model
+// in a calibrated context pool large enough for the request: the one that
+// finishes it sooner (prompt at its prompt speed, output at its decode speed)
+// first, when they differ by more than 10%. With a copy of a model on each
+// GPU this sends work to the faster card and spills to the slower one when
+// the faster is busy. Unknown speeds give no preference.
+func poolSpeedPreference(left, right Target, request domain.WorkloadRequest, requirements Requirements) int {
+	if requirements.Model == "" || left.Cloud != right.Cloud {
+		return 0
+	}
+	leftPool, leftOK := left.ModelPools[requirements.Model]
+	rightPool, rightOK := right.ModelPools[requirements.Model]
+	if !leftOK || !rightOK || leftPool.DecodeTPS <= 0 || rightPool.DecodeTPS <= 0 || leftPool.PromptTPS <= 0 || rightPool.PromptTPS <= 0 {
+		return 0
+	}
+	if requirements.ContextTokens > 0 && (leftPool.MaxRequestTokens < requirements.ContextTokens || rightPool.MaxRequestTokens < requirements.ContextTokens) {
+		return 0
+	}
+	output := request.Bounds.MaxOutput
+	if output <= 0 {
+		output = defaultReservedOutputTokens
+	}
+	prompt := requirements.ContextTokens - output
+	if prompt < 0 {
+		prompt = 0
+	}
+	leftSeconds := float64(prompt)/leftPool.PromptTPS + float64(output)/leftPool.DecodeTPS
+	rightSeconds := float64(prompt)/rightPool.PromptTPS + float64(output)/rightPool.DecodeTPS
+	switch {
+	case leftSeconds*1.1 < rightSeconds:
+		return -1
+	case rightSeconds*1.1 < leftSeconds:
+		return 1
+	}
+	return 0
 }
 
 func contextProfilePreference(left, right Target, adapter string, requirements Requirements) int {

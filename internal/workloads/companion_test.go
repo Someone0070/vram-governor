@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"vram-governor/internal/domain"
 	"vram-governor/internal/store"
 )
 
@@ -96,4 +97,29 @@ func TestCompanionLeaseRenewedWhileTargetActive(t *testing.T) {
 	mgr.placementMu.Lock()
 	delete(mgr.targetActive, "split")
 	mgr.placementMu.Unlock()
+}
+
+// With a copy of a model on each GPU, the scheduler orders the faster copy
+// first (it spills to the slower one when the faster is busy).
+func TestPoolSpeedPreferenceOrdersFasterCopyFirst(t *testing.T) {
+	fast := Target{ID: "gpu0", ModelPools: map[string]ModelPool{"m": {PoolTokens: 90000, Slots: 8, MaxRequestTokens: 90000, DecodeTPS: 138, PromptTPS: 5000}}}
+	slow := Target{ID: "gpu1", ModelPools: map[string]ModelPool{"m": {PoolTokens: 120000, Slots: 8, MaxRequestTokens: 120000, DecodeTPS: 56, PromptTPS: 300}}}
+	request := domain.WorkloadRequest{Bounds: domain.WorkloadBounds{MaxOutput: 256}}
+	requirements := Requirements{Model: "m", ContextTokens: 2256}
+	if got := poolSpeedPreference(fast, slow, request, requirements); got != -1 {
+		t.Fatalf("faster copy not preferred: %d", got)
+	}
+	if got := poolSpeedPreference(slow, fast, request, requirements); got != 1 {
+		t.Fatalf("order not symmetric: %d", got)
+	}
+	// A request too large for the faster copy gives no speed preference:
+	// only the larger pool can take it.
+	if got := poolSpeedPreference(fast, slow, request, Requirements{Model: "m", ContextTokens: 100000}); got != 0 {
+		t.Fatalf("speed preferred a target whose pool cannot hold the request: %d", got)
+	}
+	// Unknown speeds: no preference.
+	unknown := Target{ID: "x", ModelPools: map[string]ModelPool{"m": {PoolTokens: 90000, Slots: 8, MaxRequestTokens: 90000}}}
+	if got := poolSpeedPreference(fast, unknown, request, requirements); got != 0 {
+		t.Fatalf("preference without measured speeds: %d", got)
+	}
 }

@@ -1413,7 +1413,7 @@ func advertisedModelPools(advertised map[string]wsproto.ModelPool) map[string]wo
 	pools := make(map[string]workloads.ModelPool, len(advertised))
 	for model, pool := range advertised {
 		if pool.PoolTokens > 0 && pool.Slots > 0 && pool.MaxRequestTokens > 0 {
-			pools[model] = workloads.ModelPool{PoolTokens: pool.PoolTokens, Slots: pool.Slots, MaxRequestTokens: pool.MaxRequestTokens}
+			pools[model] = workloads.ModelPool{PoolTokens: pool.PoolTokens, Slots: pool.Slots, MaxRequestTokens: pool.MaxRequestTokens, DecodeTPS: pool.DecodeTPS, PromptTPS: pool.PromptTPS}
 		}
 	}
 	return pools

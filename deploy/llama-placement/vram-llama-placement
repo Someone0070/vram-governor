@@ -799,6 +799,10 @@ def main():
             placed.update({"ctx-size": str(pool), "parallel": str(slots), "kv-unified": "1"})
             placed.update(extra)
             pools[model] = {"pool_tokens": pool, "slots": slots, "max_request_tokens": max_request}
+            if swept and swept.get("tg1") and swept.get("pp"):
+                # measured speeds: the controller sends work to the copy that
+                # finishes it soonest
+                pools[model].update(decode_tps=round(swept["tg1"], 1), prompt_tps=round(swept["pp"], 1))
             note += f"; pool {pool} tokens, {slots} slots, up to {max_request} per request" + mtp_note
         except Exception as error:
             note += f"; no context pool ({error})"
