@@ -146,6 +146,10 @@ type Target struct {
 	// unified KV cache): requests reserve tokens from it instead of owning a
 	// fixed slot size. A model listed here ignores ContextLimit and Slots.
 	ModelPools map[string]ModelPool `json:"model_pools,omitempty" yaml:"-"`
+	// CompanionAcceleratorIDs are further GPUs this target uses beside
+	// AcceleratorID (a runtime that splits models across cards). The target
+	// holds their leases while it has work; see companion.go.
+	CompanionAcceleratorIDs []string `json:"companion_accelerator_ids,omitempty" yaml:"companion_accelerator_ids"`
 }
 
 // RuntimeCapacityProfile is a client-visible, finite context/concurrency mode.

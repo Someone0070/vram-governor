@@ -597,7 +597,7 @@ func validateAdapterAdvertisementJSON(raw []byte) error {
 		"runtime_profiles": {}, "active_runtime_profile": {}, "supports_runtime_profile_switch": {},
 		"capability_version": {}, "capability_revision": {}, "capability_generation": {}, "capabilities": {}, "capacity": {},
 		"max_accelerators_per_workload": {}, "model_capacity_observations": {}, "checkpoint_proof": {},
-		"model_pools": {},
+		"model_pools": {}, "companion_accelerator_indexes": {},
 	})
 	if err != nil {
 		return err
@@ -858,10 +858,13 @@ type ModelCapacityObservationAdvertisement struct {
 // AdapterAdvertisement reports existing runtime capabilities. No protocol
 // command permits installing arbitrary ComfyUI custom nodes.
 type AdapterAdvertisement struct {
-	ID                           string                                  `json:"id"`
-	Adapter                      string                                  `json:"adapter"`
-	Endpoint                     string                                  `json:"endpoint"`
-	AcceleratorIndex             int                                     `json:"accelerator_index"`
+	ID               string `json:"id"`
+	Adapter          string `json:"adapter"`
+	Endpoint         string `json:"endpoint"`
+	AcceleratorIndex int    `json:"accelerator_index"`
+	// CompanionAcceleratorIndexes are further GPUs the runtime uses (a router
+	// splitting models across cards); the controller holds their leases too.
+	CompanionAcceleratorIndexes  []int                                   `json:"companion_accelerator_indexes,omitempty"`
 	Models                       []string                                `json:"models,omitempty"`
 	ResidentModels               []string                                `json:"resident_models,omitempty"`
 	CustomNodes                  []string                                `json:"custom_nodes,omitempty"`

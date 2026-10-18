@@ -2024,7 +2024,7 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 
 	var transitionIDs []string
 	for _, foreign := range targets {
-		if foreign.ID == selected.ID || foreign.AcceleratorID != selected.AcceleratorID || m.targetActiveCount(foreign.ID) > 0 {
+		if foreign.ID == selected.ID || !targetsShareAccelerator(foreign, selected) || m.targetActiveCount(foreign.ID) > 0 {
 			continue
 		}
 		if (selected.ComfyUI || foreign.ComfyUI) && strings.EqualFold(selected.Adapter, "comfy") && strings.EqualFold(foreign.Adapter, "comfy") {

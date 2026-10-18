@@ -187,7 +187,7 @@ func DiscoverLlamaCPP(ctx context.Context, nodeID string, cfg LlamaCPPServerConf
 	}
 	return wsproto.AdapterAdvertisement{
 		ID: id, Adapter: "llamacpp", Endpoint: publicEndpoint,
-		AcceleratorIndex: cfg.AcceleratorIndex, Models: models, ResidentModels: residentModels,
+		AcceleratorIndex: cfg.AcceleratorIndex, CompanionAcceleratorIndexes: append([]int(nil), cfg.CompanionAcceleratorIndexes...), Models: models, ResidentModels: residentModels,
 		ModelPools:       modelPools,
 		Version:          "llamacpp-" + hex.EncodeToString(capabilityHash[:8]),
 		ModelFingerprint: hex.EncodeToString(modelHash[:]), ContextLimit: contextLimit, Slots: slots,

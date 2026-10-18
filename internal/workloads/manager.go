@@ -129,6 +129,7 @@ type Manager struct {
 	// take that accelerator in the same pass, even if it frees up meanwhile.
 	passWaitersMu sync.Mutex
 	passWaiters   map[string]int
+	companions companionLeases
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -7452,6 +7453,11 @@ func (m *Manager) reserveTarget(ctx context.Context, target Target, workload *do
 		targetFence.RUnlock()
 		m.residencyAdmissionMu.Unlock()
 
+		// A target that spans several GPUs first claims its companions, so
+		// a per-card target on one of them cannot start beside it.
+		if reason, companionErr := m.holdCompanionLeases(ctx, target); companionErr != nil || reason != "" {
+			return nil, false, reason, companionErr
+		}
 		// Durable lease acquisition is the only slow part of this phase and runs
 		// with every manager/placement lock released.
 		lease, acquired, err := m.store.AcquireAcceleratorLease(ctx, leaseID, workloadID, m.leaseTTL)

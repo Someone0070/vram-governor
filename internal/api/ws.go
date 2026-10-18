@@ -837,18 +837,24 @@ func (s *Server) applyAdapterPlans(nodeID string, plans []registrationAdapterPla
 		}
 		registered[targetID] = struct{}{}
 		acceleratorID := fmt.Sprintf("%s-gpu%d", nodeID, advertised.AcceleratorIndex)
+		var companions []string
+		for _, index := range advertised.CompanionAcceleratorIndexes {
+			if index != advertised.AcceleratorIndex {
+				companions = append(companions, fmt.Sprintf("%s-gpu%d", nodeID, index))
+			}
+		}
 		var acceleratorVRAMMB int64
 		if node != nil {
+			// a split runtime's memory is every card it uses
 			for _, accelerator := range node.Accelerators {
-				if accelerator.ID == acceleratorID {
-					acceleratorVRAMMB = accelerator.VRAMTotalMB
-					break
+				if accelerator.ID == acceleratorID || containsString(companions, accelerator.ID) {
+					acceleratorVRAMMB += accelerator.VRAMTotalMB
 				}
 			}
 		}
 		target := workloads.Target{
 			ID: targetID, NodeID: nodeID, Adapter: advertised.Adapter, Endpoint: advertised.Endpoint,
-			AcceleratorID: acceleratorID, AcceleratorVRAMMB: acceleratorVRAMMB,
+			AcceleratorID: acceleratorID, CompanionAcceleratorIDs: companions, AcceleratorVRAMMB: acceleratorVRAMMB,
 			Models: advertised.Models, ResidentModels: advertised.ResidentModels, CustomNodes: advertised.CustomNodes,
 			ModelPools:   advertisedModelPools(advertised.ModelPools),
 			ContextLimit: advertised.ContextLimit, Slots: advertised.Slots, CapabilityGeneration: advertised.CapabilityGeneration,

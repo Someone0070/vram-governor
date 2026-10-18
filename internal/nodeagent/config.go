@@ -180,19 +180,22 @@ func (c WarmRAMConfig) Validate() error {
 // discovery verifies model, context, and parallel slot capacity; the explicit
 // values are conservative fallbacks for older or locked-down servers.
 type LlamaCPPServerConfig struct {
-	ID                  string                 `yaml:"id"`
-	Endpoint            string                 `yaml:"endpoint"`
-	PublicEndpoint      string                 `yaml:"public_endpoint"`
-	AcceleratorIndex    int                    `yaml:"accelerator_index"`
-	ContextLimit        int                    `yaml:"context_limit"`
-	Slots               int                    `yaml:"slots"`
-	RuntimeArgs         []string               `yaml:"runtime_args"`
-	ModelPaths          map[string]string      `yaml:"model_paths"`
-	ModelFingerprints   map[string]string      `yaml:"model_fingerprints"`
-	RuntimeFingerprints map[string]string      `yaml:"runtime_fingerprints"`
-	RouterManaged       bool                   `yaml:"router_managed"`
-	MaxResidentModels   int                    `yaml:"max_resident_models"`
-	RuntimeProfiles     []RuntimeProfileConfig `yaml:"runtime_profiles"`
+	ID               string `yaml:"id"`
+	Endpoint         string `yaml:"endpoint"`
+	PublicEndpoint   string `yaml:"public_endpoint"`
+	AcceleratorIndex int    `yaml:"accelerator_index"`
+	// CompanionAcceleratorIndexes lists further GPUs this server uses (a
+	// router splitting models across cards).
+	CompanionAcceleratorIndexes []int                  `yaml:"companion_accelerator_indexes"`
+	ContextLimit                int                    `yaml:"context_limit"`
+	Slots                       int                    `yaml:"slots"`
+	RuntimeArgs                 []string               `yaml:"runtime_args"`
+	ModelPaths                  map[string]string      `yaml:"model_paths"`
+	ModelFingerprints           map[string]string      `yaml:"model_fingerprints"`
+	RuntimeFingerprints         map[string]string      `yaml:"runtime_fingerprints"`
+	RouterManaged               bool                   `yaml:"router_managed"`
+	MaxResidentModels           int                    `yaml:"max_resident_models"`
+	RuntimeProfiles             []RuntimeProfileConfig `yaml:"runtime_profiles"`
 	// ModelPoolsFile is the JSON map {model: {pool_tokens, slots,
 	// max_request_tokens}} written by vram-llama-placement; read on every
 	// discovery and advertised so the controller admits by context tokens.
