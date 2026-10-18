@@ -21,7 +21,9 @@ memory. Results are written where vram-llama-placement reads its placements.
 
 Run with llama-server stopped.
 
-usage: vram-llama-quickcal [model ...]
+usage: vram-llama-quickcal [--missing] [model ...]
+  --missing  only models without a result for the current files, GPUs and
+             llama.cpp build (exit 3 when nothing is missing)
 """
 
 import configparser
@@ -45,6 +47,9 @@ _loader.exec_module(P)
 
 TEST_CONTEXT = 8192
 TEST_SLOTS = 4
+# Server slots during tests, as in production: the Qwen3.8 4B on the 6900 XT
+# (Vulkan) generated at 36 tok/s with one slot and 87 with eight.
+SERVER_SLOTS = 8
 SAFETY = 1 << 30            # bytes left free per GPU beyond the router reserve
 PREFETCH_BYTES = 32 << 30   # model bytes kept locked in RAM ahead of the runs
 GIB = 1 << 30
@@ -150,8 +155,8 @@ def _prompt(words, seed):
 
 def run_config(model, path, config, options, mtp, port):
     """Load model with config, run the sample jobs, return measurements or None."""
-    args = [P.SERVER, "-m", path, "--host", "127.0.0.1", "--port", str(port), "--no-webui", "-fa", "on", "-lv", "4",
-            "-dev", config["device"], "-ngl", "99", "-fit", "off", "-c", str(TEST_CONTEXT), "-np", str(TEST_SLOTS), "--kv-unified"]
+    args = [P.SERVER, "-m", path, "--host", "127.0.0.1", "--port", str(port), "--no-webui", "-lv", "4",
+            "-dev", config["device"], "-ngl", "99", "-fit", "off", "-c", str(TEST_CONTEXT), "-np", str(SERVER_SLOTS), "--kv-unified"]
     if config.get("tensor-split"):
         args += ["-ts", config["tensor-split"]]
     projector = P.mmproj_path(path)
@@ -182,11 +187,18 @@ def run_config(model, path, config, options, mtp, port):
         if not healthy:
             return None
         load_seconds = time.time() - started
-        single = _post(port, "/completion", {"prompt": _prompt(1000, 1), "n_predict": 128, "cache_prompt": False, "temperature": 0})["timings"]
+        # Untimed warm-up at the measured shapes: the Vulkan backend compiles
+        # each kernel on first use (Gemma 4 on the 6900 XT read its first
+        # prompt at 97 tok/s instead of ~1000).
+        _post(port, "/completion", {"prompt": _prompt(512, 99), "n_predict": 8, "cache_prompt": False})
+        warm = [threading.Thread(target=_post, args=(port, "/completion", {"prompt": _prompt(128, 90 + i), "n_predict": 4, "cache_prompt": False})) for i in range(TEST_SLOTS)]
+        [t.start() for t in warm]
+        [t.join() for t in warm]
+        single = _post(port, "/completion", {"prompt": _prompt(768, 1), "n_predict": 96, "cache_prompt": False, "temperature": 0})["timings"]
         results = []
 
         def one(seed):
-            results.append(_post(port, "/completion", {"prompt": _prompt(250, seed), "n_predict": 96, "cache_prompt": False, "temperature": 0})["timings"])
+            results.append(_post(port, "/completion", {"prompt": _prompt(192, seed), "n_predict": 64, "cache_prompt": False, "temperature": 0})["timings"])
 
         t0 = time.time()
         threads = [threading.Thread(target=one, args=(seed,)) for seed in range(2, 2 + TEST_SLOTS)]
@@ -221,7 +233,7 @@ def run_config(model, path, config, options, mtp, port):
         memory.setdefault(clip_device, {}).setdefault("projector", 0.0)
         memory[clip_device]["projector"] += os.path.getsize(projector) / (1 << 20)
     return {"tg1": single.get("predicted_per_second", 0.0), "pp": single.get("prompt_per_second", 0.0),
-            "tg_parallel": aggregate, "load_s": round(load_seconds, 1), "memory": memory}
+            "tg_parallel": aggregate, "load_s": round(load_seconds, 1), "run_s": round(time.time() - started, 1), "memory": memory}
 
 
 # --- model of one model -------------------------------------------------------
@@ -233,10 +245,20 @@ def share_of(config, primary):
     return parts[0] / sum(parts)
 
 
+def cliff(measured, runs):
+    """A split far below the best measured split: a layer-boundary collapse
+    (Gemma 4 26B: 2180 tok/s prompt at 56:44, 134 at 52:48) that would skew
+    the fit for every other ratio."""
+    splits = [m for c, m in runs if m and c.get("tensor-split")]
+    best_pp = max(m["pp"] for m in splits)
+    best_tg = max(m["tg1"] for m in splits)
+    return measured["pp"] < best_pp * 0.5 or measured["tg1"] < best_tg * 0.6
+
+
 def fit(runs, primary, second):
     """Per-model coefficients from the measured runs."""
     singles = {share_of(c, primary): m for c, m in runs if m and not c.get("tensor-split")}
-    splits = [(share_of(c, primary), m) for c, m in runs if m and c.get("tensor-split")]
+    splits = [(share_of(c, primary), m) for c, m in runs if m and c.get("tensor-split") and not cliff(m, runs)]
 
     def line(points):
         if len(points) == 1:
@@ -306,13 +328,22 @@ def configs_for(path, cards, options):
     if len(names) < 2 or weights + 2 * GIB > sum(capacities.values()):
         return single, []
     proportional = capacities[names[0]] / sum(capacities.values())
-    shares = [proportional] if single else [proportional - 0.1, proportional + 0.1]
+    # A model that fits one GPU only splits for very long contexts: one
+    # point suffices. One that needs both GPUs gets a scan, because collapses
+    # at single layer boundaries are narrow and no formula predicts them.
+    shares = [proportional] if single else [proportional + d for d in (-0.2, -0.1, 0.0, 0.1, 0.2)]
     splits = []
     for share in shares:
         share = min(0.9, max(0.1, round(share, 2)))
         if weights * share < capacities[names[0]] - GIB and weights * (1 - share) < capacities[names[1]] - GIB:
             splits.append({"device": ",".join(names[:2]), "tensor-split": f"{round(share * 100)},{100 - round(share * 100)}"})
     return single, splits
+
+
+def build_id():
+    """Identifies the llama.cpp build: a new build can change every speed."""
+    stat = os.stat(os.path.realpath(P.SERVER))
+    return f"{stat.st_size}:{int(stat.st_mtime)}"
 
 
 def main():
@@ -325,15 +356,25 @@ def main():
     primary = cards[0][0]
     second = cards[1][0] if len(cards) > 1 else None
     capacities = {n: ((t - P.RESERVE_MIB) << 20) / (1 << 20) for n, t in cards}
-    only = sys.argv[1:]
+    missing_only = "--missing" in sys.argv
+    only = [a for a in sys.argv[1:] if not a.startswith("--")]
+    build = build_id()
+    existing = P.load_calibration()
     work = []
     for model, path in P.models().items():
         options = base[model] if base.has_section(model) else {}
         if only and model not in only or options.get("embeddings") in ("1", "true", "on"):
             continue
+        if missing_only:
+            record = existing.get(P.sweep_key(model, path, cards))
+            if record and record.get("build") == build:
+                continue
         mtp = P.mtp_settings(P.read_gguf_metadata(path), os.path.getsize(path), options)
         single, splits = configs_for(path, cards, options)
         work.append((model, path, options, mtp, single, splits))
+    if missing_only and not work:
+        print("nothing to calibrate", flush=True)
+        sys.exit(3)
     started = time.time()
     prefetch = Prefetcher()
     for model, path, options, mtp, single, splits in work:
@@ -345,7 +386,7 @@ def main():
         label = config["device"] + (" " + config["tensor-split"] if config.get("tensor-split") else "")
         with print_lock:
             if measured:
-                print(f"| {model} | {label} | {measured['load_s']}s | {measured['tg1']:.1f} | {measured['tg_parallel']:.1f} | {measured['pp']:.0f} |", flush=True)
+                print(f"| {model} | {label} | {measured['load_s']}s / {measured['run_s']}s | {measured['tg1']:.1f} | {measured['tg_parallel']:.1f} | {measured['pp']:.0f} |", flush=True)
             else:
                 print(f"| {model} | {label} | — | does not load | | |", flush=True)
 
@@ -354,11 +395,13 @@ def main():
     for model, path, options, mtp, single, splits in work:
         for config in single:
             lanes.setdefault(config["device"], []).append((model, path, options, mtp, config))
-    print("| model | placement | load | gen 1 stream | gen 4 streams | prompt |\n|---|---|---|---|---|---|", flush=True)
+    print("| model | placement | load / whole run | gen 1 stream | gen 4 streams | prompt |\n|---|---|---|---|---|---|", flush=True)
 
     def lane(device, queue, port):
         for index, (model, path, options, mtp, config) in enumerate(queue):
-            prefetch.ahead([q[1] for q in queue[index:index + 3]])
+            # the next model only: a deeper window competed with the current
+            # load for disk and memory bandwidth
+            prefetch.ahead([q[1] for q in queue[index:index + 2]])
             measured = run_config(model, path, config, options, mtp, port)
             runs[model].append((config, measured))
             report(model, config, measured)
@@ -387,11 +430,21 @@ def main():
         for config, _ in measured_runs:
             if not config.get("tensor-split"):
                 candidates.append((config, predict(model_fit, share_of(config, primary), capacities, primary, second, False)))
-        if any(c.get("tensor-split") for c, _ in measured_runs) and second:
+        measured_splits = [(c, m) for c, m in measured_runs if c.get("tensor-split")]
+        cliffs = [share_of(c, primary) for c, m in measured_splits if cliff(m, measured_runs)]
+        for config, measured in measured_splits:
+            if not cliff(measured, measured_runs):
+                # a measured ratio is a candidate as is, with its measured speeds
+                predicted = predict(model_fit, share_of(config, primary), capacities, primary, second, True)
+                predicted.update(tg1=measured["tg1"], pp=measured["pp"])
+                candidates.append((dict(config, **{"n-gpu-layers": "99", "fit": "off"}), predicted))
+        if measured_splits and second:
             for step in range(5, 100, 5):
                 share = step / 100
                 weights = model_fit["memory"]["weights_mib"]
                 if weights * share > capacities[primary] - 1024 or weights * (1 - share) > capacities[second] - 1024:
+                    continue
+                if any(abs(share - bad) <= 0.03 for bad in cliffs):
                     continue
                 config = {"device": f"{primary},{second}", "tensor-split": f"{step},{100 - step}", "n-gpu-layers": "99", "fit": "off"}
                 candidates.append((config, predict(model_fit, share, capacities, primary, second, True)))
@@ -419,7 +472,7 @@ def main():
                 else:
                     ok = False
             if ok:
-                record = dict(config, pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
+                record = dict(config, build=build, pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
                               tgN=measured["tg_parallel"], jobs=predicted["jobs_per_min"] / 60, predicted=predicted, fit=model_fit)
                 if not record.get("tensor-split"):
                     record.pop("n-gpu-layers", None)

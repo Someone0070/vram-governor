@@ -1,0 +1,79 @@
+#!/bin/bash
+# Calibrate router models that have no result for the current model files,
+# GPUs and llama.cpp build, without an operator: triggered when the models
+# directory changes (vram-llama-autocal.path), nightly and at boot
+# (vram-llama-autocal.timer). Waits until the router is idle, stops it for
+# the few minutes the runs take, regenerates the presets and starts it again.
+set -u
+export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/root/llama.cpp-mixed/build/bin}
+QUICKCAL=${QUICKCAL:-/usr/local/sbin/vram-llama-quickcal}
+ROUTER=${ROUTER_URL:-http://127.0.0.1:8080}
+UNIT=${ROUTER_UNIT:-llama-server}
+MAX_WAIT=${MAX_WAIT_SECONDS:-3600}
+LOCK=/run/vram-llama-autocal.lock
+
+exec 9>"$LOCK"
+flock -n 9 || { echo "another calibration is running"; exit 0; }
+
+# Anything to do? (quickcal --missing exits 3 when every model is current;
+# a dry check needs no GPU.)
+if ! python3 - <<'PY'
+import importlib.machinery, importlib.util, os, sys
+l = importlib.machinery.SourceFileLoader("q", os.environ.get("QUICKCAL", "/usr/local/sbin/vram-llama-quickcal"))
+s = importlib.util.spec_from_loader("q", l); q = importlib.util.module_from_spec(s); l.exec_module(q)
+P = q.P
+cards = P.devices()
+build = q.build_id()
+results = P.load_calibration()
+import configparser
+base = configparser.ConfigParser(interpolation=None, strict=False); base.optionxform = str; base.read(P.BASE)
+missing = []
+for model, path in P.models().items():
+    options = base[model] if base.has_section(model) else {}
+    if options.get("embeddings") in ("1", "true", "on"):
+        continue
+    record = results.get(P.sweep_key(model, path, cards))
+    if not record or record.get("build") != build:
+        missing.append(model)
+print("uncalibrated:", " ".join(missing) or "none")
+sys.exit(0 if missing else 3)
+PY
+then
+    exit 0
+fi
+
+# Wait until no loaded model is processing a request.
+idle() {
+    python3 - "$ROUTER" <<'PY'
+import json, sys, urllib.request
+base = sys.argv[1]
+try:
+    models = json.load(urllib.request.urlopen(base + "/models", timeout=5))["data"]
+except Exception:
+    sys.exit(0)  # router down: nothing to interrupt
+for m in models:
+    if (m.get("status") or {}).get("value") != "loaded":
+        continue
+    try:
+        slots = json.load(urllib.request.urlopen(base + "/slots?model=" + urllib.request.quote(m["id"]), timeout=5))
+    except Exception:
+        continue
+    if any(s.get("is_processing") for s in slots):
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+waited=0
+while ! idle; do
+    [ "$waited" -ge "$MAX_WAIT" ] && { echo "router stayed busy for ${MAX_WAIT}s; trying again next time"; exit 0; }
+    sleep 15; waited=$((waited + 15))
+done
+
+echo "stopping $UNIT for calibration"
+systemctl stop "$UNIT"
+"$QUICKCAL" --missing
+status=$?
+systemctl start "$UNIT"
+echo "calibration exit $status; $UNIT started"
+[ "$status" = 3 ] && exit 0
+exit "$status"

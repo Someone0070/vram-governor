@@ -1,0 +1,8 @@
+[Unit]
+Description=Calibrate new or changed llama.cpp router models
+After=llama-server.service
+
+[Service]
+Type=oneshot
+Environment=LD_LIBRARY_PATH=/root/llama.cpp-mixed/build/bin
+ExecStart=/usr/local/sbin/vram-llama-autocal

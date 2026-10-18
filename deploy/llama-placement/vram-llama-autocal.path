@@ -1,0 +1,13 @@
+[Unit]
+Description=Calibrate router models when the models directory changes
+
+[Path]
+PathChanged=/etc/vram-governor/llama-models
+PathChanged=/etc/vram-governor/llama-presets.base.ini
+# Let a multi-file copy finish before calibrating.
+TriggerLimitIntervalSec=120
+TriggerLimitBurst=1
+Unit=vram-llama-autocal.service
+
+[Install]
+WantedBy=multi-user.target

@@ -300,7 +300,7 @@ def fitted_context(path, device, slots, options, cards, context=None):
     if not os.path.exists(binary):
         return None
     stat = os.stat(path)
-    args = ["-m", path, "-dev", device, "-np", str(slots), "-fa", "on"]
+    args = ["-m", path, "-dev", device, "-np", str(slots)]
     for key, flag in (("cache-type-k", "-ctk"), ("cache-type-v", "-ctv")):
         if options.get(key):
             args += [flag, options[key]]
@@ -551,7 +551,7 @@ def batched_throughput(path, preset, options, slots):
     192 generated tokens. Jobs per second counts prompt reading too: a split
     that generates more in parallel can still finish fewer jobs."""
     bench = os.path.join(os.path.dirname(SERVER), "llama-batched-bench")
-    args = [bench, "-m", path, "-dev", preset["device"], "-ngl", "99", "-fa", "on", "-c", preset["ctx-size"], "--kv-unified",
+    args = [bench, "-m", path, "-dev", preset["device"], "-ngl", "99", "-c", preset["ctx-size"], "--kv-unified",
             "-npp", "1024", "-ntg", "192", "-npl", "1" if slots == 1 else f"1,{slots}"]
     if preset.get("tensor-split"):
         args += ["-ts", preset["tensor-split"].replace(",", "/")]
@@ -684,7 +684,7 @@ TEST_IMAGE = _test_image()
 def loads_on_gpus(path, preset, options):
     """Start llama-server with these preset keys: healthy with every layer on the GPUs?"""
     # -lv 4: the "offloaded N/M layers" line is debug-level output.
-    args = [SERVER, "-m", path, "--host", "127.0.0.1", "--port", "8098", "--no-webui", "-fa", "on", "-lv", "4"]
+    args = [SERVER, "-m", path, "--host", "127.0.0.1", "--port", "8098", "--no-webui", "-lv", "4"]
     projector = mmproj_path(path)
     if projector:
         # The router loads the projector too; its buffers count.

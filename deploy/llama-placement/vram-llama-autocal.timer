@@ -1,0 +1,10 @@
+[Unit]
+Description=Calibrate uncalibrated router models at boot and nightly
+
+[Timer]
+OnBootSec=5min
+OnCalendar=*-*-* 04:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
