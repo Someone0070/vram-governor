@@ -38,6 +38,32 @@ CPU: 104 -> 38 tok/s. Split models use the tool's estimate with auto-fit off
 instead of slowing it down. The router command line must not set
 `--ctx-size`/`--parallel`: they override every model's preset.
 
+## MTP speculative decoding
+
+Models with multi-token-prediction layers (`nextn_predict_layers` in the
+GGUF: the Qwen3.8 4B and 27B here) run with `spec-type = draft-mtp`. Through
+the LB, single request (CT200, 2026-10-17):
+
+| Model | Without MTP | With MTP | Pool without / with |
+|---|---|---|---|
+| qwen3.8_4b (4070 SUPER) | 103 tok/s | 130-138 tok/s | 186k / 87.5k tokens |
+| qwen3.8-27b Q5 (split) | 20.0 | 31.0 | 30.2k / 27.1k |
+| qwen3.8-27b Q6 (split) | 18.8 | 28-30 | 35.6k / 32k |
+
+Eight concurrent 4B chats finish faster with MTP (8.9 s vs 12.4 s); four
+concurrent 27B requests take about the same (52 vs 49 s).
+
+The draft context needs VRAM that neither this tool's estimate nor
+llama-fit-params accounts for, and part of it is only allocated on the first
+generation. Too little and llama.cpp moves layers to the CPU (4B at a 131k
+pool: 38 tok/s) or, with `fit = off`, aborts with CUDA out of memory. So
+`--calibrate` starts a real llama-server per MTP model, binary-searches the
+largest pool that loads with every layer on the GPUs and completes a short
+generation, then keeps 90% of it after two more clean runs (the 27B Q6 at its
+full pool passed once and then failed in the router). A model without a
+calibrated MTP pool runs without MTP; `mtp = off` in the base file disables
+it. Run `--calibrate` with llama-server stopped.
+
 Hand-written settings (embedding mode, KV-cache types, `placement = single`
 to keep a model on the primary GPU, ...) go in
 `/etc/vram-governor/llama-presets.base.ini` and always win; the router reads

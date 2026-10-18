@@ -24,6 +24,16 @@ and card set; without a cached result the primary GPU is filled first (it
 also processes prompts fastest). Run --calibrate with llama-server stopped
 after adding models or changing cards.
 
+Models that ship multi-token-prediction layers (GGUF nextn_predict_layers)
+get MTP speculative decoding (4070 SUPER: 4B 103 -> 155-167 tok/s, 27B split
+19.9 -> 31-33). Its draft context needs VRAM that no estimate here or in
+llama-fit-params got right (the server also sees less free memory than the
+fit tool), and without that room llama.cpp moves layers to the CPU and MTP
+turns 4x slower. So --calibrate loads each such model in a real llama-server
+and keeps the largest pool that still loads entirely on the GPUs; a model
+without a calibrated MTP pool runs without MTP. `mtp = off` in the base file
+disables it for a model.
+
 usage: vram-llama-placement [--dry-run | --calibrate]
 """
 
@@ -35,6 +45,9 @@ import re
 import struct
 import subprocess
 import sys
+import threading
+import time
+import urllib.request
 
 MODELS_DIR = os.environ.get("VG_LLAMA_MODELS_DIR", "/etc/vram-governor/llama-models")
 BASE = os.environ.get("VG_LLAMA_PRESETS_BASE", "/etc/vram-governor/llama-presets.base.ini")
@@ -48,6 +61,8 @@ MIN_CONTEXT = int(os.environ.get("VG_LLAMA_MIN_CONTEXT", "8192"))
 CALIBRATION = os.environ.get("VG_LLAMA_CALIBRATION", "/var/lib/vram-governor/llama-placement-calibration.json")
 CACHE_BYTES = {"f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 34 / 32, "q5_1": 24 / 32, "q5_0": 22 / 32, "q4_1": 20 / 32, "q4_0": 18 / 32, "iq4_nl": 18 / 32}
 GIB = 1 << 30
+# This tool's own keys; llama-server would reject them.
+OWN_KEYS = ("placement", "mtp")
 
 
 def read_gguf_metadata(path):
@@ -113,6 +128,16 @@ def kv_cache_bytes(meta, context, k_type, v_type):
     k = CACHE_BYTES.get(k_type, 2.0)
     v = CACHE_BYTES.get(v_type, 2.0)
     return int(sum(h * (head_dim * k + value_dim * v) for h in per_layer) * context)
+
+
+def mtp_settings(meta, weights, options):
+    """Speculative-decoding keys for a model with MTP layers, else {}."""
+    arch = meta.get("general.architecture", "")
+    if options.get("mtp") in ("0", "off", "false", "no") or not meta.get(f"{arch}.nextn_predict_layers"):
+        return {}
+    # Drafting 3 tokens is fastest on the small model; on the 27B split 2 is
+    # as fast and steadier (prose 30.7 / code 32.6 vs 31.1 / 28.7 at 3).
+    return {"spec-type": "draft-mtp", "spec-draft-n-max": "3" if weights < 6 * GIB else "2"}
 
 
 def devices():
@@ -277,7 +302,8 @@ def context_pool(model, path, placed, base, cards):
             return pool, 2, min(trained, pool), {"n-gpu-layers": str(fitted[1])}
     single_spill = len(names) == 1 and weights + margin > capacities.get(names[0], 0)
     if layers and gpu_layers < layers or single_spill:
-        # Partly on the CPU: keep the KV small, it competes with the layers.
+        # Partly on the CPU: keep the KV small, it competes with the layers
+        # (no MTP: drafting does not pay off when layers run on the CPU).
         pool, slots = min(trained, 16384), 2
         return pool, slots, min(trained, pool), {}
     elif len(names) > 1:
@@ -294,6 +320,24 @@ def context_pool(model, path, placed, base, cards):
         pool = 2048
     slots = max(1, min(slots, pool // 2048))
     return pool, slots, min(trained, pool), {}
+
+
+def mtp_key(model, path, cards, placed):
+    return "mtp|" + calibration_key(model, path, cards) + "|" + placed.get("tensor-split", "")
+
+
+def with_mtp(model, path, placed, base, cards, pool, slots, max_request, extra):
+    """Apply the calibrated MTP pool, if this model has one."""
+    options = base[model] if base.has_section(model) else {}
+    mtp = mtp_settings(read_gguf_metadata(path), os.path.getsize(path), options)
+    if not mtp or extra or placed.get("n-gpu-layers", "99") != "99":
+        return pool, slots, max_request, extra, ""
+    cached = load_calibration().get(mtp_key(model, path, cards, placed))
+    if not cached:
+        return pool, slots, max_request, extra, "; MTP uncalibrated (run --calibrate)"
+    pool = min(pool, cached["pool"])
+    slots = max(1, min(slots, pool // 2048))
+    return pool, slots, min(max_request, pool), dict(extra, **mtp), "; MTP"
 
 
 def split_candidates(need, capacities):
@@ -362,11 +406,111 @@ def calibrate(base, cards, context):
         if best and best["tg"] > 0:
             results[calibration_key(model, path, cards)] = dict(best, tried=tried)
             print(f"{model}: chose {best['tensor_split']}", flush=True)
+    save_calibration(results)
+    # MTP pools, measured with the real server (on the split just chosen).
+    for model, path in models().items():
+        options = base[model] if base.has_section(model) else {}
+        mtp = mtp_settings(read_gguf_metadata(path), os.path.getsize(path), options)
+        if not mtp:
+            continue
+        placed, _ = placement(model, path, base, cards, MIN_CONTEXT)
+        pool, slots, _, extra = context_pool(model, path, placed, base, cards)
+        if extra or placed.get("n-gpu-layers", "99") != "99":
+            continue
+
+        def fits(size):
+            preset = dict(placed, **mtp)
+            preset.update({"ctx-size": str(size), "parallel": str(max(1, min(slots, size // 2048))), "kv-unified": "1"})
+            ok = loads_on_gpus(path, preset, options)
+            print(f"{model}: MTP pool {size}: {'fits' if ok else 'does not fit'}", flush=True)
+            return ok
+
+        best = pool if fits(pool) else 0
+        low, high = 8192, pool
+        while not best and high - low >= 4096:
+            size = (low + high) // 2 // 256 * 256
+            if fits(size):
+                low = size
+            else:
+                high = size
+        best = best or (low if low > 8192 or fits(low) else 0)
+        # The largest size that loads once is an edge, not a setting: the 27B
+        # Q6 at its full pool passed here and then ran out of memory in the
+        # router. Keep 10% headroom and require two clean runs.
+        verified = 0
+        for _ in range(3):
+            if not best:
+                break
+            best = max(8192, int(best * 0.9) // 256 * 256)
+            if fits(best) and fits(best):
+                verified = best
+                break
+            if best == 8192:
+                break
+        best = verified
+        key = mtp_key(model, path, cards, placed)
+        if best:
+            results[key] = {"pool": best}
+            print(f"{model}: MTP pool {best} (without MTP {pool})", flush=True)
+        else:
+            results.pop(key, None)
+        save_calibration(results)
+
+
+def save_calibration(results):
     os.makedirs(os.path.dirname(CALIBRATION), exist_ok=True)
     tmp = CALIBRATION + ".tmp"
     with open(tmp, "w") as f:
         json.dump(results, f, indent=1)
     os.replace(tmp, CALIBRATION)
+
+
+def loads_on_gpus(path, preset, options):
+    """Start llama-server with these preset keys: healthy with every layer on the GPUs?"""
+    # -lv 4: the "offloaded N/M layers" line is debug-level output.
+    args = [SERVER, "-m", path, "--host", "127.0.0.1", "--port", "8098", "--no-webui", "-fa", "on", "-lv", "4"]
+    merged = dict(preset)
+    merged.update({k: v for k, v in options.items() if k not in OWN_KEYS})
+    for key, value in merged.items():
+        if key == "kv-unified":
+            if value in ("1", "true", "on"):
+                args.append("--" + key)
+        else:
+            args += ["--" + key, value]
+    proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    log, healthy = [], False
+    reader = threading.Thread(target=lambda: log.extend(proc.stderr), daemon=True)
+    reader.start()
+    try:
+        for _ in range(300):
+            if proc.poll() is not None:
+                break
+            try:
+                healthy = urllib.request.urlopen("http://127.0.0.1:8098/health", timeout=2).status == 200
+            except Exception:
+                healthy = False
+            if healthy:
+                break
+            time.sleep(1)
+        if healthy:
+            # MTP allocates more on its first draft: a pool that loads can
+            # still run out of memory on the first request (27B Q6 at 35584).
+            body = json.dumps({"prompt": "Count from one to twenty in words:", "n_predict": 48}).encode()
+            try:
+                request = urllib.request.Request("http://127.0.0.1:8098/completion", data=body, headers={"Content-Type": "application/json"})
+                healthy = urllib.request.urlopen(request, timeout=300).status == 200 and proc.poll() is None
+            except Exception:
+                healthy = False
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        reader.join(timeout=5)
+    offloaded = [m.groups() for m in (re.search(r"offloaded (\d+)/(\d+) layers", line) for line in log) if m]
+    return healthy and bool(offloaded) and all(a == b for a, b in offloaded)
 
 
 def main():
@@ -383,17 +527,17 @@ def main():
     lines = ["; Generated by vram-llama-placement before each llama-server start.",
              "; Edit %s instead; its settings always win." % BASE,
              "; GPUs: " + (", ".join(f"{n} {t} MiB" for n, t in cards) or "none found"), ""]
-    # "placement" is this tool's own key; llama-server would reject it.
-    sections = {s: {k: v for k, v in base[s].items() if k != "placement"} for s in base.sections()}
+    sections = {s: {k: v for k, v in base[s].items() if k not in OWN_KEYS} for s in base.sections()}
     pools = {}
     for model, path in models().items():
         placed, note = placement(model, path, base, cards, MIN_CONTEXT)
         try:
             pool, slots, max_request, extra = context_pool(model, path, placed, base, cards)
+            pool, slots, max_request, extra, mtp_note = with_mtp(model, path, placed, base, cards, pool, slots, max_request, extra)
             placed.update({"ctx-size": str(pool), "parallel": str(slots), "kv-unified": "1"})
             placed.update(extra)
             pools[model] = {"pool_tokens": pool, "slots": slots, "max_request_tokens": max_request}
-            note += f"; pool {pool} tokens, {slots} slots, up to {max_request} per request"
+            note += f"; pool {pool} tokens, {slots} slots, up to {max_request} per request" + mtp_note
         except Exception as error:
             note += f"; no context pool ({error})"
         merged = dict(placed)
