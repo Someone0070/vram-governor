@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -81,105 +82,143 @@ func (s *Server) handleAdminNodeTelemetry(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{"node_id": r.PathValue("id"), "range_minutes": minutes, "samples": jsonSlice(rows)})
 }
 
-// readiness reports observable deployment facts, not roadmap claims. It is
-// intentionally conservative: configuration and simulator tests do not count
-// as a live integration.
-func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, profiles []*domain.InterferenceProfile, samples []*domain.SchedulerLearningSample) deploymentReadiness {
+// readiness is the console's health summary: live facts about this
+// deployment (nodes, GPUs, routes, storage, recent job outcomes). Optional
+// features that are not configured are "off", not "missing", so the overall
+// state only degrades for something that is actually broken.
+func (s *Server) readiness(nodes []*domain.Node, targets []workloads.Target, rows []*domain.Workload) deploymentReadiness {
 	mode := "development"
 	if s.cfg.Production {
 		mode = "production"
 	}
+	var problems []string
+	check := func(id, label, status, detail string) readinessCheck {
+		if status == "missing" || status == "partial" {
+			problems = append(problems, label)
+		}
+		return readinessCheck{ID: id, Label: label, Status: status, Detail: detail}
+	}
+	var checks []readinessCheck
+
 	stateBackend := "memory (restart-ephemeral)"
-	persistenceStatus := "missing"
-	persistenceDetail := "database_url is empty; queues, leases, prompt mappings, approvals, incidents, and notifications are lost on controller restart"
 	if s.cfg.DatabaseURL != "" {
 		stateBackend = "postgresql"
-		persistenceStatus = "ready"
-		persistenceDetail = "controller opened PostgreSQL successfully at startup"
+		checks = append(checks, check("durable_state", "Controller state", "ready", "PostgreSQL"))
+	} else {
+		checks = append(checks, check("durable_state", "Controller state", "partial", "in memory: queues and history are lost on restart"))
 	}
 
-	connected := 0
+	connected, gpus := 0, []string{}
+	var offline []string
 	for _, node := range nodes {
 		if node.Observed.Connectivity == domain.ConnectivityConnected {
 			connected++
+			for _, gpu := range node.Accelerators {
+				gpus = append(gpus, gpu.Model)
+			}
+		} else {
+			offline = append(offline, firstNonEmptyString(node.Name, node.ID))
 		}
 	}
-	llmTargets, comfyTargets, cloudTargets, unverifiedCapacity, sharingTargets := 0, 0, 0, 0, 0
+	nodeStatus, nodeDetail := "ready", fmt.Sprintf("%d of %d connected", connected, len(nodes))
+	if len(offline) > 0 {
+		nodeStatus = "partial"
+		if connected == 0 {
+			nodeStatus = "missing"
+		}
+		nodeDetail += "; offline: " + strings.Join(offline, ", ")
+	}
+	checks = append(checks, check("nodes", "Nodes", nodeStatus, nodeDetail))
+	if len(gpus) > 0 {
+		checks = append(checks, check("gpus", "GPUs", "ready", strings.Join(gpus, ", ")))
+	} else {
+		checks = append(checks, check("gpus", "GPUs", "missing", "no connected node reports a GPU"))
+	}
+
+	llmRoutes, comfyRoutes, cloudReady := 0, 0, 0
+	models, loaded := map[string]bool{}, []string{}
 	for _, target := range targets {
-		if !target.Enabled {
+		if !target.Enabled || target.Quarantined {
 			continue
 		}
 		switch strings.ToLower(target.Adapter) {
 		case "llamacpp", "llama":
-			llmTargets++
-			if !target.CapacityVerified {
-				unverifiedCapacity++
+			llmRoutes++
+			for _, model := range target.Models {
+				models[model] = true
 			}
+			loaded = append(loaded, target.ResidentModels...)
 		case "comfy":
-			comfyTargets++
+			comfyRoutes++
 		case "openrouter":
-			cloudTargets++
-		}
-		if target.SharingEnabled {
-			sharingTargets++
-		}
-	}
-	trustedProfiles := 0
-	for _, profile := range profiles {
-		if profile.Confidence >= .5 {
-			trustedProfiles++
+			if target.Endpoint != "" && target.Authorization != "" {
+				cloudReady++
+			}
 		}
 	}
-	guardedSharingSuccesses, guardedSharingRollbacks := 0, 0
-	for _, sample := range samples {
-		var predicted struct {
-			GuardedExploration bool `json:"guarded_exploration"`
+	if llmRoutes > 0 {
+		detail := fmt.Sprintf("%d routes, %d models", llmRoutes, len(models))
+		if len(loaded) > 0 {
+			detail += "; loaded: " + strings.Join(loaded, ", ")
+		} else {
+			detail += "; none loaded (first request loads on demand)"
 		}
-		var observed struct {
-			VRAMMB int64 `json:"vram_mb"`
-		}
-		if json.Unmarshal(sample.Predicted, &predicted) != nil || !predicted.GuardedExploration || json.Unmarshal(sample.Observed, &observed) != nil || observed.VRAMMB <= 0 {
+		checks = append(checks, check("llm", "LLM routes", "ready", detail))
+	} else {
+		checks = append(checks, check("llm", "LLM routes", "missing", "no enabled local LLM route"))
+	}
+	if comfyRoutes > 0 {
+		checks = append(checks, check("comfy", "ComfyUI", "ready", fmt.Sprintf("%d routes (image, video, audio workflows)", comfyRoutes)))
+	} else {
+		checks = append(checks, check("comfy", "ComfyUI", "off", "no ComfyUI route configured"))
+	}
+	artifacts := s.cfg.Workloads.ArtifactStore.Type
+	if artifacts == "" {
+		artifacts = "filesystem"
+	}
+	checks = append(checks, check("artifacts", "Output storage", "ready", artifacts))
+
+	since := time.Now().Add(-24 * time.Hour)
+	succeeded, failed := 0, 0
+	for _, row := range rows {
+		if row == nil || row.FinishedAt == nil || row.FinishedAt.Before(since) {
 			continue
 		}
-		if sample.Outcome == "succeeded" {
-			guardedSharingSuccesses++
-		} else {
-			guardedSharingRollbacks++
+		switch row.Status {
+		case domain.WorkloadSucceeded:
+			succeeded++
+		case domain.WorkloadFailed:
+			failed++
 		}
 	}
+	jobStatus := "ready"
+	if failed > 0 && failed*5 > succeeded+failed {
+		jobStatus = "partial"
+	}
+	checks = append(checks, check("jobs", "Jobs (24 h)", jobStatus, fmt.Sprintf("%d succeeded, %d failed", succeeded, failed)))
+	if cloudReady > 0 {
+		checks = append(checks, check("cloud", "Cloud fallback", "ready", fmt.Sprintf("%d OpenRouter route(s)", cloudReady)))
+	} else {
+		checks = append(checks, check("cloud", "Cloud fallback", "off", "local only (no OpenRouter key configured)"))
+	}
+	if s.nodeLossMonitoringEnabled() {
+		checks = append(checks, check("monitoring", "Node-loss monitoring", "ready", "opens an incident when a node drops, closes it on reconnect"))
+	}
 
-	checks := []readinessCheck{
-		{ID: "durable_state", Label: "Durable controller state", Status: persistenceStatus, Detail: persistenceDetail},
-		{ID: "node_telemetry", Label: "Live accelerator telemetry", Status: ternaryStatus(connected > 0), Detail: countDetail(connected, "connected node", "connected nodes", "no connected node agent")},
-		{ID: "local_llm", Label: "Local LLM route", Status: ternaryStatus(llmTargets > 0), Detail: countDetail(llmTargets, "enabled local LLM target", "enabled local LLM targets", "no enabled local LLM target")},
-		{ID: "comfy", Label: "External ComfyUI route", Status: ternaryStatus(comfyTargets > 0), Detail: countDetail(comfyTargets, "enabled discovered/configured Comfy target", "enabled discovered/configured Comfy targets", "no enabled Comfy target; the dual-workload release gate is not met")},
-		{ID: "capacity", Label: "Runtime-verified context and slots", Status: "ready", Detail: "all enabled local LLM targets report verified capacity"},
-		{ID: "artifacts", Label: "Production object storage", Status: "partial", Detail: "filesystem artifact storage is active; suitable for development, not the production S3 durability boundary"},
-		{ID: "cloud", Label: "OpenRouter fallback", Status: ternaryStatus(cloudTargets > 0), Detail: countDetail(cloudTargets, "enabled cloud target (live provider behavior is not asserted here)", "enabled cloud targets (live provider behavior is not asserted here)", "no enabled OpenRouter target")},
-		{ID: "checkpoint", Label: "Runtime checkpoint / resume", Status: "missing", Detail: "the HTTP adapters currently return unsupported for yield, checkpoint, and resume"},
-		{ID: "coscheduling", Label: "Measured adaptive co-scheduling", Status: "missing", Detail: "no sharing target with a trusted real-run interference profile"},
-		{ID: "system_agent", Label: "Autonomous system-agent monitoring", Status: "partial", Detail: "a built-in node-loss observer opens and verifies recovery incidents; model-based evidence analysis and broader monitors are not running"},
+	overall := "healthy"
+	if len(problems) > 0 {
+		overall = "degraded: " + strings.Join(problems, ", ")
 	}
-	if unverifiedCapacity > 0 {
-		checks[4].Status = "partial"
-		checks[4].Detail = fmt.Sprintf("%d enabled local LLM target(s) use configured/fallback rather than runtime-verified capacity", unverifiedCapacity)
+	return deploymentReadiness{Mode: mode, StateBackend: stateBackend, ArtifactBackend: artifacts, ReleaseGate: overall, Checks: checks}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
 	}
-	if s.cfg.Workloads.ArtifactStore.Type == "s3" {
-		checks[5].Status = "ready"
-		checks[5].Detail = "S3-compatible artifact storage opened successfully at startup"
-	}
-	if guardedSharingSuccesses > 0 {
-		checks[8].Status = "ready"
-		checks[8].Detail = fmt.Sprintf("%d measured guarded co-scheduling success(es), %d rollback sample(s), and %d trusted profile(s) are persisted", guardedSharingSuccesses, guardedSharingRollbacks, trustedProfiles)
-	} else if sharingTargets > 0 && trustedProfiles > 0 {
-		checks[8].Status = "partial"
-		checks[8].Detail = fmt.Sprintf("%d sharing target(s) and %d trusted profile(s) are configured; no guarded physical co-scheduling success is recorded", sharingTargets, trustedProfiles)
-	}
-	releaseGate := "not ready"
-	if persistenceStatus == "ready" && connected > 0 && llmTargets > 0 && comfyTargets > 0 && unverifiedCapacity == 0 {
-		releaseGate = "integration-ready; live acceptance still required"
-	}
-	return deploymentReadiness{Mode: mode, StateBackend: stateBackend, ArtifactBackend: s.cfg.Workloads.ArtifactStore.Type, ReleaseGate: releaseGate, Checks: checks}
+	return ""
 }
 
 func ternaryStatus(ok bool) string {
@@ -296,9 +335,21 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	incidents, _ := s.incidentStore.ListIncidents(r.Context(), "")
 	performanceProfiles, _ := s.profiles.ListAllProfiles(r.Context())
 	nodeCommands, _ := s.workloadStore.ListNodeCommands(r.Context(), "", 100)
+	targets := s.workloads.Targets()
+	readiness := s.readiness(nodes, targets, workloads)
+	// The console polls this every two seconds: send what it shows, not the
+	// full history (452 jobs with base64 payloads and 11.6k recovered
+	// node-loss incidents made it 15 MB).
+	workloads = overviewWorkloads(workloads, overviewRecentWorkloads)
+	incidentCounts := map[string]int{"total": len(incidents)}
+	incidents = overviewIncidents(incidents, overviewRecentIncidents)
 	for index, incident := range incidents {
+		if incident.Status != "closed" && incident.Status != "recovered" {
+			incidentCounts["unresolved"]++
+		}
 		incidents[index] = s.syncIncidentAnalysis(r.Context(), incident)
 	}
+	residencies = servedResidencies(residencies, targets)
 	nodes = jsonSlice(nodes)
 	workloads = jsonSlice(workloads)
 	events = jsonSlice(events)
@@ -312,8 +363,89 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request) {
 	incidents = jsonSlice(incidents)
 	performanceProfiles = jsonSlice(performanceProfiles)
 	nodeCommands = jsonSlice(nodeCommands)
-	targets := s.workloads.Targets()
-	writeJSON(w, http.StatusOK, map[string]any{"principal": p.ID, "readiness": s.readiness(nodes, targets, profiles, learning), "nodes": nodes, "targets": targets, "workloads": workloads, "events": events, "model_residencies": residencies, "residency_transitions": transitions, "notifications": notifications, "budget_reservations": budgets, "scheduler_learning_samples": learning, "interference_profiles": profiles, "performance_profiles": performanceProfiles, "transition_plans": transitionPlans, "node_commands": nodeCommands, "incidents": incidents})
+	writeJSON(w, http.StatusOK, map[string]any{"principal": p.ID, "readiness": readiness, "nodes": nodes, "targets": targets, "workloads": workloads, "events": events, "model_residencies": residencies, "residency_transitions": transitions, "notifications": notifications, "budget_reservations": budgets, "scheduler_learning_samples": learning, "interference_profiles": profiles, "performance_profiles": performanceProfiles, "transition_plans": transitionPlans, "node_commands": nodeCommands, "incidents": incidents, "incident_counts": incidentCounts})
+}
+
+const (
+	overviewRecentWorkloads = 150
+	overviewRecentIncidents = 25
+)
+
+// overviewWorkloads keeps every unfinished workload plus the most recent
+// finished ones, without request payloads, plan material or outputs (the
+// console shows none of them; GET /api/v1/workloads/{id} has the full row).
+func overviewWorkloads(rows []*domain.Workload, recent int) []*domain.Workload {
+	sorted := append([]*domain.Workload(nil), rows...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].CreatedAt.After(sorted[j].CreatedAt) })
+	out := make([]*domain.Workload, 0, recent)
+	finished := 0
+	for _, row := range sorted {
+		if row == nil {
+			continue
+		}
+		switch row.Status {
+		case domain.WorkloadSucceeded, domain.WorkloadFailed, domain.WorkloadCancelled, domain.WorkloadRejected:
+			if finished >= recent {
+				continue
+			}
+			finished++
+		}
+		summary := *row
+		summary.Request.Payload = nil
+		summary.Request.TransformationParameters = nil
+		summary.InlineOutput = nil
+		if row.Plan != nil {
+			plan := *row.Plan
+			plan.Material = nil
+			summary.Plan = &plan
+		}
+		if row.Execution != nil {
+			execution := *row.Execution
+			execution.Opaque = nil
+			summary.Execution = &execution
+		}
+		out = append(out, &summary)
+	}
+	return out
+}
+
+// overviewIncidents keeps unresolved incidents plus the most recent others.
+func overviewIncidents(rows []*domain.Incident, recent int) []*domain.Incident {
+	sorted := append([]*domain.Incident(nil), rows...)
+	sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].UpdatedAt.After(sorted[j].UpdatedAt) })
+	out := make([]*domain.Incident, 0, recent)
+	resolved := 0
+	for _, row := range sorted {
+		if row == nil {
+			continue
+		}
+		if row.Status == "closed" || row.Status == "recovered" {
+			if resolved >= recent {
+				continue
+			}
+			resolved++
+		}
+		out = append(out, row)
+	}
+	return out
+}
+
+// servedResidencies drops residency rows for models no route serves any
+// more (models removed from a node keep their old rows in the store).
+func servedResidencies(rows []*domain.ModelResidency, targets []workloads.Target) []*domain.ModelResidency {
+	served := make(map[string]bool)
+	for _, target := range targets {
+		for _, model := range target.Models {
+			served[target.ID+"\x00"+model] = true
+		}
+	}
+	out := make([]*domain.ModelResidency, 0, len(rows))
+	for _, row := range rows {
+		if row != nil && served[row.TargetID+"\x00"+row.Model] {
+			out = append(out, row)
+		}
+	}
+	return out
 }
 
 func (s *Server) handleAdminIntegrations(w http.ResponseWriter, r *http.Request) {

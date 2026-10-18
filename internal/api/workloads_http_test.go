@@ -927,7 +927,7 @@ func TestAdminOverviewUsesArraysForEmptyCollections(t *testing.T) {
 	}
 }
 
-func TestAdminOverviewReportsDeploymentGapsWithoutPromotingSimulatorCoverage(t *testing.T) {
+func TestAdminOverviewHealthReportsRealProblemsAndOptionalFeaturesAsOff(t *testing.T) {
 	srv, _, cancel := testServer(t)
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "/admin/api/overview", nil)
@@ -951,15 +951,17 @@ func TestAdminOverviewReportsDeploymentGapsWithoutPromotingSimulatorCoverage(t *
 	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Readiness.StateBackend != "memory (restart-ephemeral)" || body.Readiness.ReleaseGate != "not ready" {
-		t.Fatalf("development deployment was overstated: %+v", body.Readiness)
-	}
 	statuses := map[string]string{}
 	for _, check := range body.Readiness.Checks {
 		statuses[check.ID] = check.Status
 	}
-	if statuses["durable_state"] != "missing" || statuses["comfy"] != "missing" || statuses["checkpoint"] != "missing" {
-		t.Fatalf("known release gaps not reported: %+v", statuses)
+	// No database, no GPU and no LLM route are real problems; ComfyUI and the
+	// cloud fallback are optional and only reported as off.
+	if body.Readiness.StateBackend != "memory (restart-ephemeral)" || !strings.HasPrefix(body.Readiness.ReleaseGate, "degraded: ") || statuses["durable_state"] != "partial" || statuses["llm"] != "missing" {
+		t.Fatalf("problems not reported: %+v", body.Readiness)
+	}
+	if statuses["comfy"] != "off" || statuses["cloud"] != "off" || strings.Contains(body.Readiness.ReleaseGate, "ComfyUI") || strings.Contains(body.Readiness.ReleaseGate, "Cloud") {
+		t.Fatalf("optional features counted as problems: %+v", body.Readiness)
 	}
 }
 

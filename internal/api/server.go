@@ -800,9 +800,21 @@ func (s *Server) reconcileNodeConnectivityIncident(ctx context.Context, node *do
 		s.log.Warn("node-loss incident reconciliation failed", "node", node.ID, "error", err)
 		return
 	}
-	var active *domain.Incident
+	var active, recentlyRecovered *domain.Incident
 	for _, incident := range incidents {
-		if incident.Status == "closed" || incident.Status == "recovered" {
+		if incident.Status == "closed" {
+			continue
+		}
+		if incident.Status == "recovered" {
+			// A node that drops again within half an hour reopens the same
+			// incident: a flapping link made ~75 new incidents an hour.
+			if time.Since(incident.UpdatedAt) < 30*time.Minute && (recentlyRecovered == nil || incident.UpdatedAt.After(recentlyRecovered.UpdatedAt)) {
+				for _, evidence := range incident.EvidenceRefs {
+					if evidence == evidenceRef {
+						recentlyRecovered = incident
+					}
+				}
+			}
 			continue
 		}
 		for _, evidence := range incident.EvidenceRefs {
@@ -818,6 +830,17 @@ func (s *Server) reconcileNodeConnectivityIncident(ctx context.Context, node *do
 	now := time.Now().UTC()
 	if current == domain.ConnectivityLost {
 		if active != nil {
+			return
+		}
+		if recentlyRecovered != nil {
+			recentlyRecovered.Status = "open"
+			recentlyRecovered.UpdatedAt = now
+			if !strings.Contains(recentlyRecovered.Summary, "(repeated)") {
+				recentlyRecovered.Summary += " (repeated)"
+			}
+			if _, err := s.incidentStore.UpdateIncident(ctx, recentlyRecovered); err != nil {
+				s.log.Warn("node-loss incident reopen failed", "node", node.ID, "error", err)
+			}
 			return
 		}
 		name := node.Name
