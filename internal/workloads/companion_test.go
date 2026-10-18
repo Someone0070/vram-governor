@@ -143,3 +143,38 @@ func TestLearnedSpeedReplacesCalibrationAfterSamples(t *testing.T) {
 		t.Fatal("the registered target's pools were modified")
 	}
 }
+
+// Evicting a neighbour across GPUs is fenced by the lease of the GPU the two
+// share: the split target uses its companion lease on GPU 1 to evict the GPU 1
+// router, and the GPU 1 router records its eviction of the split model on GPU 1.
+func TestCrossGPUReclaimUsesSharedGPULease(t *testing.T) {
+	previousGrace := companionGrace
+	companionGrace = time.Hour
+	defer func() { companionGrace = previousGrace }()
+	backing := store.NewMemoryStore()
+	mgr := NewManager(quietLogger(), backing, time.Minute)
+	ctx := context.Background()
+	split := Target{ID: "split", AcceleratorID: "node-gpu0", CompanionAcceleratorIDs: []string{"node-gpu1"}}
+	gpu1 := Target{ID: "gpu1", AcceleratorID: "node-gpu1"}
+	gpu0 := Target{ID: "gpu0", AcceleratorID: "node-gpu0"}
+	primary, _, err := backing.AcquireAcceleratorLease(ctx, "node-gpu0", "split-job", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason, err := mgr.holdCompanionLeases(ctx, split); err != nil || reason != "" {
+		t.Fatalf("companion: %q %v", reason, err)
+	}
+	if fence := mgr.reclaimLease(split, gpu1, primary); fence == nil || fence.AcceleratorID != "node-gpu1" {
+		t.Fatalf("split evicting the GPU 1 router must use its GPU 1 companion lease, got %+v", fence)
+	}
+	if fence := mgr.reclaimLease(split, gpu0, primary); fence != primary {
+		t.Fatalf("split evicting the GPU 0 router must use its own lease, got %+v", fence)
+	}
+	gpu1Lease := &domain.AcceleratorLease{AcceleratorID: "node-gpu1", WorkloadID: "gpu1-job", FencingToken: 7}
+	if got := transitionAccelerator(split, gpu1Lease); got != "node-gpu1" {
+		t.Fatalf("GPU 1 router evicting the split model must record it on GPU 1, got %s", got)
+	}
+	if got := transitionAccelerator(gpu0, gpu1Lease); got != "node-gpu0" {
+		t.Fatalf("a lease on an unrelated GPU must not move the transition, got %s", got)
+	}
+}

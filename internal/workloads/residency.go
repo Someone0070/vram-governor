@@ -1719,7 +1719,7 @@ func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleA
 			existing, lookupErr = m.store.GetResidencyTransitionByIdempotency(ctx, idempotencyKey)
 		}
 		if lookupErr == nil {
-			if existing.TargetID != target.ID || existing.AcceleratorID != target.AcceleratorID || existing.Model != model || existing.ToTier != to || existing.Reason != canonicalReason || existing.RequestedBy != actor || existing.WorkloadID != workloadID {
+			if existing.TargetID != target.ID || existing.AcceleratorID != transitionAccelerator(target, lease) || existing.Model != model || existing.ToTier != to || existing.Reason != canonicalReason || existing.RequestedBy != actor || existing.WorkloadID != workloadID {
 				return existing, fmt.Errorf("%w: canonical residency transition arguments differ", store.ErrResidencyTransitionConflict)
 			}
 			if existing.Status == domain.ResidencyTransitionSucceeded {
@@ -1777,7 +1777,7 @@ func (m *Manager) transitionModel(ctx context.Context, lifecycle ModelLifecycleA
 	residencyRevision := residency.Revision
 	transition := &domain.ResidencyTransition{
 		ID: newID("rtr"), IdempotencyKey: idempotencyKey, TargetID: target.ID,
-		AcceleratorID: target.AcceleratorID, Model: model, FromTier: residency.ObservedTier,
+		AcceleratorID: transitionAccelerator(target, lease), Model: model, FromTier: residency.ObservedTier,
 		ToTier: to, Reason: canonicalReason, RequestedBy: actor, WorkloadID: workloadID,
 		CapabilityVersion: target.CapabilityVersion, CapabilityRevision: target.CapabilityRevision,
 		Status: domain.ResidencyTransitionPlanned, CreatedAt: time.Now().UTC(),
@@ -2007,6 +2007,37 @@ func (m *Manager) nodeReady(ctx context.Context, nodeID string) bool {
 	return err == nil && node != nil && node.Observed.Ready && node.Observed.Connectivity == domain.ConnectivityConnected
 }
 
+// transitionAccelerator is the GPU a residency transition is recorded and
+// fenced on: the target's own, or - for a target spanning several GPUs
+// evicted by a neighbour on one of them - the shared GPU whose lease the
+// caller holds.
+func transitionAccelerator(target Target, lease *domain.AcceleratorLease) string {
+	if lease != nil && lease.AcceleratorID != target.AcceleratorID && containsString(targetAccelerators(target), lease.AcceleratorID) {
+		return lease.AcceleratorID
+	}
+	return target.AcceleratorID
+}
+
+// reclaimLease picks the lease that fences evicting foreign: selected's own
+// when foreign uses that GPU, otherwise selected's companion lease on a GPU
+// foreign uses (a split target evicting the per-card router of its second
+// GPU).
+func (m *Manager) reclaimLease(selected, foreign Target, lease *domain.AcceleratorLease) *domain.AcceleratorLease {
+	if lease == nil || containsString(targetAccelerators(foreign), lease.AcceleratorID) {
+		return lease
+	}
+	m.companions.mu.Lock()
+	defer m.companions.mu.Unlock()
+	if hold := m.companions.holds[selected.ID]; hold != nil {
+		for _, companion := range hold.leases {
+			if containsString(targetAccelerators(foreign), companion.AcceleratorID) {
+				return companion
+			}
+		}
+	}
+	return lease
+}
+
 func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, workload *domain.Workload, lease *domain.AcceleratorLease) ([]string, error) {
 	if selected.AcceleratorID == "" {
 		return nil, nil
@@ -2081,7 +2112,8 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 				if m.modelHasActiveDemand(model) || m.modelHasQueuedDemand(ctx, model) {
 					return transitionIDs, fmt.Errorf("foreign resident %s on %s is protected by active or queued demand", model, foreign.ID)
 				}
-				transition, err := m.transitionModel(ctx, lifecycle, foreign, model, domain.ResidencyColdDisk, "cross_adapter_reclaim", workload.Request.OwnerID, workload.Request.ID, demandTransitionKey("cross-adapter:"+workload.Request.ID+":"+foreign.ID+":"+model, workload.Request.ID, lease), lease)
+				fence := m.reclaimLease(selected, foreign, lease)
+				transition, err := m.transitionModel(ctx, lifecycle, foreign, model, domain.ResidencyColdDisk, "cross_adapter_reclaim", workload.Request.OwnerID, workload.Request.ID, demandTransitionKey("cross-adapter:"+workload.Request.ID+":"+foreign.ID+":"+model, workload.Request.ID, fence), fence)
 				if transition != nil {
 					transitionIDs = append(transitionIDs, transition.ID)
 				}
@@ -2104,7 +2136,7 @@ func (m *Manager) reclaimForeignTargets(ctx context.Context, selected Target, wo
 		if !ok {
 			continue
 		}
-		transition, err := m.transitionRuntimeCache(ctx, reclaimer, foreign, workload, lease, "cross_adapter_reclaim")
+		transition, err := m.transitionRuntimeCache(ctx, reclaimer, foreign, workload, m.reclaimLease(selected, foreign, lease), "cross_adapter_reclaim")
 		if transition != nil {
 			transitionIDs = append(transitionIDs, transition.ID)
 		}
