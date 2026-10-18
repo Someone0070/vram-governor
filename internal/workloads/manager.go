@@ -130,6 +130,7 @@ type Manager struct {
 	passWaitersMu sync.Mutex
 	passWaiters   map[string]int
 	companions    companionLeases
+	speeds        learnedSpeeds
 }
 
 // pendingResidencyObservation is versioned by target registration. A slower
@@ -4913,6 +4914,13 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		boundTarget = m.boundTarget(ctx, w.Request)
 	}
 	targetEstimates := m.estimateTargets(ctx, targets, w, req)
+	// Speeds measured on recent requests replace the calibration for ordering
+	// only: admission compares targets to the registered ones (pools
+	// included), so the targets themselves stay untouched.
+	speedViews := make(map[string]Target, len(targets))
+	for _, target := range targets {
+		speedViews[target.ID] = m.withLearnedSpeeds(target, req.Model)
+	}
 	sort.SliceStable(targets, func(i, j int) bool {
 		if boundTarget != "" && (targets[i].ID == boundTarget) != (targets[j].ID == boundTarget) {
 			return targets[i].ID == boundTarget
@@ -4933,7 +4941,7 @@ func (m *Manager) tryAdmit(ctx context.Context, w *domain.Workload) {
 		// context as the primary best-fit dimension; residency and transition
 		// cost remain tie-breakers. If that route is busy or otherwise
 		// incompatible, admission naturally spills to the next candidate.
-		if preference := poolSpeedPreference(targets[i], targets[j], w.Request, req); preference != 0 {
+		if preference := poolSpeedPreference(speedViews[targets[i].ID], speedViews[targets[j].ID], w.Request, req); preference != 0 {
 			return preference < 0
 		}
 		if preference := contextProfilePreference(targets[i], targets[j], w.Request.Adapter, req); preference != 0 {
@@ -10075,6 +10083,9 @@ func sharingViolation(reservation *targetReservation, observation Observation) s
 }
 
 func (m *Manager) recordSchedulingSample(ctx context.Context, workload *domain.Workload, target Target, reservation *targetReservation, observation Observation, outcome string) {
+	if outcome == "succeeded" {
+		m.observeSpeed(workload, target)
+	}
 	if reservation == nil {
 		return
 	}

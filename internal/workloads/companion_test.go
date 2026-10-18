@@ -123,3 +123,23 @@ func TestPoolSpeedPreferenceOrdersFasterCopyFirst(t *testing.T) {
 		t.Fatalf("preference without measured speeds: %d", got)
 	}
 }
+
+func TestLearnedSpeedReplacesCalibrationAfterSamples(t *testing.T) {
+	mgr := NewManager(quietLogger(), store.NewMemoryStore(), time.Second)
+	target := Target{ID: "gpu0", ModelPools: map[string]ModelPool{"m": {PoolTokens: 8192, Slots: 1, MaxRequestTokens: 8192, DecodeTPS: 100, PromptTPS: 1000}}}
+	job := &domain.Workload{Plan: &domain.ExecutionPlan{Model: "m"}, Execution: &domain.ExecutionHandle{Performance: &domain.ExecutionPerformance{DecodeTPS: 40, PromptTPS: 400, CompletionTokens: 64}}}
+	for i := 0; i < learnedSpeedMinSamples-1; i++ {
+		mgr.observeSpeed(job, target)
+	}
+	if got := mgr.withLearnedSpeeds(target, "m").ModelPools["m"].DecodeTPS; got != 100 {
+		t.Fatalf("calibration replaced before enough samples: %v", got)
+	}
+	mgr.observeSpeed(job, target)
+	view := mgr.withLearnedSpeeds(target, "m")
+	if got := view.ModelPools["m"].DecodeTPS; got != 40 {
+		t.Fatalf("learned decode speed not used: %v", got)
+	}
+	if target.ModelPools["m"].DecodeTPS != 100 {
+		t.Fatal("the registered target's pools were modified")
+	}
+}
