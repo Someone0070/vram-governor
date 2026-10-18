@@ -61,7 +61,14 @@ func main() {
 		time.Duration(cfg.Jobs.ReaperIntervalMillis)*time.Millisecond,
 		cfg.Jobs.DefaultMaxAttempts,
 	)
-	registerVerificationMockWorkers(jobsMgr)
+	// The legacy /jobs queue only has simulated workers: in production it is
+	// left unwired (its routes answer 501) instead of returning made-up
+	// results. Real GPU work goes through the unified workload API.
+	var serverJobs *jobs.Manager
+	if !cfg.Production {
+		registerVerificationMockWorkers(jobsMgr)
+		serverJobs = jobsMgr
+	}
 
 	var workloadStore store.WorkloadStore = controllerStore
 	workloadMgr := workloads.NewManager(log, workloadStore, time.Duration(cfg.Workloads.LeaseTTLSeconds)*time.Second)
@@ -196,7 +203,7 @@ func main() {
 		}
 		workloadMgr.RegisterTarget(workloads.Target{ID: configured.ID, Adapter: configured.Adapter, Endpoint: configured.Endpoint, RuntimeProtocol: configured.RuntimeProtocol, AcceleratorID: configured.AcceleratorID, Models: configured.Models, Profiles: configured.Profiles, ResidentModels: configured.ResidentModels, CustomNodes: configured.CustomNodes, ContextLimit: configured.ContextLimit, Slots: configured.Slots, CapabilityVersion: capabilityVersion, CapabilityRevision: capabilityRevision, Capabilities: capabilities, Capacity: capacity, MaxAcceleratorsPerWorkload: maxAccelerators, ModelFingerprint: configured.ModelFingerprint, CapacitySource: configured.CapacitySource, CapacityVerified: configured.CapacityVerified, SupportsModelLifecycle: configured.SupportsModelLifecycle, SupportsAcceleratorReclaim: configured.SupportsAcceleratorReclaim, MaxResidentModels: configured.MaxResidentModels, WarmRAMSupported: configured.WarmRAMSupported, ResidencyPolicy: domain.ResidencyPolicyMode(configured.ResidencyPolicy), IdleUnloadAfter: time.Duration(configured.IdleUnloadSeconds) * time.Second, MinResidency: time.Duration(configured.MinResidencySeconds) * time.Second, Cloud: configured.Cloud, Enabled: enabled, Authorization: authorization, InputCentsPerMTok: configured.InputCentsPerMTok, OutputCentsPerMTok: configured.OutputCentsPerMTok, WorkloadClass: configured.WorkloadClass, StandaloneVRAMMB: configured.StandaloneVRAMMB, AcceleratorVRAMMB: configured.AcceleratorVRAMMB, VRAMReserveMB: configured.VRAMReserveMB, SharingEnabled: configured.SharingEnabled, GuardedExploration: configured.GuardedExploration, PredictedSlowdown: configured.PredictedSlowdown, MaxSlowdown: configured.MaxSlowdown, SafetyCritical: configured.SafetyCritical, Provider: configured.Provider, Quarantined: configured.Quarantined, ComfyUI: configured.ComfyUI})
 	}
-	srv := api.NewServer(cfg, log, controllerStore, jobsMgr, dashboard.FS())
+	srv := api.NewServer(cfg, log, controllerStore, serverJobs, dashboard.FS())
 	defer srv.Close()
 	srv.SetWorkloadManager(workloadMgr, workloadStore)
 	if checkpointCoordinator != nil {

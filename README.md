@@ -56,7 +56,13 @@ curl https://<lb-host>:8443/v1/chat/completions   -H "Authorization: Bearer $TOK
 ```
 
 - `GET /v1/models` lists every model on every node, with current/free slots,
-  context limits and whether the model is resident.
+  context limits and whether the model is resident; `GET /v1/models/{id}`
+  returns one.
+- Errors on `/v1/*` use OpenAI's shape (`{"error":{"message","type","code"}}`):
+  a bad key is 401 `invalid_api_key`, an unknown model 404 `model_not_found`.
+- `response_format` `json_schema` and `json_object` are enforced by the
+  runtime's grammar (`json_object` is sent as a schema for any object).
+  Thinking models spend tokens reasoning first, so leave `max_tokens` room.
 - `priority` (0..credential `max_priority`, higher first) orders queued work.
 - `queue_policy: wait` holds the request until a slot frees (bounded by
   `max_wait_seconds`, default 120, max 900); `fail_fast` (the default) returns
@@ -184,6 +190,9 @@ results; external-boundary status is tracked in the audit linked above.
 - OpenAI-compatible `POST /v1/chat/completions`, including native SSE proxy
   streaming, client-disconnect cancellation, lease renewal for long streams,
   and structured terminal fail-fast capacity errors.
+- OpenAI-compatible `POST /v1/completions` (legacy text completion) and
+  `POST /v1/responses` (Responses API, streaming included), both served by
+  llama.cpp through the same admission and queueing as chat.
 - OpenAI-compatible `POST /v1/embeddings` for router embedding models, with the
   same admission, model loading and queueing as chat (router presets must run
   those models with `embeddings = 1`, see `--models-preset`)
@@ -314,7 +323,7 @@ Generate a credential digest, for example:
 |---|---|
 | Common async | `/api/v1/workloads`, status, approval, reprioritization, cancellation, artifacts, events, notifications |
 | Creator Studio | `/api/v1/capabilities`, capability-oriented `/api/v1/workloads`, `/api/v1/workloads/batch`, `/api/v1/batches/{id}`, session working-set hints |
-| OpenAI | `/v1/chat/completions`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`, human chat at `/chat/` |
+| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`, `/v1/images/generations`, `/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`, human chat at `/chat/` |
 | ComfyUI | `/prompt`, `/ws`, `/history`, `/history/{id}`, `/queue`, `/upload/image`, `/view` |
 | ComfyUI web app | `/comfy/` (sign in with a UI token): the real ComfyUI interface with live previews and progress; Queue Prompt is scheduled by the LB (`comfy_ui` config block + a `comfy_ui: true` target) |
 | Node | `/ws/node`, node engine/profile reporting |

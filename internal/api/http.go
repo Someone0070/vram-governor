@@ -110,10 +110,12 @@ func (s *Server) routes(dashboardFS http.FileSystem) {
 	s.mux.HandleFunc("POST /api/agent/v1/incidents/{id}/escalate", s.handleIncidentEscalation)
 	s.mux.HandleFunc("GET /api/agent/v1/events", s.handleAgentEvents)
 
-	if dashboardFS != nil {
-		fileServer := http.FileServer(dashboardFS)
-		s.mux.Handle("/", fileServer)
-	}
+	// The LB's address opens the console. (The old static node page here
+	// fetched /nodes without credentials and only ever showed a 401.)
+	s.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/admin/", http.StatusFound)
+	})
+	_ = dashboardFS
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
