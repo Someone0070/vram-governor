@@ -153,6 +153,13 @@ def _prompt(words, seed):
     return " ".join(f"w{(seed * 7919 + i * 104729) % 50021}" for i in range(words))
 
 
+def projector_device(config):
+    """Where a model's vision projector goes: its own GPU, or for a split the
+    second GPU (the 6900 XT has 4 GB more; on the 4070 the projector took the
+    room Gemma 4 26B needed at its fast ratios)."""
+    return config["device"].split(",")[-1]
+
+
 def run_config(model, path, config, options, mtp, port):
     """Load model with config, run the sample jobs, return measurements or None."""
     args = [P.SERVER, "-m", path, "--host", "127.0.0.1", "--port", str(port), "--no-webui", "-lv", "4",
@@ -161,11 +168,7 @@ def run_config(model, path, config, options, mtp, port):
         args += ["-ts", config["tensor-split"]]
     projector = P.mmproj_path(path)
     if projector:
-        args += ["--mmproj", projector]
-        if not config.get("tensor-split"):
-            # keep the projector on the model's GPU (llama.cpp otherwise picks
-            # the first GPU, so a model on the 6900 XT used 4070 memory)
-            args += ["--mmproj-device", config["device"]]
+        args += ["--mmproj", projector, "--mmproj-device", projector_device(config)]
     for key, value in mtp.items():
         args += ["--" + key, value]
     for key in ("cache-type-k", "cache-type-v"):
@@ -194,8 +197,12 @@ def run_config(model, path, config, options, mtp, port):
         # Untimed warm-up at the measured shapes: the Vulkan backend compiles
         # each kernel on first use (Gemma 4 on the 6900 XT read its first
         # prompt at 97 tok/s instead of ~1000).
-        _post(port, "/completion", {"prompt": _prompt(512, 99), "n_predict": 8, "cache_prompt": False})
-        warm = [threading.Thread(target=_post, args=(port, "/completion", {"prompt": _prompt(128, 90 + i), "n_predict": 4, "cache_prompt": False})) for i in range(TEST_SLOTS)]
+        first = _post(port, "/completion", {"prompt": _prompt(512, 99), "n_predict": 8, "cache_prompt": False})["timings"]
+        # A split reading prompts this slowly is a layer-boundary collapse
+        # (Gemma 4 26B: 100-180 tok/s against 2180): measure it once and
+        # skip the slow parallel test, it cannot win.
+        collapsed = bool(config.get("tensor-split")) and first.get("prompt_per_second", 0) < 300
+        warm = [] if collapsed else [threading.Thread(target=_post, args=(port, "/completion", {"prompt": _prompt(128, 90 + i), "n_predict": 4, "cache_prompt": False})) for i in range(TEST_SLOTS)]
         [t.start() for t in warm]
         [t.join() for t in warm]
         single = _post(port, "/completion", {"prompt": _prompt(768, 1), "n_predict": 96, "cache_prompt": False, "temperature": 0})["timings"]
@@ -204,14 +211,12 @@ def run_config(model, path, config, options, mtp, port):
         def one(seed):
             results.append(_post(port, "/completion", {"prompt": _prompt(192, seed), "n_predict": 64, "cache_prompt": False, "temperature": 0})["timings"])
 
-        t0 = time.time()
-        threads = [threading.Thread(target=one, args=(seed,)) for seed in range(2, 2 + TEST_SLOTS)]
+        threads = [] if collapsed else [threading.Thread(target=one, args=(seed,)) for seed in range(2, 2 + TEST_SLOTS)]
         [t.start() for t in threads]
         [t.join() for t in threads]
-        parallel_seconds = time.time() - t0
         # the four requests generate together: their own generation rates add
         # up (wall time would count their prompt reading as generation)
-        aggregate = sum(r.get("predicted_per_second", 0.0) for r in results)
+        aggregate = sum(r.get("predicted_per_second", 0.0) for r in results) if results else single.get("predicted_per_second", 0.0)
     except Exception:
         return None
     finally:
@@ -487,7 +492,11 @@ def main():
                     continue
                 config = {"device": f"{primary},{second}", "tensor-split": f"{step},{100 - step}", "n-gpu-layers": "99", "fit": "off"}
                 candidates.append((config, predict(model_fit, share, capacities, primary, second, True)))
-        candidates = [(c, p) for c, p in candidates if p["pool"] >= 4096]
+        # A placement must hold a useful context, not just load: Gemma 4 26B at
+        # 60:40 read prompts fast but left a 4096-token pool.
+        trained = int(P.read_gguf_metadata(path).get(f"{P.read_gguf_metadata(path).get('general.architecture', '')}.context_length", 0) or 32768)
+        needed = min(16384, trained)
+        candidates = [(c, p) for c, p in candidates if p["pool"] >= needed]
         if not candidates:
             continue
         best_single = max(p["tg1"] for _, p in candidates)
@@ -508,8 +517,8 @@ def main():
                 # The pool is calculated from logged buffers; confirm it by
                 # loading at that size with the projector and an image request.
                 preset = dict(config, **mtp)
-                if P.mmproj_path(path) and not config.get("tensor-split"):
-                    preset["mmproj-device"] = config["device"]
+                if P.mmproj_path(path):
+                    preset["mmproj-device"] = projector_device(config)
                 for _ in range(4):
                     preset.update({"ctx-size": str(pool), "parallel": str(max(1, min(8, pool // 8192))), "kv-unified": "1", "n-gpu-layers": "99", "fit": "off"})
                     if P.loads_on_gpus(path, preset, options):
@@ -522,7 +531,7 @@ def main():
                 print(f"| {model} | {label} | | | {measured['tg1'] if measured else 0:.1f} | {measured['pp'] if measured else 0:.0f} | {predicted['jobs_per_min']:.1f} | ❌ |", flush=True)
                 confirmed[key] = None
                 return None
-            record = dict(config, build=build, projector=bool(P.mmproj_path(path)), pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
+            record = dict(config, build=build, projector=bool(P.mmproj_path(path)), projector_device=projector_device(config) if P.mmproj_path(path) else "", pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
                           tgN=measured["tg_parallel"], jobs=predicted["jobs_per_min"] / 60, predicted=predicted, fit=model_fit)
             print(f"| {model} | {label} | {pool} | {record['slots']} | {measured['tg1']:.1f} | {measured['pp']:.0f} | {predicted['jobs_per_min']:.1f} | ✅ |", flush=True)
             confirmed[key] = record

@@ -232,8 +232,9 @@ def placement(model, path, base, cards, context):
         return {"device": cards[0][0]} if cards else {}, "embedding model"
     swept = load_calibration().get(sweep_key(model, path, cards))
     if swept:
-        return sweep_placed(swept), (f"swept: {swept['device']}{' ' + swept['tensor-split'] if swept.get('tensor-split') else ''}, "
-                                     f"{swept['tg1']:.0f} tok/s single, {swept['tgN']:.0f} tok/s at {swept['slots']} slots")
+        parallel = f", {swept['tgN']:.0f} tok/s at {swept['slots']} slots" if swept.get("tgN") else f", {swept['slots']} slots"
+        return sweep_placed(swept), (f"calibrated: {swept['device']}{' ' + swept['tensor-split'] if swept.get('tensor-split') else ''}, "
+                                     f"{swept.get('tg1', 0):.0f} tok/s single" + parallel)
     weights = os.path.getsize(path)
     try:
         meta = read_gguf_metadata(path)
@@ -284,7 +285,10 @@ def role_key(role, model, path, cards):
 
 def sweep_placed(record):
     if record.get("tensor-split"):
-        return {"device": record["device"], "tensor-split": record["tensor-split"], "n-gpu-layers": "99", "fit": "off"}
+        placed = {"device": record["device"], "tensor-split": record["tensor-split"], "n-gpu-layers": "99", "fit": "off"}
+        if record.get("projector_device"):
+            placed["mmproj-device"] = record["projector_device"]
+        return placed
     # Measured with every layer on the GPU and auto-fit off; auto-fit could
     # otherwise move layers to the CPU at the measured pool.
     placed = {"device": record["device"], "n-gpu-layers": "99", "fit": "off"}
