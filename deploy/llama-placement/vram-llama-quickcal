@@ -162,6 +162,10 @@ def run_config(model, path, config, options, mtp, port):
     projector = P.mmproj_path(path)
     if projector:
         args += ["--mmproj", projector]
+        if not config.get("tensor-split"):
+            # keep the projector on the model's GPU (llama.cpp otherwise picks
+            # the first GPU, so a model on the 6900 XT used 4070 memory)
+            args += ["--mmproj-device", config["device"]]
     for key, value in mtp.items():
         args += ["--" + key, value]
     for key in ("cache-type-k", "cache-type-v"):
@@ -453,8 +457,13 @@ def main():
             continue
         best_single = max(p["tg1"] for _, p in candidates)
         ranked = sorted((cp for cp in candidates if cp[1]["tg1"] >= best_single * 0.75), key=lambda cp: (cp[1]["jobs_per_min"], cp[1]["pool"]), reverse=True)
-        chosen = None
-        for config, predicted in ranked[:4]:
+        confirmed = {}
+
+        def confirm(config, predicted):
+            """Measure (if needed) and load-check one placement; a record or None."""
+            key = (config["device"], config.get("tensor-split"))
+            if key in confirmed:
+                return confirmed[key]
             measured = next((m for c, m in measured_runs if c["device"] == config["device"] and c.get("tensor-split") == config.get("tensor-split")), None)
             if measured is None:
                 measured = run_config(model, path, config, options, mtp, 8096)
@@ -464,6 +473,8 @@ def main():
                 # The pool is calculated from logged buffers; confirm it by
                 # loading at that size with the projector and an image request.
                 preset = dict(config, **mtp)
+                if P.mmproj_path(path) and not config.get("tensor-split"):
+                    preset["mmproj-device"] = config["device"]
                 for _ in range(4):
                     preset.update({"ctx-size": str(pool), "parallel": str(max(1, min(8, pool // 8192))), "kv-unified": "1", "n-gpu-layers": "99", "fit": "off"})
                     if P.loads_on_gpus(path, preset, options):
@@ -471,21 +482,40 @@ def main():
                     pool = max(4096, int(pool * 0.85) // 256 * 256)
                 else:
                     ok = False
-            if ok:
-                record = dict(config, build=build, pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
-                              tgN=measured["tg_parallel"], jobs=predicted["jobs_per_min"] / 60, predicted=predicted, fit=model_fit)
-                if not record.get("tensor-split"):
-                    record.pop("n-gpu-layers", None)
-                    record.pop("fit", None)
-                chosen = record
-                label = config["device"] + (" " + config["tensor-split"] if config.get("tensor-split") else "")
-                print(f"| {model} | {label} | {pool} | {record['slots']} | {measured['tg1']:.1f} | {measured['pp']:.0f} | {predicted['jobs_per_min']:.1f} | ✅ |", flush=True)
-                break
             label = config["device"] + (" " + config["tensor-split"] if config.get("tensor-split") else "")
-            print(f"| {model} | {label} | | | {measured['tg1'] if measured else 0:.1f} | {measured['pp'] if measured else 0:.0f} | {predicted['jobs_per_min']:.1f} | ❌ bad ratio |", flush=True)
+            if not ok:
+                print(f"| {model} | {label} | | | {measured['tg1'] if measured else 0:.1f} | {measured['pp'] if measured else 0:.0f} | {predicted['jobs_per_min']:.1f} | ❌ |", flush=True)
+                confirmed[key] = None
+                return None
+            record = dict(config, build=build, projector=bool(P.mmproj_path(path)), pool=pool, slots=max(1, min(8, pool // 8192)), tg1=measured["tg1"], pp=measured["pp"],
+                          tgN=measured["tg_parallel"], jobs=predicted["jobs_per_min"] / 60, predicted=predicted, fit=model_fit)
+            print(f"| {model} | {label} | {pool} | {record['slots']} | {measured['tg1']:.1f} | {measured['pp']:.0f} | {predicted['jobs_per_min']:.1f} | ✅ |", flush=True)
+            confirmed[key] = record
+            return record
+
+        chosen = next((r for r in (confirm(c, p) for c, p in ranked[:4]) if r), None)
         if chosen:
             results[P.sweep_key(model, path, cards)] = chosen
-            P.save_calibration(results)
+        # Per-router roles: the best confirmed placement on each GPU alone,
+        # and a split when the model needs both GPUs or a split holds much
+        # more context than either GPU (a long-context copy).
+        singles = {}
+        for role, device in (("gpu0", primary), ("gpu1", second)):
+            option = next(((c, p) for c, p in candidates if c["device"] == device and not c.get("tensor-split")), None)
+            record = confirm(*option) if option else None
+            if record:
+                singles[role] = record
+                results[P.role_key(role, model, path, cards)] = record
+            else:
+                results.pop(P.role_key(role, model, path, cards), None)
+        split_ranked = [cp for cp in sorted(candidates, key=lambda cp: (cp[1]["jobs_per_min"], cp[1]["pool"]), reverse=True) if cp[0].get("tensor-split")]
+        split = next((r for r in (confirm(c, p) for c, p in split_ranked[:4]) if r), None)
+        largest_single = max((r["pool"] for r in singles.values()), default=0)
+        if split and (not singles or split["pool"] >= largest_single * 1.3):
+            results[P.role_key("split", model, path, cards)] = split
+        else:
+            results.pop(P.role_key("split", model, path, cards), None)
+        P.save_calibration(results)
     prefetch.release_all()
     print(f"\ncalibrated {len(work)} models in {time.time() - started:.0f}s", flush=True)
 

@@ -277,12 +277,21 @@ def sweep_key(model, path, cards):
     return "sweep|" + calibration_key(model, path, cards)
 
 
+def role_key(role, model, path, cards):
+    """Calibrated placement of a model for one router role: gpu0, gpu1, split."""
+    return f"role|{role}|" + calibration_key(model, path, cards)
+
+
 def sweep_placed(record):
     if record.get("tensor-split"):
         return {"device": record["device"], "tensor-split": record["tensor-split"], "n-gpu-layers": "99", "fit": "off"}
     # Measured with every layer on the GPU and auto-fit off; auto-fit could
     # otherwise move layers to the CPU at the measured pool.
-    return {"device": record["device"], "n-gpu-layers": "99", "fit": "off"}
+    placed = {"device": record["device"], "n-gpu-layers": "99", "fit": "off"}
+    if record.get("projector"):
+        # the vision projector stays on the model's GPU
+        placed["mmproj-device"] = record["device"]
+    return placed
 
 
 FIT_CACHE = os.environ.get("VG_LLAMA_FIT_CACHE", "/var/lib/vram-governor/llama-fit-cache.json")
@@ -757,10 +766,27 @@ def main():
              "; GPUs: " + (", ".join(f"{n} {t} MiB" for n, t in cards) or "none found"), ""]
     sections = {s: {k: v for k, v in base[s].items() if k not in OWN_KEYS} for s in base.sections()}
     pools = {}
+    # Role mode: one router per GPU plus a split router. Each gets only the
+    # models calibrated for its role (the primary GPU's router also takes
+    # uncalibrated models that fit it, and embedding models).
+    role = os.environ.get("VG_LLAMA_ROLE", "")
+    role_dir = os.environ.get("VG_LLAMA_ROLE_MODELS_DIR", "")
+    included = []
     for model, path in models().items():
         placed, note = placement(model, path, base, cards, MIN_CONTEXT)
+        if role:
+            options = base[model] if base.has_section(model) else {}
+            record = load_calibration().get(role_key(role, model, path, cards))
+            if record:
+                placed = sweep_placed(record)
+                note = f"role {role}: calibrated {record['tg1']:.0f} tok/s single, {record['pp']:.0f} tok/s prompt"
+            elif role == "gpu0" and cards and (options.get("embeddings") in ("1", "true", "on") or placed.get("device") == cards[0][0]):
+                note += f"; role {role}: not calibrated, estimated"
+            else:
+                continue
+            included.append((model, path))
         try:
-            swept = load_calibration().get(sweep_key(model, path, cards))
+            swept = load_calibration().get(role_key(role, model, path, cards)) if role else load_calibration().get(sweep_key(model, path, cards))
             if swept:
                 meta = read_gguf_metadata(path)
                 trained = int(meta.get(f"{meta.get('general.architecture', '')}.context_length", 0) or 32768)
@@ -779,8 +805,9 @@ def main():
         merged = dict(placed)
         merged.update(sections.pop(model, {}))
         lines += [f"; {note}", f"[{model}]"] + [f"{k} = {v}" for k, v in merged.items()] + [""]
-    for model, options in sections.items():
-        lines += [f"[{model}]"] + [f"{k} = {v}" for k, v in options.items()] + [""]
+    if not role:
+        for model, options in sections.items():
+            lines += [f"[{model}]"] + [f"{k} = {v}" for k, v in options.items()] + [""]
     text = "\n".join(lines)
     if dry_run:
         print(text)
@@ -791,6 +818,26 @@ def main():
         with open(tmp, "w") as f:
             f.write(content)
         os.replace(tmp, target)
+    if role and role_dir:
+        link_role_models(role_dir, included)
+
+
+def link_role_models(role_dir, included):
+    """A models directory for one router: links to the shared entries."""
+    os.makedirs(role_dir, exist_ok=True)
+    wanted = {}
+    for model, path in included:
+        folder = os.path.dirname(path)
+        entry = os.path.basename(path) if os.path.realpath(folder) == os.path.realpath(MODELS_DIR) else os.path.basename(folder)
+        wanted[entry] = os.path.join(MODELS_DIR, entry)
+    for entry in os.listdir(role_dir):
+        full = os.path.join(role_dir, entry)
+        if os.path.islink(full) and (entry not in wanted or os.readlink(full) != wanted[entry]):
+            os.unlink(full)
+    for entry, source in wanted.items():
+        full = os.path.join(role_dir, entry)
+        if not os.path.lexists(full):
+            os.symlink(source, full)
 
 
 if __name__ == "__main__":
