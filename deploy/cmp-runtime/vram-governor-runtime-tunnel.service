@@ -9,7 +9,7 @@ Wants=network-online.target comfy-harness.service llama-server.service
 Type=simple
 User=vram-governor
 Group=vram-governor
-ExecStart=/usr/bin/ssh -NT -i /etc/vram-governor/runtime-tunnel-ed25519 -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/vram-governor/lb-known-hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 127.0.0.1:9444:127.0.0.1:8190 -R 127.0.0.1:9445:127.0.0.1:8080 vram-runtime-tunnel@10.0.0.115
+ExecStart=/usr/bin/ssh -NT -i /etc/vram-governor/runtime-tunnel-ed25519 -o BatchMode=yes -o ExitOnForwardFailure=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/vram-governor/lb-known-hosts -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -R 127.0.0.1:9444:127.0.0.1:8190 -R 127.0.0.1:9445:127.0.0.1:8080 -R 127.0.0.1:9446:127.0.0.1:8188 -R 127.0.0.1:9447:127.0.0.1:8085 -R 127.0.0.1:9448:127.0.0.1:8086 vram-runtime-tunnel@10.0.0.115
 Restart=always
 RestartSec=3
 NoNewPrivileges=true

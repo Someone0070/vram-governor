@@ -7,8 +7,9 @@
 set -u
 export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-/root/llama.cpp-mixed/build/bin}
 QUICKCAL=${QUICKCAL:-/usr/local/sbin/vram-llama-quickcal}
-ROUTER=${ROUTER_URL:-http://127.0.0.1:8080}
-UNIT=${ROUTER_UNIT:-llama-server}
+# every router unit on the node and its port (per-GPU layout: one per GPU
+# plus the split router; units that do not exist are skipped)
+ROUTERS=${ROUTERS:-"llama-server:8080 llama-gpu1:8085 llama-split:8086"}
 MAX_WAIT=${MAX_WAIT_SECONDS:-3600}
 LOCK=/run/vram-llama-autocal.lock
 
@@ -44,7 +45,13 @@ fi
 
 # Wait until no loaded model is processing a request.
 idle() {
-    python3 - "$ROUTER" <<'PY'
+    for entry in $ROUTERS; do
+        port=${entry##*:}
+        router_idle "http://127.0.0.1:$port" || return 1
+    done
+}
+router_idle() {
+    python3 - "$1" <<'PY'
 import json, sys, urllib.request
 base = sys.argv[1]
 try:
@@ -69,11 +76,16 @@ while ! idle; do
     sleep 15; waited=$((waited + 15))
 done
 
-echo "stopping $UNIT for calibration"
-systemctl stop "$UNIT"
+units=""
+for entry in $ROUTERS; do
+    unit=${entry%%:*}
+    systemctl cat "$unit" >/dev/null 2>&1 && units="$units $unit"
+done
+echo "stopping$units for calibration"
+systemctl stop $units
 "$QUICKCAL" --missing
 status=$?
-systemctl start "$UNIT"
-echo "calibration exit $status; $UNIT started"
+systemctl start $units
+echo "calibration exit $status;$units started"
 [ "$status" = 3 ] && exit 0
 exit "$status"

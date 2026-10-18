@@ -1,0 +1,19 @@
+[Unit]
+Description=llama.cpp router: both GPUs (models split across cards)
+After=network.target mnt-models.mount
+RequiresMountsFor=/mnt/models
+
+[Service]
+Type=simple
+WorkingDirectory=/root/llama.cpp-mixed
+Environment=LD_LIBRARY_PATH=/root/llama.cpp-mixed/build/bin
+Environment=VG_LLAMA_ROLE=split
+Environment=VG_LLAMA_ROLE_MODELS_DIR=/etc/vram-governor/llama-models-split
+Environment=VG_LLAMA_PRESETS=/etc/vram-governor/llama-presets-split.ini
+Environment=VG_LLAMA_POOLS=/etc/vram-governor/llama-model-pools-split.json
+ExecStartPre=/usr/local/sbin/vram-llama-placement
+ExecStart=/root/llama.cpp-mixed/build/bin/llama-server --host 127.0.0.1 --port 8086 --no-webui --models-dir /etc/vram-governor/llama-models-split --models-preset /etc/vram-governor/llama-presets-split.ini --models-max 1 --no-models-autoload --metrics
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

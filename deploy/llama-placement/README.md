@@ -70,6 +70,54 @@ to keep a model on the primary GPU, ...) go in
 the generated `/etc/vram-governor/llama-presets.ini`. Run with `--dry-run` to
 see the decisions and the estimates behind them.
 
+## Quick calibration (minutes, automatic)
+
+`vram-llama-quickcal` measures each model in three placements (each GPU
+alone, one split; a 5-point split scan for a model that needs both GPUs):
+one ~5-20 s run each (load from RAM, an untimed warm-up, one 768-token job,
+four parallel jobs, and the per-device buffer sizes llama.cpp logs). Runs on
+different GPUs go in parallel and the next model is locked in RAM while the
+current one runs. A per-model fit predicts every ratio:
+
+| Quantity | Model (share s on the primary GPU) |
+|---|---|
+| time per generated token | s·a + (1−s)·b + c when split |
+| time per prompt token | s·a' + (1−s)·b' |
+| pool tokens | min over GPUs of free bytes ÷ KV bytes per token |
+
+On InternVL3.5-8B (4070 SUPER + 6900 XT) the fit is within 1.3% for
+generation, 6% for prompt and 5% for the pool. Some ratios collapse at layer
+boundaries no formula predicts (Gemma 4 26B: prompt 2180 tok/s at 56:44,
+134 at 52:48): a split far below the best measured one is excluded from the
+fit and its neighbourhood skipped. Every chosen placement is confirmed by a
+run and by a load at its pool with an image request.
+
+Results per role go to the calibration cache: `gpu0` and `gpu1` (each GPU
+alone) and `split` (models that need both GPUs, or a split with 30% more
+context than either GPU). `vram-llama-autocal` (path unit on the models
+directory and base presets, a nightly timer, at boot) calibrates whatever
+has no result for the current files, GPUs and llama.cpp build, waiting for
+the routers to be idle.
+
+## Per-GPU routers
+
+One router per GPU plus one for split models, so the controller can run a
+copy of a model on each card and split only when needed:
+
+| Unit | Port (LB tunnel) | GPU(s) | Role |
+|---|---|---|---|
+| `llama-server` + `zz-placement-gpu0.conf` | 8080 (9445) | 4070 SUPER | `gpu0` |
+| `llama-gpu1.service` | 8085 (9447) | 6900 XT | `gpu1` |
+| `llama-split.service` | 8086 (9448) | both | `split` |
+
+Each router gets its own models directory of links, presets and pools
+(`VG_LLAMA_ROLE`). The node agent advertises the split router with
+`companion_accelerator_indexes: [1]`; the controller holds both GPUs' leases
+while it runs, evicts the per-card routers' models before it loads, and
+prefers whichever copy finishes a request sooner (pools carry measured
+decode and prompt speeds). Vision projectors are pinned to the model's GPU
+(`mmproj-device`); the 6900 XT router runs without CUDA visible.
+
 ## Mixed NVIDIA + AMD build
 
 Splitting across vendors needs llama.cpp built with both backends; the same
